@@ -4,13 +4,13 @@ import csv
 import json
 import time
 import math
-import zipfile
 import sqlite3
 import asyncio
+import zipfile
 import logging
 from pathlib import Path
-from datetime import datetime, timezone, timedelta
-from collections import defaultdict
+from datetime import datetime, timezone
+from typing import Optional
 
 import aiohttp
 from aiohttp import web
@@ -23,142 +23,137 @@ load_dotenv()
 # CONFIG
 # ============================================================
 
-WALLET = os.getenv(
-    "WALLET",
-    "0xf3531b23b504cf0aed4ff21325232b2a2d496685"
-).lower()
+PORT = int(os.getenv("PORT", "8080"))
+
+DATA_API = "https://data-api.polymarket.com"
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
+MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
+DISCOVERY_INTERVAL = float(os.getenv("DISCOVERY_INTERVAL", "5"))
+STRATEGY_INTERVAL = float(os.getenv("STRATEGY_INTERVAL", "3.0"))
+MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "900"))
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "5"))
-POSITIONS_INTERVAL = int(os.getenv("POSITIONS_INTERVAL", "300"))
-REPORT_INTERVAL = int(os.getenv("REPORT_INTERVAL", "3600"))
-BOOK_RETENTION_HOURS = int(os.getenv("BOOK_RETENTION_HOURS", "48"))
-PORT = int(os.getenv("PORT", "8080"))
+CRYPTO_FEE_RATE = float(os.getenv("CRYPTO_FEE_RATE", "0.07"))
+
+# Original M03 parameters.
+ENTRY_MOVE = 0.03
+PYRAMID_STEP = 0.08
+LOOKBACK_TICKS = 2
+SWITCH_MOVE = 0.03
+MAX_BUYS_SIDE = 5
+
+# A $1000 account corresponds to the original simulator's 10 shares per buy.
+BASE_CAPITAL = float(os.getenv("BASE_CAPITAL", "1000"))
+BASE_SHARES = float(os.getenv("BASE_SHARES", "10"))
+
+# Independent paper accounts.
+CAPITALS = [
+    float(x.strip())
+    for x in os.getenv("PAPER_CAPITALS", "100,250,500,1000,2500").split(",")
+    if x.strip()
+]
+
 REPORT_DELAY_SECONDS = int(os.getenv("REPORT_DELAY_SECONDS", "300"))
 REPORT_CHECK_INTERVAL = int(os.getenv("REPORT_CHECK_INTERVAL", "30"))
 
-DATA_API = "https://data-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
-MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-TRADE_PAGE_LIMIT = 1000
-ACTIVITY_PAGE_LIMIT = 500
-ACTIVITY_TYPES = "TRADE,SPLIT,MERGE,REDEEM,MAKER_REBATE"
-ACTIVITY_POLL_INTERVAL = float(os.getenv("ACTIVITY_POLL_INTERVAL", "15"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    p = DATA_DIR / ".write_test"
+    p.write_text("ok")
+    p.unlink()
+except Exception:
+    DATA_DIR = Path("./data")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# Render Free has an ephemeral filesystem, so use a local writable directory.
-# Hourly Telegram ZIP files are the durable archive.
-DATA_DIR = Path(os.getenv("DATA_DIR", "./data"))
-DATA_DIR.mkdir(parents=True, exist_ok=True)
-
-BOOTSTRAP_LOOKBACK_HOURS = int(os.getenv("BOOTSTRAP_LOOKBACK_HOURS", "6"))
-
-DB_PATH = DATA_DIR / "powerwinner_observer.db"
-REPORT_DIR = DATA_DIR / "reports"
+DB_PATH = DATA_DIR / "m03_paper_money.db"
+REPORT_DIR = DATA_DIR / "m03_paper_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("powerwinner")
+log = logging.getLogger("m03-paper-money")
 
-# Shared state
-ws_send_queue: asyncio.Queue = asyncio.Queue()
+session: Optional[aiohttp.ClientSession] = None
+
+markets = {}
+asset_to_market = {}
+books = {}
 subscribed_assets = set()
-latest_books = {}
-last_report_end = None
-session: aiohttp.ClientSession | None = None
+ws_send_queue: asyncio.Queue = asyncio.Queue()
 
+# condition_id -> per-market original M03 state
+strategy_state = {}
+price_history = {}
 
 # ============================================================
 # HELPERS
 # ============================================================
 
-def now_ts() -> int:
+def now_ts():
     return int(time.time())
 
-def utc_iso(ts: int | float | None = None) -> str:
+def now_ms():
+    return int(time.time() * 1000)
+
+def utc_iso(ts=None):
     if ts is None:
         ts = time.time()
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
 
-def safe_float(value, default=0.0):
+def sf(v, default=0.0):
     try:
-        return float(value)
+        return float(v)
     except (TypeError, ValueError):
         return default
 
-def safe_int(value, default=0):
+def si(v, default=0):
     try:
-        return int(float(value))
+        return int(float(v))
     except (TypeError, ValueError):
         return default
 
-def json_dumps(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def jd(v):
+    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
 
-def trade_uid(t: dict) -> str:
-    # Data API does not expose a dedicated trade id in this public response.
-    # transactionHash can repeat for multiple fills, so include trade fields.
-    parts = [
-        str(t.get("transactionHash", "")),
-        str(t.get("timestamp", "")),
-        str(t.get("asset", "")),
-        str(t.get("side", "")),
-        str(t.get("price", "")),
-        str(t.get("size", "")),
-        str(t.get("outcome", "")),
-        str(t.get("conditionId", "")),
-    ]
-    return "|".join(parts)
+def parse_jsonish(v):
+    if isinstance(v, list):
+        return v
+    if v is None:
+        return []
+    try:
+        x = json.loads(v)
+        return x if isinstance(x, list) else []
+    except Exception:
+        return []
 
-def is_crypto_5m(title: str, slug: str, event_slug: str) -> bool:
-    s = f"{title} {slug} {event_slug}".lower()
-    crypto = any(x in s for x in ("bitcoin", "btc", "ethereum", "eth"))
-    five = any(x in s for x in ("5m", "5-min", "5 min", "5 minute", "5-minute"))
-    # Polymarket titles often contain a five-minute time range but not literal "5m".
-    # We keep all BTC/ETH Up/Down markets and tag likely 5m ones later.
-    updown = ("up or down" in s) or ("up-down" in s) or ("updown" in s)
-    return crypto and (five or updown)
+def slot_start_from_slug(slug):
+    try:
+        return int(str(slug).rstrip("/").split("-")[-1])
+    except Exception:
+        return None
 
-def classify_symbol(title: str, slug: str, event_slug: str) -> str:
-    s = f"{title} {slug} {event_slug}".lower()
-    if "bitcoin" in s or "btc" in s:
-        return "BTC"
-    if "ethereum" in s or "eth" in s:
-        return "ETH"
-    return "OTHER"
+def account_id(capital):
+    return f"CAP_{capital:g}"
 
-def estimate_execution(side: str, trade_price: float, bid: float | None, ask: float | None):
-    if bid is None or ask is None or bid <= 0 or ask <= 0:
-        return "UNKNOWN", None
-    eps = 0.0006
-    spread = ask - bid
+def shares_per_buy(capital):
+    return BASE_SHARES * (capital / BASE_CAPITAL)
 
-    # For a BUY:
-    # - execution at/near ask -> aggressive/taker-like
-    # - execution at/near bid -> passive/maker-like
-    # For a SELL, reverse.
-    if side.upper() == "BUY":
-        if trade_price >= ask - eps:
-            return "TAKER_LIKELY", spread
-        if trade_price <= bid + eps:
-            return "MAKER_LIKELY", spread
-    elif side.upper() == "SELL":
-        if trade_price <= bid + eps:
-            return "TAKER_LIKELY", spread
-        if trade_price >= ask - eps:
-            return "MAKER_LIKELY", spread
-    return "UNKNOWN", spread
-
+def fee_for(shares, price):
+    fee = shares * CRYPTO_FEE_RATE * price * (1.0 - price)
+    return round(fee, 6) if fee >= 0.0000005 else 0.0
 
 # ============================================================
-# DATABASE
+# DB
 # ============================================================
 
-def db_connect():
+def db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -166,629 +161,364 @@ def db_connect():
     return conn
 
 def init_db():
-    with db_connect() as conn:
+    with db() as conn:
         conn.executescript("""
-        CREATE TABLE IF NOT EXISTS trades (
-            uid TEXT PRIMARY KEY,
-            observed_at INTEGER NOT NULL,
-            trade_ts INTEGER NOT NULL,
-            trade_time_utc TEXT NOT NULL,
-            proxy_wallet TEXT,
-            side TEXT,
-            asset TEXT,
-            condition_id TEXT,
-            size REAL,
-            price REAL,
-            usd_value REAL,
-            title TEXT,
+        CREATE TABLE IF NOT EXISTS markets (
+            condition_id TEXT PRIMARY KEY,
             slug TEXT,
-            event_slug TEXT,
-            outcome TEXT,
-            outcome_index INTEGER,
-            symbol TEXT,
-            is_crypto_5m INTEGER DEFAULT 0,
-            transaction_hash TEXT,
-            best_bid REAL,
-            best_ask REAL,
-            book_ts INTEGER,
-            book_age_ms INTEGER,
-            execution_type TEXT DEFAULT 'UNKNOWN',
-            spread REAL,
-            raw_json TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(trade_ts);
-        CREATE INDEX IF NOT EXISTS idx_trades_condition ON trades(condition_id);
-        CREATE INDEX IF NOT EXISTS idx_trades_asset ON trades(asset);
-
-        CREATE TABLE IF NOT EXISTS book_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            received_ts_ms INTEGER NOT NULL,
-            exchange_ts_ms INTEGER,
-            asset TEXT NOT NULL,
-            condition_id TEXT,
-            best_bid REAL,
-            best_ask REAL,
-            bid_size REAL,
-            ask_size REAL,
-            last_trade_price REAL,
-            event_type TEXT,
-            raw_json TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_books_asset_ts
-        ON book_events(asset, received_ts_ms);
-
-        CREATE TABLE IF NOT EXISTS positions_snapshots (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            snapshot_ts INTEGER NOT NULL,
-            kind TEXT NOT NULL,
-            condition_id TEXT,
-            asset TEXT,
             title TEXT,
+            start_ts INTEGER,
+            end_ts INTEGER,
+            up_asset TEXT,
+            down_asset TEXT,
+            resolved INTEGER DEFAULT 0,
+            winning_asset TEXT,
+            winning_outcome TEXT,
+            discovered_ms INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS accounts (
+            account_id TEXT PRIMARY KEY,
+            initial_capital REAL,
+            cash REAL,
+            realized_pnl REAL DEFAULT 0,
+            created_ms INTEGER
+        );
+
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            condition_id TEXT,
+            ts_ms INTEGER,
+            elapsed_sec REAL,
+            signal_type TEXT,
+            asset TEXT,
             outcome TEXT,
-            size REAL,
+            ask REAL,
+            reference REAL,
+            momentum REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS paper_orders (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT,
+            condition_id TEXT,
+            ts_ms INTEGER,
+            elapsed_sec REAL,
+            signal_type TEXT,
+            asset TEXT,
+            outcome TEXT,
+            requested_shares REAL,
+            filled_shares REAL,
             avg_price REAL,
-            current_value REAL,
-            cash_pnl REAL,
-            realized_pnl REAL,
-            total_bought REAL,
-            raw_json TEXT
+            gross_cost REAL,
+            fee REAL,
+            total_cost REAL,
+            status TEXT,
+            UNIQUE(account_id, condition_id, ts_ms, signal_type, asset)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_pos_ts ON positions_snapshots(snapshot_ts);
-
-        CREATE TABLE IF NOT EXISTS activities (
-            uid TEXT PRIMARY KEY,
-            observed_at INTEGER NOT NULL,
-            activity_ts INTEGER NOT NULL,
-            activity_time_utc TEXT NOT NULL,
-            proxy_wallet TEXT,
-            type TEXT,
-            side TEXT,
+        CREATE TABLE IF NOT EXISTS results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT,
             condition_id TEXT,
-            asset TEXT,
-            size REAL,
-            usdc_size REAL,
-            price REAL,
-            outcome TEXT,
-            outcome_index INTEGER,
-            title TEXT,
-            slug TEXT,
-            event_slug TEXT,
-            symbol TEXT,
-            is_crypto_5m INTEGER DEFAULT 0,
-            transaction_hash TEXT,
-            raw_json TEXT
+            winning_asset TEXT,
+            winning_outcome TEXT,
+            payout REAL,
+            market_cost REAL,
+            pnl REAL,
+            settled_ms INTEGER,
+            UNIQUE(account_id, condition_id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_activities_ts ON activities(activity_ts);
-        CREATE INDEX IF NOT EXISTS idx_activities_type ON activities(type);
-        CREATE INDEX IF NOT EXISTS idx_activities_condition ON activities(condition_id);
+        CREATE TABLE IF NOT EXISTS equity_snapshots (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id TEXT,
+            ts_ms INTEGER,
+            cash REAL,
+            open_value REAL,
+            equity REAL,
+            realized_pnl REAL
+        );
 
-        CREATE TABLE IF NOT EXISTS app_state (
+        CREATE TABLE IF NOT EXISTS state (
             key TEXT PRIMARY KEY,
             value TEXT
         );
+
+        CREATE INDEX IF NOT EXISTS idx_orders_market ON paper_orders(condition_id);
+        CREATE INDEX IF NOT EXISTS idx_orders_account ON paper_orders(account_id);
+        CREATE INDEX IF NOT EXISTS idx_results_account ON results(account_id);
         """)
 
-def get_state(key: str, default=None):
-    with db_connect() as conn:
-        row = conn.execute("SELECT value FROM app_state WHERE key=?", (key,)).fetchone()
-        return row["value"] if row else default
-
-def set_state(key: str, value):
-    with db_connect() as conn:
-        conn.execute(
-            "INSERT INTO app_state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (key, str(value)),
-        )
-        conn.commit()
-
-def insert_trade(t: dict) -> bool:
-    uid = trade_uid(t)
-    asset = str(t.get("asset", ""))
-    tts = safe_int(t.get("timestamp"))
-    side = str(t.get("side", "")).upper()
-    price = safe_float(t.get("price"))
-    size = safe_float(t.get("size"))
-    title = str(t.get("title", ""))
-    slug = str(t.get("slug", ""))
-    event_slug = str(t.get("eventSlug", ""))
-    symbol = classify_symbol(title, slug, event_slug)
-
-    # Use latest in-memory book if it is temporally plausible.
-    book = latest_books.get(asset)
-    bid = ask = None
-    book_ts = None
-    book_age_ms = None
-    execution_type = "UNKNOWN"
-    spread = None
-
-    if book:
-        bid = book.get("best_bid")
-        ask = book.get("best_ask")
-        book_ts = book.get("received_ts_ms")
-        book_age_ms = abs((tts * 1000) - book_ts) if tts and book_ts else None
-        # Only classify from an in-memory snapshot close to the actual trade.
-        if book_age_ms is not None and book_age_ms <= 15000:
-            execution_type, spread = estimate_execution(side, price, bid, ask)
-
-    row = (
-        uid, now_ts(), tts, utc_iso(tts),
-        str(t.get("proxyWallet", "")).lower(),
-        side, asset, str(t.get("conditionId", "")),
-        size, price, size * price,
-        title, slug, event_slug, str(t.get("outcome", "")),
-        safe_int(t.get("outcomeIndex"), -1),
-        symbol, int(is_crypto_5m(title, slug, event_slug)),
-        str(t.get("transactionHash", "")),
-        bid, ask, book_ts, book_age_ms, execution_type, spread,
-        json_dumps(t),
-    )
-
-    with db_connect() as conn:
-        cur = conn.execute("""
-            INSERT OR IGNORE INTO trades(
-                uid, observed_at, trade_ts, trade_time_utc, proxy_wallet,
-                side, asset, condition_id, size, price, usd_value,
-                title, slug, event_slug, outcome, outcome_index,
-                symbol, is_crypto_5m, transaction_hash,
-                best_bid, best_ask, book_ts, book_age_ms,
-                execution_type, spread, raw_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, row)
-        conn.commit()
-        return cur.rowcount > 0
-
-def activity_uid(a: dict) -> str:
-    parts = [
-        str(a.get("transactionHash", "")), str(a.get("timestamp", "")),
-        str(a.get("type", "")), str(a.get("conditionId", "")),
-        str(a.get("asset", "")), str(a.get("side", "")),
-        str(a.get("size", "")), str(a.get("usdcSize", "")),
-        str(a.get("price", "")), str(a.get("outcomeIndex", "")),
-    ]
-    return "|".join(parts)
-
-def insert_activity(a: dict) -> bool:
-    uid = activity_uid(a)
-    ats = safe_int(a.get("timestamp"))
-    title = str(a.get("title", ""))
-    slug = str(a.get("slug", ""))
-    event_slug = str(a.get("eventSlug", ""))
-    row = (
-        uid, now_ts(), ats, utc_iso(ats), str(a.get("proxyWallet", "")).lower(),
-        str(a.get("type", "")).upper(), str(a.get("side", "")).upper(),
-        str(a.get("conditionId", "")), str(a.get("asset", "")),
-        safe_float(a.get("size")), safe_float(a.get("usdcSize")),
-        safe_float(a.get("price")), str(a.get("outcome", "")),
-        safe_int(a.get("outcomeIndex"), -1), title, slug, event_slug,
-        classify_symbol(title, slug, event_slug),
-        int(is_crypto_5m(title, slug, event_slug)),
-        str(a.get("transactionHash", "")), json_dumps(a),
-    )
-    with db_connect() as conn:
-        cur = conn.execute("""
-            INSERT OR IGNORE INTO activities(
-                uid, observed_at, activity_ts, activity_time_utc, proxy_wallet,
-                type, side, condition_id, asset, size, usdc_size, price,
-                outcome, outcome_index, title, slug, event_slug, symbol,
-                is_crypto_5m, transaction_hash, raw_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-        """, row)
-        conn.commit()
-        return cur.rowcount > 0
-
-def insert_book_event(asset: str, event: dict, event_type: str, payload: dict):
-    recv_ms = int(time.time() * 1000)
-    exch_ts = payload.get("timestamp") or event.get("timestamp")
-    exch_ts = safe_int(exch_ts, 0) or None
-
-    def top(levels, want_max):
-        if not levels:
-            return None, None
-        parsed = []
-        for level in levels:
-            if isinstance(level, dict):
-                p = safe_float(level.get("price"), math.nan)
-                s = safe_float(level.get("size"), 0)
-            else:
-                continue
-            if not math.isnan(p):
-                parsed.append((p, s))
-        if not parsed:
-            return None, None
-        return (max(parsed) if want_max else min(parsed))
-
-    bids = payload.get("bids") or []
-    asks = payload.get("asks") or []
-    bid, bid_size = top(bids, True)
-    ask, ask_size = top(asks, False)
-
-    # price_change/best_bid_ask events can provide direct values.
-    bid = safe_float(payload.get("best_bid"), bid[0] if isinstance(bid, tuple) else bid) if payload.get("best_bid") is not None else (bid[0] if isinstance(bid, tuple) else bid)
-    ask = safe_float(payload.get("best_ask"), ask[0] if isinstance(ask, tuple) else ask) if payload.get("best_ask") is not None else (ask[0] if isinstance(ask, tuple) else ask)
-
-    # Fix size extraction from tuple path.
-    if isinstance(bid_size, tuple):
-        bid_size = bid_size[1]
-    if isinstance(ask_size, tuple):
-        ask_size = ask_size[1]
-
-    # If event is direct best_bid_ask and sizes are available.
-    if payload.get("best_bid_size") is not None:
-        bid_size = safe_float(payload.get("best_bid_size"))
-    if payload.get("best_ask_size") is not None:
-        ask_size = safe_float(payload.get("best_ask_size"))
-
-    last_trade = payload.get("last_trade_price") or payload.get("lastTradePrice")
-    last_trade = safe_float(last_trade, 0) or None
-
-    previous = latest_books.get(asset, {})
-    if bid is None:
-        bid = previous.get("best_bid")
-    if ask is None:
-        ask = previous.get("best_ask")
-
-    changed = (
-        previous.get("best_bid") != bid
-        or previous.get("best_ask") != ask
-        or event_type in ("book", "best_bid_ask")
-    )
-
-    latest_books[asset] = {
-        "received_ts_ms": recv_ms,
-        "exchange_ts_ms": exch_ts,
-        "best_bid": bid,
-        "best_ask": ask,
-        "condition_id": payload.get("market") or payload.get("condition_id"),
-    }
-
-    if not changed:
-        return
-
-    with db_connect() as conn:
-        conn.execute("""
-            INSERT INTO book_events(
-                received_ts_ms, exchange_ts_ms, asset, condition_id,
-                best_bid, best_ask, bid_size, ask_size, last_trade_price,
-                event_type, raw_json
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?)
-        """, (
-            recv_ms, exch_ts, asset,
-            str(payload.get("market") or payload.get("condition_id") or ""),
-            bid, ask, bid_size, ask_size, last_trade,
-            event_type, json_dumps(event),
-        ))
-        conn.commit()
-
-def save_positions(kind: str, rows: list[dict]):
-    ts = now_ts()
-    with db_connect() as conn:
-        for p in rows:
+        for capital in CAPITALS:
+            aid = account_id(capital)
             conn.execute("""
-                INSERT INTO positions_snapshots(
-                    snapshot_ts, kind, condition_id, asset, title, outcome,
-                    size, avg_price, current_value, cash_pnl, realized_pnl,
-                    total_bought, raw_json
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                ts, kind,
-                str(p.get("conditionId") or p.get("condition_id") or ""),
-                str(p.get("asset") or ""),
-                str(p.get("title") or ""),
-                str(p.get("outcome") or ""),
-                safe_float(p.get("size")),
-                safe_float(p.get("avgPrice") or p.get("avg_price")),
-                safe_float(p.get("currentValue") or p.get("current_value")),
-                safe_float(p.get("cashPnl") or p.get("cash_pnl")),
-                safe_float(p.get("realizedPnl") or p.get("realized_pnl")),
-                safe_float(p.get("totalBought") or p.get("total_bought")),
-                json_dumps(p),
-            ))
+                INSERT OR IGNORE INTO accounts(
+                    account_id, initial_capital, cash, realized_pnl, created_ms
+                ) VALUES (?,?,?,?,?)
+            """, (aid, capital, capital, 0.0, now_ms()))
         conn.commit()
 
+def state_get(key, default=None):
+    with db() as conn:
+        r = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        return r["value"] if r else default
+
+def state_set(key, value):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO state(key,value) VALUES(?,?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value
+        """, (key, str(value)))
+        conn.commit()
 
 # ============================================================
-# HTTP / TELEGRAM
+# HTTP / MARKET DISCOVERY
 # ============================================================
 
-async def get_json(url: str, params=None):
-    global session
-    assert session is not None
+async def get_json(url, params=None):
     for attempt in range(3):
         try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=20)) as r:
-                text = await r.text()
+            async with session.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=12),
+            ) as r:
+                txt = await r.text()
                 if r.status == 200:
-                    return json.loads(text)
-                log.warning("HTTP %s %s -> %s: %s", r.status, url, params, text[:300])
+                    return json.loads(txt)
+                if r.status == 429:
+                    await asyncio.sleep(0.6 * (attempt + 1))
+                    continue
+                log.warning("HTTP %s %s -> %s", r.status, url, txt[:220])
         except Exception as e:
-            log.warning("GET error %s attempt %s: %s", url, attempt + 1, e)
-        await asyncio.sleep(1.5 * (attempt + 1))
+            log.warning("GET %s failed: %s", url, e)
+        await asyncio.sleep(0.2 * (attempt + 1))
     return None
 
-async def telegram_send_text(text: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    data = {"chat_id": TELEGRAM_CHAT_ID, "text": text[:4000]}
-    try:
-        async with session.post(url, data=data, timeout=aiohttp.ClientTimeout(total=30)) as r:
-            if r.status != 200:
-                log.warning("Telegram sendMessage failed: %s", await r.text())
-    except Exception as e:
-        log.warning("Telegram text error: %s", e)
+async def fetch_event_by_slug(slug):
+    for url, params in (
+        (f"{GAMMA_API}/events/slug/{slug}", None),
+        (f"{GAMMA_API}/events", {"slug": slug}),
+    ):
+        data = await get_json(url, params)
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+    return None
 
-async def telegram_send_file(path: Path, caption: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram credentials are missing; report saved locally: %s", path)
-        return False
+def parse_market_from_event(event, expected_slug):
+    if not isinstance(event, dict):
+        return None
+    raw_markets = event.get("markets")
+    if not isinstance(raw_markets, list):
+        return None
 
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    for raw in raw_markets:
+        if not isinstance(raw, dict):
+            continue
 
-    try:
-        form = aiohttp.FormData()
-        form.add_field("chat_id", TELEGRAM_CHAT_ID)
-        form.add_field("caption", caption[:1024])
-        form.add_field(
-            "document",
-            path.read_bytes(),
-            filename=path.name,
-            content_type="application/zip",
-        )
+        cid = str(raw.get("conditionId") or "")
+        if not cid:
+            continue
 
-        async with session.post(
-            url,
-            data=form,
-            timeout=aiohttp.ClientTimeout(total=120)
-        ) as r:
-            if r.status != 200:
-                log.warning("Telegram sendDocument failed: %s", await r.text())
-                return False
+        outcomes = [str(x).strip().upper() for x in parse_jsonish(raw.get("outcomes"))]
+        tokens = [str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
+        if len(tokens) < 2:
+            continue
 
-            log.info("Report sent to Telegram: %s", path.name)
-            return True
+        up_asset = None
+        down_asset = None
+        for i, out in enumerate(outcomes):
+            if i >= len(tokens):
+                break
+            if out in {"UP", "YES"}:
+                up_asset = tokens[i]
+            elif out in {"DOWN", "NO"}:
+                down_asset = tokens[i]
 
-    except Exception as e:
-        log.exception("Telegram file error: %s", e)
-        return False
+        up_asset = up_asset or tokens[0]
+        down_asset = down_asset or tokens[1]
 
+        slug = str(raw.get("slug") or event.get("slug") or expected_slug)
+        st = slot_start_from_slug(slug) or slot_start_from_slug(expected_slug)
+        if not st:
+            continue
 
-# ============================================================
-# DATA COLLECTION
-# ============================================================
+        return {
+            "condition_id": cid,
+            "slug": slug,
+            "title": str(raw.get("question") or event.get("title") or slug),
+            "start_ts": int(st),
+            "end_ts": int(st) + 300,
+            "up_asset": up_asset,
+            "down_asset": down_asset,
+        }
 
-async def subscribe_asset(asset: str):
+    return None
+
+async def subscribe_asset(asset):
     if not asset or asset in subscribed_assets:
         return
     subscribed_assets.add(asset)
-    await ws_send_queue.put({"assets_ids": [asset], "operation": "subscribe"})
+    await ws_send_queue.put({"operation": "subscribe", "assets_ids": [asset]})
 
-async def load_seed_assets():
-    # Subscribe to assets seen recently so order book history exists before the next trade.
-    cutoff = now_ts() - 6 * 3600
-    with db_connect() as conn:
-        rows = conn.execute(
-            "SELECT DISTINCT asset FROM trades WHERE trade_ts>=? AND asset!=''",
-            (cutoff,),
-        ).fetchall()
-    for row in rows:
-        asset = row["asset"]
-        if asset:
-            subscribed_assets.add(asset)
-    log.info("Seeded %d recent assets for WebSocket", len(subscribed_assets))
+async def add_market(m):
+    cid = m["condition_id"]
+    if cid in markets:
+        return
 
-async def fetch_all_trades(start_ts: int, end_ts: int):
-    """Fetch every public trade page for the requested window."""
-    all_rows = []
-    offset = 0
-    page_number = 1
+    markets[cid] = m
+    asset_to_market[m["up_asset"]] = cid
+    asset_to_market[m["down_asset"]] = cid
 
-    while True:
-        params = {
-            "user": WALLET,
-            "limit": TRADE_PAGE_LIMIT,
-            "offset": offset,
-            "takerOnly": "false",
-            "start": start_ts,
-            "end": end_ts,
-        }
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO markets(
+                condition_id, slug, title, start_ts, end_ts,
+                up_asset, down_asset, discovered_ms
+            ) VALUES (?,?,?,?,?,?,?,?)
+            ON CONFLICT(condition_id) DO UPDATE SET
+                slug=excluded.slug,
+                title=excluded.title,
+                start_ts=excluded.start_ts,
+                end_ts=excluded.end_ts,
+                up_asset=excluded.up_asset,
+                down_asset=excluded.down_asset
+        """, (
+            cid, m["slug"], m["title"], m["start_ts"], m["end_ts"],
+            m["up_asset"], m["down_asset"], now_ms(),
+        ))
+        conn.commit()
 
-        rows = await get_json(f"{DATA_API}/trades", params=params)
+    strategy_state.setdefault(cid, {
+        "started_sides": set(),
+        "buys": {m["up_asset"]: 0, m["down_asset"]: 0},
+        "last_buy": {},
+    })
+    price_history.setdefault(cid, {
+        m["up_asset"]: [],
+        m["down_asset"]: [],
+    })
 
-        if not isinstance(rows, list):
-            log.warning("Trade page %d failed", page_number)
-            break
+    await subscribe_asset(m["up_asset"])
+    await subscribe_asset(m["down_asset"])
 
-        count = len(rows)
+    log.info("MARKET %s | %s -> %s", m["slug"], utc_iso(m["start_ts"]), utc_iso(m["end_ts"]))
 
-        log.info(
-            "Fetched trades page %d: %d",
-            page_number,
-            count,
-        )
-
-        if count == 0:
-            break
-
-        all_rows.extend(rows)
-
-        if count < TRADE_PAGE_LIMIT:
-            break
-
-        offset += TRADE_PAGE_LIMIT
-        page_number += 1
-
-        # Safety guard against an accidental infinite pagination loop.
-        if page_number > 100:
-            log.warning("Trade pagination safety limit reached")
-            break
-
-        await asyncio.sleep(0.10)
-
-    log.info(
-        "Fetched total trades from API: %d",
-        len(all_rows),
-    )
-
-    return all_rows
-
-
-async def fetch_all_activity(start_ts: int, end_ts: int):
-    all_rows = []
-    offset = 0
-    while True:
-        params = {
-            "user": WALLET, "limit": ACTIVITY_PAGE_LIMIT, "offset": offset,
-            "type": ACTIVITY_TYPES, "start": start_ts, "end": end_ts,
-            "sortBy": "TIMESTAMP", "sortDirection": "ASC",
-        }
-        rows = await get_json(f"{DATA_API}/activity", params=params)
-        if not isinstance(rows, list):
-            break
-        all_rows.extend(rows)
-        if len(rows) < ACTIVITY_PAGE_LIMIT:
-            break
-        offset += ACTIVITY_PAGE_LIMIT
-        if offset > 5000:
-            log.warning("Activity pagination cap reached for window")
-            break
-        await asyncio.sleep(0.10)
-    return all_rows
-
-async def poll_activity():
-    log.info("Activity poller started for %s", WALLET)
+async def discovery_loop():
     while True:
         try:
-            last_ts = safe_int(get_state("last_activity_ts", "0"))
-            start = now_ts() - BOOTSTRAP_LOOKBACK_HOURS * 3600 if last_ts <= 0 else max(1, last_ts - 120)
-            end = now_ts() + 5
-            rows = await fetch_all_activity(start, end)
-            new_count = 0
-            max_ts = last_ts
-            type_counts = defaultdict(int)
-            for a in rows:
-                if str(a.get("proxyWallet", "")).lower() not in ("", WALLET):
+            now = now_ts()
+            current = (now // 300) * 300
+            for slot in (current - 300, current, current + 300):
+                slug = f"btc-updown-5m-{slot}"
+                event = await fetch_event_by_slug(slug)
+                if not event:
                     continue
-                ats = safe_int(a.get("timestamp"))
-                max_ts = max(max_ts, ats)
-                if insert_activity(a):
-                    new_count += 1
-                    type_counts[str(a.get("type", "UNKNOWN")).upper()] += 1
-            if max_ts > 0:
-                set_state("last_activity_ts", max_ts)
-            if new_count:
-                log.info("New activity stored: %d | %s", new_count, dict(type_counts))
+                m = parse_market_from_event(event, slug)
+                if m:
+                    await add_market(m)
         except Exception:
-            log.exception("Activity poller failure")
-        await asyncio.sleep(ACTIVITY_POLL_INTERVAL)
+            log.exception("Discovery failed")
+        await asyncio.sleep(DISCOVERY_INTERVAL)
 
-async def poll_trades():
-    log.info("Trade poller started for %s", WALLET)
-    first_run = True
+# ============================================================
+# ORDER BOOK
+# ============================================================
 
-    while True:
-        try:
-            # Keep a 120-second overlap so delayed/out-of-order API records
-            # are not missed. INSERT OR IGNORE removes duplicates.
-            last_ts = safe_int(get_state("last_trade_ts", "0"))
+def level_map(rows):
+    out = {}
+    for x in rows or []:
+        if not isinstance(x, dict):
+            continue
+        p = sf(x.get("price"), math.nan)
+        q = sf(x.get("size"), 0)
+        if not math.isnan(p) and q > 0:
+            out[p] = q
+    return out
 
-            if last_ts <= 0:
-                start = now_ts() - BOOTSTRAP_LOOKBACK_HOURS * 3600
-            else:
-                start = max(1, last_ts - 120)
+def apply_book(asset, payload):
+    books[asset] = {
+        "bids": level_map(payload.get("bids")),
+        "asks": level_map(payload.get("asks")),
+        "received_ms": now_ms(),
+    }
 
-            end = now_ts() + 5
+def apply_price_change(payload):
+    recv = now_ms()
+    changes = payload.get("price_changes") or payload.get("priceChanges") or []
+    for ch in changes:
+        if not isinstance(ch, dict):
+            continue
+        asset = str(ch.get("asset_id") or ch.get("token_id") or ch.get("tokenId") or "")
+        if not asset:
+            continue
+        b = books.setdefault(asset, {"bids": {}, "asks": {}, "received_ms": recv})
+        p = sf(ch.get("price"), math.nan)
+        q = sf(ch.get("size"), 0)
+        side = str(ch.get("side", "")).upper()
+        if math.isnan(p):
+            continue
+        target = b["bids"] if side == "BUY" else b["asks"]
+        if q <= 0:
+            target.pop(p, None)
+        else:
+            target[p] = q
+        b["received_ms"] = recv
 
-            rows = await fetch_all_trades(start, end)
-            rows = sorted(
-                rows,
-                key=lambda x: safe_int(x.get("timestamp")),
-            )
+def best_ask(asset):
+    b = books.get(asset)
+    if not b or not b["asks"]:
+        return None
+    return min(b["asks"])
 
-            new_count = 0
-            duplicate_count = 0
-            max_ts = last_ts
+def best_bid(asset):
+    b = books.get(asset)
+    if not b or not b["bids"]:
+        return None
+    return max(b["bids"])
 
-            for t in rows:
-                proxy_wallet = str(
-                    t.get("proxyWallet", "")
-                ).lower()
+async def refresh_book(asset):
+    data = await get_json(f"{CLOB_API}/book", {"token_id": asset})
+    if isinstance(data, dict):
+        apply_book(asset, data)
+        return True
+    return False
 
-                if proxy_wallet not in ("", WALLET):
-                    continue
+async def ensure_fresh_book(asset):
+    b = books.get(asset)
+    if b and (b["asks"] or b["bids"]):
+        if now_ms() - b["received_ms"] <= MAX_BOOK_AGE_MS:
+            return True
+    return await refresh_book(asset)
 
-                inserted = insert_trade(t)
+# ============================================================
+# WS
+# ============================================================
 
-                asset = str(t.get("asset", ""))
-
-                if asset:
-                    await subscribe_asset(asset)
-
-                tts = safe_int(t.get("timestamp"))
-                max_ts = max(max_ts, tts)
-
-                if inserted:
-                    new_count += 1
-                else:
-                    duplicate_count += 1
-
-            if max_ts > 0:
-                set_state("last_trade_ts", max_ts)
-
-            if new_count > 0:
-                log.info(
-                    "New unique trades stored: %d | duplicates ignored: %d",
-                    new_count,
-                    duplicate_count,
-                )
-            elif first_run:
-                log.info("No new unique trades in initial window")
-
-            first_run = False
-
-        except Exception:
-            log.exception("Trade poller failure")
-
-        await asyncio.sleep(POLL_INTERVAL)
-
-async def positions_poller():
-    await asyncio.sleep(5)
-    while True:
-        try:
-            current = await get_json(
-                f"{DATA_API}/positions",
-                params={"user": WALLET, "limit": 500, "offset": 0},
-            )
-            if isinstance(current, list):
-                save_positions("current", current)
-
-            closed = await get_json(
-                f"{DATA_API}/closed-positions",
-                params={"user": WALLET, "limit": 500, "offset": 0},
-            )
-            if isinstance(closed, list):
-                save_positions("closed", closed)
-        except Exception:
-            log.exception("Positions poller failure")
-
-        await asyncio.sleep(POSITIONS_INTERVAL)
-
-def parse_ws_message(raw):
+def parse_ws(raw):
     if isinstance(raw, bytes):
         raw = raw.decode("utf-8", "ignore")
-    if raw in ("PONG", "PING", ""):
+    if raw in ("", "PING", "PONG"):
         return []
     try:
-        obj = json.loads(raw)
+        x = json.loads(raw)
+        return x if isinstance(x, list) else [x]
     except Exception:
         return []
-    return obj if isinstance(obj, list) else [obj]
 
-async def ws_heartbeat(ws):
+async def ws_sender(ws):
+    while True:
+        msg = await ws_send_queue.get()
+        try:
+            await ws.send(jd(msg))
+        except Exception:
+            await ws_send_queue.put(msg)
+            return
+
+async def ws_ping(ws):
     while True:
         try:
             await ws.send("PING")
@@ -796,514 +526,595 @@ async def ws_heartbeat(ws):
             return
         await asyncio.sleep(10)
 
-async def ws_sender(ws):
-    while True:
-        msg = await ws_send_queue.get()
-        try:
-            await ws.send(json_dumps(msg))
-        except Exception:
-            # Put it back for the next connection.
-            await ws_send_queue.put(msg)
-            return
-
-async def market_ws_loop():
-    await load_seed_assets()
-
+async def ws_loop():
     while True:
         try:
+            if not subscribed_assets:
+                await asyncio.sleep(0.5)
+                continue
+
             async with websockets.connect(
                 MARKET_WS,
                 ping_interval=None,
                 close_timeout=5,
-                max_size=10_000_000,
+                max_size=20_000_000,
             ) as ws:
-                initial_assets = list(subscribed_assets)
-                if initial_assets:
-                    await ws.send(json_dumps({
-                        "assets_ids": initial_assets,
-                        "type": "market",
-                        "custom_feature_enabled": True,
-                    }))
-                else:
-                    # A market stream requires assets; wait until poller discovers one.
-                    log.info("WebSocket waiting for first asset")
-                    while not subscribed_assets:
-                        await asyncio.sleep(1)
-                    await ws.send(json_dumps({
-                        "assets_ids": list(subscribed_assets),
-                        "type": "market",
-                        "custom_feature_enabled": True,
-                    }))
+                await ws.send(jd({
+                    "assets_ids": list(subscribed_assets),
+                    "type": "market",
+                    "custom_feature_enabled": True,
+                }))
 
-                log.info("Market WebSocket connected; assets=%d", len(subscribed_assets))
-                hb = asyncio.create_task(ws_heartbeat(ws))
+                log.info("WS connected | assets=%d", len(subscribed_assets))
+
                 sender = asyncio.create_task(ws_sender(ws))
-
+                ping = asyncio.create_task(ws_ping(ws))
                 try:
                     async for raw in ws:
-                        for event in parse_ws_message(raw):
-                            if not isinstance(event, dict):
+                        for ev in parse_ws(raw):
+                            if not isinstance(ev, dict):
                                 continue
-                            event_type = str(
-                                event.get("event_type")
-                                or event.get("type")
-                                or ""
-                            )
-                            payload = event.get("payload") if isinstance(event.get("payload"), dict) else event
-                            asset = str(
-                                payload.get("asset_id")
-                                or payload.get("asset")
-                                or payload.get("token_id")
-                                or payload.get("tokenId")
-                                or ""
-                            )
-                            if not asset:
-                                continue
-
-                            if event_type in (
-                                "book", "price_change", "best_bid_ask",
-                                "last_trade_price"
-                            ):
-                                insert_book_event(asset, event, event_type, payload)
+                            et = str(ev.get("event_type") or ev.get("type") or "")
+                            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
+                            if et == "book":
+                                asset = str(payload.get("asset_id") or payload.get("token_id") or "")
+                                if asset:
+                                    apply_book(asset, payload)
+                            elif et == "price_change":
+                                apply_price_change(payload)
                 finally:
-                    hb.cancel()
                     sender.cancel()
+                    ping.cancel()
         except Exception as e:
-            log.warning("Market WebSocket disconnected: %s", e)
-            await asyncio.sleep(3)
-
-async def reconcile_trade_books():
-    # For Data API trades that appeared after the actual execution, locate the nearest
-    # historical top-of-book snapshot around trade time.
-    while True:
-        try:
-            with db_connect() as conn:
-                rows = conn.execute("""
-                    SELECT uid, trade_ts, side, asset, price
-                    FROM trades
-                    WHERE execution_type='UNKNOWN'
-                      AND asset!=''
-                      AND trade_ts >= ?
-                    ORDER BY trade_ts DESC
-                    LIMIT 1000
-                """, (now_ts() - BOOK_RETENTION_HOURS * 3600,)).fetchall()
-
-                for tr in rows:
-                    target = tr["trade_ts"] * 1000
-                    book = conn.execute("""
-                        SELECT received_ts_ms, best_bid, best_ask
-                        FROM book_events
-                        WHERE asset=?
-                          AND received_ts_ms BETWEEN ? AND ?
-                        ORDER BY ABS(received_ts_ms - ?) ASC
-                        LIMIT 1
-                    """, (tr["asset"], target - 10000, target + 10000, target)).fetchone()
-
-                    if not book:
-                        continue
-
-                    bid = book["best_bid"]
-                    ask = book["best_ask"]
-                    ex_type, spread = estimate_execution(
-                        tr["side"], tr["price"], bid, ask
-                    )
-                    age = abs(book["received_ts_ms"] - target)
-                    conn.execute("""
-                        UPDATE trades
-                        SET best_bid=?, best_ask=?, book_ts=?, book_age_ms=?,
-                            execution_type=?, spread=?
-                        WHERE uid=?
-                    """, (
-                        bid, ask, book["received_ts_ms"], age,
-                        ex_type, spread, tr["uid"]
-                    ))
-                conn.commit()
-        except Exception:
-            log.exception("Book reconciliation failure")
-        await asyncio.sleep(30)
-
-async def cleanup_loop():
-    while True:
-        try:
-            cutoff_ms = int((time.time() - BOOK_RETENTION_HOURS * 3600) * 1000)
-            with db_connect() as conn:
-                conn.execute("DELETE FROM book_events WHERE received_ts_ms < ?", (cutoff_ms,))
-                conn.commit()
-        except Exception:
-            log.exception("Cleanup failure")
-        await asyncio.sleep(3600)
-
+            log.warning("WS reconnect: %s", e)
+            await asyncio.sleep(1)
 
 # ============================================================
-# REPORTING
+# ORIGINAL M03 SIGNAL ENGINE
 # ============================================================
 
-def rows_to_csv_bytes(rows, columns=None):
-    sio = io.StringIO()
-    if rows:
-        if columns is None:
-            columns = list(rows[0].keys())
-        writer = csv.DictWriter(sio, fieldnames=columns, extrasaction="ignore")
-        writer.writeheader()
-        for r in rows:
-            writer.writerow(dict(r))
-    elif columns:
-        writer = csv.DictWriter(sio, fieldnames=columns)
-        writer.writeheader()
-    return sio.getvalue().encode("utf-8-sig")
+def record_prices(m):
+    cid = m["condition_id"]
+    hist = price_history.setdefault(cid, {m["up_asset"]: [], m["down_asset"]: []})
+    for asset in (m["up_asset"], m["down_asset"]):
+        ask = best_ask(asset)
+        if ask is not None:
+            arr = hist.setdefault(asset, [])
+            arr.append((now_ms(), ask))
+            if len(arr) > 100:
+                del arr[:-100]
 
-def build_market_summary(trades):
-    grouped = defaultdict(list)
-    for r in trades:
-        grouped[(r["condition_id"], r["title"])].append(r)
+def momentum_for(cid, asset):
+    arr = price_history.get(cid, {}).get(asset, [])
+    if len(arr) <= LOOKBACK_TICKS:
+        return None, None
+    current = arr[-1][1]
+    ref = arr[-1 - LOOKBACK_TICKS][1]
+    return current - ref, ref
 
-    out = []
-    for (condition_id, title), rs in grouped.items():
-        buys = [r for r in rs if r["side"] == "BUY"]
-        sells = [r for r in rs if r["side"] == "SELL"]
+def store_signal(cid, elapsed, signal_type, asset, outcome, ask, ref, mom):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO signals(
+                condition_id, ts_ms, elapsed_sec, signal_type,
+                asset, outcome, ask, reference, momentum
+            ) VALUES (?,?,?,?,?,?,?,?,?)
+        """, (cid, now_ms(), elapsed, signal_type, asset, outcome, ask, ref, mom))
+        conn.commit()
 
-        buy_usd = sum(safe_float(r["usd_value"]) for r in buys)
-        sell_usd = sum(safe_float(r["usd_value"]) for r in sells)
-        buy_shares = sum(safe_float(r["size"]) for r in buys)
-        sell_shares = sum(safe_float(r["size"]) for r in sells)
-        avg_buy = (
-            sum(safe_float(r["price"]) * safe_float(r["size"]) for r in buys) / buy_shares
-            if buy_shares else 0
-        )
-        avg_sell = (
-            sum(safe_float(r["price"]) * safe_float(r["size"]) for r in sells) / sell_shares
-            if sell_shares else 0
-        )
+async def fill_market_buy(asset, shares):
+    await ensure_fresh_book(asset)
+    b = books.get(asset)
+    if not b or not b["asks"]:
+        return 0.0, None, 0.0, 0.0
 
-        outcomes = defaultdict(lambda: {"buy_usd": 0.0, "sell_usd": 0.0, "buy_n": 0, "sell_n": 0})
-        for r in rs:
-            o = r["outcome"] or "UNKNOWN"
-            if r["side"] == "BUY":
-                outcomes[o]["buy_usd"] += safe_float(r["usd_value"])
-                outcomes[o]["buy_n"] += 1
-            else:
-                outcomes[o]["sell_usd"] += safe_float(r["usd_value"])
-                outcomes[o]["sell_n"] += 1
+    remain = shares
+    gross = 0.0
+    fee = 0.0
+    filled = 0.0
 
-        maker = sum(1 for r in rs if r["execution_type"] == "MAKER_LIKELY")
-        taker = sum(1 for r in rs if r["execution_type"] == "TAKER_LIKELY")
-        unknown = sum(1 for r in rs if r["execution_type"] == "UNKNOWN")
+    for price in sorted(b["asks"]):
+        qty = b["asks"][price]
+        if qty <= 0:
+            continue
+        take = min(remain, qty)
+        if take <= 0:
+            break
+        gross += take * price
+        fee += fee_for(take, price)
+        filled += take
+        remain -= take
+        if remain <= 1e-10:
+            break
 
-        # Behavioral label is heuristic, intentionally not a claim of exact intent.
-        unique_outcomes_bought = {r["outcome"] for r in buys if r["outcome"]}
-        if sells and sell_shares >= buy_shares * 0.9:
-            behavior = "EARLY/FULL_EXIT_LIKELY"
-        elif sells:
-            behavior = "PARTIAL_EXIT_LIKELY"
-        elif len(unique_outcomes_bought) >= 2:
-            behavior = "BOTH_SIDES/HEDGE_LIKELY"
-        elif buys:
-            behavior = "ACCUMULATE/HOLD_LIKELY"
+    avg = gross / filled if filled > 0 else None
+    return filled, avg, gross, fee
+
+async def execute_for_accounts(cid, elapsed, signal_type, asset, outcome):
+    for capital in CAPITALS:
+        aid = account_id(capital)
+        requested = shares_per_buy(capital)
+
+        with db() as conn:
+            acc = conn.execute(
+                "SELECT * FROM accounts WHERE account_id=?",
+                (aid,),
+            ).fetchone()
+        if not acc:
+            continue
+
+        cash = sf(acc["cash"])
+        if cash <= 0:
+            continue
+
+        filled, avg, gross, fee = await fill_market_buy(asset, requested)
+        total = gross + fee
+
+        # Paper account cannot spend more than its available cash.
+        if total > cash and avg is not None and total > 0:
+            ratio = max(0.0, cash / total)
+            filled *= ratio
+            gross *= ratio
+            fee *= ratio
+            total = gross + fee
+
+        if filled <= 1e-10:
+            status = "NO_FILL"
+        elif filled + 1e-9 < requested:
+            status = "PARTIAL"
         else:
-            behavior = "SELL_ONLY/UNKNOWN"
+            status = "FULL"
 
-        out.append({
-            "condition_id": condition_id,
-            "symbol": rs[0]["symbol"],
-            "title": title,
-            "first_trade_utc": min(r["trade_time_utc"] for r in rs),
-            "last_trade_utc": max(r["trade_time_utc"] for r in rs),
-            "trade_count": len(rs),
-            "buy_count": len(buys),
-            "sell_count": len(sells),
-            "buy_usd": round(buy_usd, 6),
-            "sell_usd": round(sell_usd, 6),
-            "buy_shares": round(buy_shares, 6),
-            "sell_shares": round(sell_shares, 6),
-            "avg_buy_price": round(avg_buy, 6),
-            "avg_sell_price": round(avg_sell, 6),
-            "maker_likely": maker,
-            "taker_likely": taker,
-            "unknown_execution": unknown,
-            "behavior_hint": behavior,
-            "outcome_breakdown_json": json_dumps(outcomes),
-        })
-    return sorted(out, key=lambda x: x["first_trade_utc"])
+        with db() as conn:
+            conn.execute("""
+                INSERT OR IGNORE INTO paper_orders(
+                    account_id, condition_id, ts_ms, elapsed_sec,
+                    signal_type, asset, outcome, requested_shares,
+                    filled_shares, avg_price, gross_cost, fee,
+                    total_cost, status
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                aid, cid, now_ms(), elapsed, signal_type,
+                asset, outcome, requested, filled, avg,
+                gross, fee, total, status,
+            ))
+            if filled > 0:
+                conn.execute(
+                    "UPDATE accounts SET cash=cash-? WHERE account_id=?",
+                    (total, aid),
+                )
+            conn.commit()
 
-def build_report_txt(start_ts, end_ts, trades, summaries, positions):
-    total_usd = sum(safe_float(r["usd_value"]) for r in trades)
-    buys = [r for r in trades if r["side"] == "BUY"]
-    sells = [r for r in trades if r["side"] == "SELL"]
-    maker = sum(1 for r in trades if r["execution_type"] == "MAKER_LIKELY")
-    taker = sum(1 for r in trades if r["execution_type"] == "TAKER_LIKELY")
-    unknown = sum(1 for r in trades if r["execution_type"] == "UNKNOWN")
-    btc = sum(1 for r in trades if r["symbol"] == "BTC")
-    eth = sum(1 for r in trades if r["symbol"] == "ETH")
-    crypto5m = sum(1 for r in trades if r["is_crypto_5m"])
+        if filled > 0:
+            log.info(
+                "%s | %s %s | %.4fsh @ %s | cost=%.2f | cash=%.2f",
+                aid, signal_type, outcome, filled,
+                f"{avg:.4f}" if avg is not None else "-",
+                total, max(0.0, cash - total),
+            )
 
-    lines = [
-        "POWERWINNER WALLET OBSERVER v2",
-        "=" * 60,
-        f"Wallet: {WALLET}",
-        f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
-        "",
-        "HOURLY SUMMARY",
-        f"Trades: {len(trades)}",
-        f"BUY: {len(buys)} | SELL: {len(sells)}",
-        f"Trade notional (sum size*price): ${total_usd:.2f}",
-        f"BTC trades: {btc} | ETH trades: {eth}",
-        f"Likely crypto 5m Up/Down trades: {crypto5m}",
-        f"Markets touched: {len(summaries)}",
-        "",
-        "EXECUTION HEURISTIC",
-        f"MAKER_LIKELY: {maker}",
-        f"TAKER_LIKELY: {taker}",
-        f"UNKNOWN: {unknown}",
-        "",
-        "IMPORTANT:",
-        "MAKER_LIKELY/TAKER_LIKELY are estimates from public order-book data.",
-        "They are NOT proof of the user's private active limit orders.",
-        "UNKNOWN is expected when the bot had no sufficiently close book snapshot.",
-        "",
-        "MARKETS",
-    ]
+async def evaluate_m03(m):
+    cid = m["condition_id"]
+    elapsed = now_ts() - m["start_ts"]
 
-    for s in summaries:
-        lines += [
-            "-" * 60,
-            f"{s['symbol']} | {s['title']}",
-            f"Trades: {s['trade_count']} | BUY {s['buy_count']} | SELL {s['sell_count']}",
-            f"BUY ${s['buy_usd']:.2f} @ avg {s['avg_buy_price']:.4f}",
-            f"SELL ${s['sell_usd']:.2f} @ avg {s['avg_sell_price']:.4f}",
-            f"Execution: maker~{s['maker_likely']} taker~{s['taker_likely']} unknown={s['unknown_execution']}",
-            f"Behavior hint: {s['behavior_hint']}",
-            f"Outcomes: {s['outcome_breakdown_json']}",
-        ]
+    if elapsed < 0 or elapsed >= 300:
+        return
 
-    lines += [
-        "",
-        "FILES IN THIS ARCHIVE",
-        "trades.csv             - every observed trade",
-        "markets_summary.csv    - aggregation by market",
-        "book_events.csv        - public top-of-book events around tracked assets",
-        "positions.csv          - current/closed position snapshots captured in period",
-        "report.txt             - this summary",
-        "metadata.json          - bot/report metadata",
-    ]
-    return "\n".join(lines)
+    st = strategy_state.setdefault(cid, {
+        "started_sides": set(),
+        "buys": {m["up_asset"]: 0, m["down_asset"]: 0},
+        "last_buy": {},
+    })
 
-def create_hourly_zip(start_ts: int, end_ts: int) -> Path:
-    """
-    Stable lightweight report.
+    candidates = []
 
-    The full book_events table is NOT exported because it can contain a very
-    large number of WebSocket rows and caused memory spikes on Render.
-    For each trade, trades.csv already contains best_bid, best_ask, book_ts,
-    book_age_ms, execution_type and spread.
-    """
-    with db_connect() as conn:
-        trades = conn.execute(
-            """
-            SELECT * FROM trades
-            WHERE trade_ts >= ? AND trade_ts < ?
-            ORDER BY trade_ts, observed_at
-            """,
-            (start_ts, end_ts),
-        ).fetchall()
+    for asset, outcome in ((m["up_asset"], "Up"), (m["down_asset"], "Down")):
+        ask = best_ask(asset)
+        if ask is None or ask <= 0.01 or ask >= 0.99:
+            continue
 
-        positions = conn.execute(
-            """
-            SELECT * FROM positions_snapshots
-            WHERE snapshot_ts >= ? AND snapshot_ts < ?
-            ORDER BY snapshot_ts
-            """,
-            (start_ts, end_ts),
-        ).fetchall()
+        mom, ref = momentum_for(cid, asset)
+        if mom is None:
+            continue
 
-        activities = conn.execute(
-            """
-            SELECT * FROM activities
-            WHERE activity_ts >= ? AND activity_ts < ?
-            ORDER BY activity_ts, observed_at
-            """,
-            (start_ts, end_ts),
-        ).fetchall()
+        buys = st["buys"].get(asset, 0)
+        signal = None
 
-    summaries = build_market_summary(trades)
-    report_txt = build_report_txt(start_ts, end_ts, trades, summaries, positions)
+        if buys == 0:
+            if not st["started_sides"]:
+                if mom >= ENTRY_MOVE:
+                    signal = "ENTRY"
+            else:
+                if mom >= SWITCH_MOVE:
+                    signal = "SWITCH"
+        else:
+            last_buy = st["last_buy"].get(asset)
+            if (
+                last_buy is not None
+                and ask >= last_buy + PYRAMID_STEP
+                and mom > 0
+                and buys < MAX_BUYS_SIDE
+            ):
+                signal = "PYRAMID"
 
-    dt_start = datetime.fromtimestamp(start_ts, tz=timezone.utc)
-    dt_end = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+        if signal:
+            candidates.append((mom, asset, outcome, ask, ref, signal))
 
-    name = (
-        f"powerwinner_{dt_start:%Y-%m-%d_%H-%M}_"
-        f"{dt_end:%H-%M}_UTC.zip"
-    )
-    path = REPORT_DIR / name
+    if not candidates:
+        return
 
-    summary_columns = [
-        "condition_id", "symbol", "title", "first_trade_utc", "last_trade_utc",
-        "trade_count", "buy_count", "sell_count", "buy_usd", "sell_usd",
-        "buy_shares", "sell_shares", "avg_buy_price", "avg_sell_price",
-        "maker_likely", "taker_likely", "unknown_execution",
-        "behavior_hint", "outcome_breakdown_json"
-    ]
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    mom, asset, outcome, ask, ref, signal = candidates[0]
 
-    metadata = {
-        "version": "2.4-activity",
-        "activity_count": len(activities),
-        "wallet": WALLET,
-        "period_start_utc": utc_iso(start_ts),
-        "period_end_utc": utc_iso(end_ts),
-        "generated_at_utc": utc_iso(),
-        "trade_count": len(trades),
-        "market_count": len(summaries),
-        "book_export": "per-trade snapshots only",
-        "maker_taker_note": (
-            "MAKER_LIKELY/TAKER_LIKELY are heuristics based on the closest "
-            "public order-book snapshot saved directly with each trade."
-        ),
-    }
+    store_signal(cid, elapsed, signal, asset, outcome, ask, ref, mom)
+    await execute_for_accounts(cid, elapsed, signal, asset, outcome)
 
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as z:
-        z.writestr("trades.csv", rows_to_csv_bytes(trades))
-        z.writestr(
-            "markets_summary.csv",
-            rows_to_csv_bytes(summaries, summary_columns),
-        )
-        z.writestr("positions.csv", rows_to_csv_bytes(positions))
-        z.writestr("activity.csv", rows_to_csv_bytes(activities))
-        z.writestr("report.txt", report_txt.encode("utf-8"))
-        z.writestr(
-            "metadata.json",
-            json.dumps(metadata, ensure_ascii=False, indent=2).encode("utf-8"),
-        )
+    st["started_sides"].add(asset)
+    st["buys"][asset] = st["buys"].get(asset, 0) + 1
+    st["last_buy"][asset] = ask
 
+async def strategy_loop():
     log.info(
-        "ZIP created: %s | trades=%d | markets=%d | bytes=%d",
-        path.name,
-        len(trades),
-        len(summaries),
-        path.stat().st_size,
+        "M03 Paper Money started | capitals=%s | base %.0f -> %.1f shares | cycle=%.1fs",
+        CAPITALS, BASE_CAPITAL, BASE_SHARES, STRATEGY_INTERVAL,
     )
-
-    return path
-
-def next_hour_boundary(ts=None):
-    if ts is None:
-        ts = now_ts()
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    nxt = dt.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
-    return int(nxt.timestamp())
-
-async def hourly_reporter():
-    """
-    Reliable hourly reporter:
-    - waits 2 minutes after the UTC hour closes;
-    - survives Render restarts;
-    - sends every completed but unsent hour;
-    - advances state only after Telegram confirms the ZIP upload.
-    """
-
-    saved = safe_int(get_state("last_report_end", "0"))
-
-    if saved > 0:
-        last_report_end = saved
-    else:
-        dt = datetime.now(timezone.utc)
-        hour_start = dt.replace(minute=0, second=0, microsecond=0)
-        last_report_end = int(hour_start.timestamp())
-        set_state("last_report_end", last_report_end)
-
-        log.info(
-            "Reporter initialized from %s",
-            utc_iso(last_report_end)
-        )
 
     while True:
         try:
             now = now_ts()
+            for m in list(markets.values()):
+                if m["start_ts"] <= now < m["end_ts"]:
+                    record_prices(m)
+                    await evaluate_m03(m)
+        except Exception:
+            log.exception("Strategy loop failed")
 
-            # With REPORT_DELAY_SECONDS=120, the 19:00-20:00 UTC report
-            # becomes eligible at about 20:02 UTC.
-            eligible_end = ((now - REPORT_DELAY_SECONDS) // 3600) * 3600
+        await asyncio.sleep(STRATEGY_INTERVAL)
 
-            while last_report_end < eligible_end:
-                start_ts = last_report_end
-                end_ts = start_ts + 3600
+# ============================================================
+# RESOLUTION
+# ============================================================
 
-                log.info(
-                    "Preparing hourly report: %s -> %s",
-                    utc_iso(start_ts),
-                    utc_iso(end_ts)
-                )
+def resolved_winner_from_market(raw):
+    if not isinstance(raw, dict):
+        return None, None
 
-                log.info("Starting lightweight ZIP generation")
-                path = create_hourly_zip(start_ts, end_ts)
+    token_objs = raw.get("tokens")
+    if isinstance(token_objs, list):
+        for tok in token_objs:
+            if isinstance(tok, dict) and bool(tok.get("winner", False)):
+                asset = str(tok.get("token_id") or tok.get("tokenId") or tok.get("id") or "")
+                outcome = str(tok.get("outcome") or tok.get("name") or "")
+                if asset:
+                    return asset, outcome
 
-                with db_connect() as conn:
-                    count = conn.execute(
-                        """
-                        SELECT COUNT(*) AS c
-                        FROM trades
-                        WHERE trade_ts >= ?
-                        AND trade_ts < ?
-                        """,
-                        (start_ts, end_ts),
-                    ).fetchone()["c"]
+    outcomes = [str(x) for x in parse_jsonish(raw.get("outcomes"))]
+    tokens = [str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
+    prices_raw = parse_jsonish(raw.get("outcomePrices"))
+    if len(outcomes) >= 2 and len(tokens) >= 2 and len(prices_raw) >= 2:
+        prices = [sf(x, -1) for x in prices_raw]
+        n = min(len(outcomes), len(tokens), len(prices))
+        idx = max(range(n), key=lambda i: prices[i])
+        others = [prices[i] for i in range(n) if i != idx]
+        if prices[idx] >= 0.999 and (max(others) if others else -1) <= 0.001:
+            return tokens[idx], outcomes[idx]
+
+    return None, None
+
+async def resolve_market_row(row):
+    event = await fetch_event_by_slug(str(row["slug"]))
+    if not isinstance(event, dict):
+        return None, None
+
+    rms = event.get("markets")
+    if not isinstance(rms, list):
+        return None, None
+
+    raw = None
+    for x in rms:
+        if isinstance(x, dict) and str(x.get("conditionId") or "") == str(row["condition_id"]):
+            raw = x
+            break
+    if raw is None and len(rms) == 1 and isinstance(rms[0], dict):
+        raw = rms[0]
+
+    return resolved_winner_from_market(raw)
+
+async def settle_market(cid, winning_asset, winning_outcome):
+    with db() as conn:
+        for capital in CAPITALS:
+            aid = account_id(capital)
+            existing = conn.execute(
+                "SELECT 1 FROM results WHERE account_id=? AND condition_id=?",
+                (aid, cid),
+            ).fetchone()
+            if existing:
+                continue
+
+            orders = conn.execute("""
+                SELECT * FROM paper_orders
+                WHERE account_id=? AND condition_id=?
+                ORDER BY id
+            """, (aid, cid)).fetchall()
+
+            if not orders:
+                # No trade in this market for that account.
+                continue
+
+            total_cost = sum(sf(o["total_cost"]) for o in orders)
+            payout = sum(
+                sf(o["filled_shares"])
+                for o in orders
+                if str(o["asset"]) == str(winning_asset)
+            )
+            pnl = payout - total_cost
+
+            conn.execute("""
+                INSERT INTO results(
+                    account_id, condition_id, winning_asset, winning_outcome,
+                    payout, market_cost, pnl, settled_ms
+                ) VALUES (?,?,?,?,?,?,?,?)
+            """, (
+                aid, cid, winning_asset, winning_outcome,
+                payout, total_cost, pnl, now_ms(),
+            ))
+            conn.execute("""
+                UPDATE accounts
+                SET cash=cash+?,
+                    realized_pnl=realized_pnl+?
+                WHERE account_id=?
+            """, (payout, pnl, aid))
+
+        conn.execute("""
+            UPDATE markets
+            SET resolved=1, winning_asset=?, winning_outcome=?
+            WHERE condition_id=?
+        """, (winning_asset, winning_outcome, cid))
+        conn.commit()
+
+    log.info("RESOLVED %s | winner=%s", cid[-8:], winning_outcome)
+
+async def resolution_loop():
+    while True:
+        try:
+            cutoff = now_ts() - 10
+            with db() as conn:
+                rows = conn.execute("""
+                    SELECT * FROM markets
+                    WHERE resolved=0 AND end_ts < ?
+                    ORDER BY end_ts
+                    LIMIT 100
+                """, (cutoff,)).fetchall()
+
+            for row in rows:
+                wa, wo = await resolve_market_row(row)
+                if wa:
+                    await settle_market(str(row["condition_id"]), wa, wo)
+        except Exception:
+            log.exception("Resolution failed")
+
+        await asyncio.sleep(10)
+
+# ============================================================
+# EQUITY / REPORTS
+# ============================================================
+
+async def account_metrics(aid):
+    with db() as conn:
+        acc = conn.execute("SELECT * FROM accounts WHERE account_id=?", (aid,)).fetchone()
+        if not acc:
+            return None
+
+        rows = conn.execute("""
+            SELECT po.asset, SUM(po.filled_shares) AS shares
+            FROM paper_orders po
+            JOIN markets m ON m.condition_id=po.condition_id
+            WHERE po.account_id=? AND m.resolved=0
+            GROUP BY po.asset
+        """, (aid,)).fetchall()
+
+    open_value = 0.0
+    for r in rows:
+        asset = str(r["asset"])
+        shares = sf(r["shares"])
+        if shares <= 0:
+            continue
+        await ensure_fresh_book(asset)
+        bid = best_bid(asset)
+        if bid is not None:
+            open_value += shares * bid
+
+    cash = sf(acc["cash"])
+    initial = sf(acc["initial_capital"])
+    realized = sf(acc["realized_pnl"])
+    equity = cash + open_value
+
+    return {
+        "account_id": aid,
+        "initial_capital": initial,
+        "cash": cash,
+        "open_value": open_value,
+        "equity": equity,
+        "realized_pnl": realized,
+        "total_return": equity - initial,
+        "return_pct": ((equity - initial) / initial * 100.0) if initial > 0 else 0.0,
+    }
+
+def csv_bytes(rows, columns=None):
+    s = io.StringIO()
+    if rows:
+        if columns is None:
+            columns = list(rows[0].keys())
+        w = csv.DictWriter(s, fieldnames=columns, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(dict(r))
+    elif columns:
+        w = csv.DictWriter(s, fieldnames=columns)
+        w.writeheader()
+    return s.getvalue().encode("utf-8-sig")
+
+async def make_report(start_ts, end_ts):
+    sm, em = start_ts * 1000, end_ts * 1000
+
+    metrics = []
+    for capital in CAPITALS:
+        m = await account_metrics(account_id(capital))
+        if m:
+            metrics.append(m)
+
+    with db() as conn:
+        signals = conn.execute("""
+            SELECT * FROM signals
+            WHERE ts_ms>=? AND ts_ms<?
+            ORDER BY ts_ms
+        """, (sm, em)).fetchall()
+
+        orders = conn.execute("""
+            SELECT * FROM paper_orders
+            WHERE ts_ms>=? AND ts_ms<?
+            ORDER BY ts_ms, account_id
+        """, (sm, em)).fetchall()
+
+        results = conn.execute("""
+            SELECT r.*, m.slug, m.title, m.end_ts
+            FROM results r
+            JOIN markets m ON m.condition_id=r.condition_id
+            WHERE (m.end_ts*1000)>=? AND (m.end_ts*1000)<?
+            ORDER BY m.end_ts, r.account_id
+        """, (sm, em)).fetchall()
+
+    lines = [
+        "M03 PAPER MONEY BOT",
+        "=" * 68,
+        f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
+        f"Original M03: entry={ENTRY_MOVE}, pyramid={PYRAMID_STEP}, lookback={LOOKBACK_TICKS}, switch={SWITCH_MOVE}",
+        f"Capital accounts: {CAPITALS}",
+        "",
+        f"M03 signals this hour: {len(signals)}",
+        f"Paper orders this hour: {len(orders)}",
+        f"Settled account-results attributed to this hour: {len(results)}",
+        "",
+        "ACCOUNT STATUS",
+    ]
+
+    for m in metrics:
+        lines.append(
+            f"{m['account_id']}: start=${m['initial_capital']:.2f} | "
+            f"cash=${m['cash']:.2f} | open=${m['open_value']:.2f} | "
+            f"equity=${m['equity']:.2f} | return=${m['total_return']:+.2f} "
+            f"({m['return_pct']:+.2f}%) | realized=${m['realized_pnl']:+.2f}"
+        )
+
+    d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    path = REPORT_DIR / f"m03_paper_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
+
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("signals.csv", csv_bytes(signals))
+        z.writestr("orders.csv", csv_bytes(orders))
+        z.writestr("results.csv", csv_bytes(results))
+        z.writestr("accounts.csv", csv_bytes(metrics))
+        z.writestr("report.txt", "\n".join(lines).encode("utf-8"))
+
+    return path, metrics
+
+async def tg_file(path, caption):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured; report at %s", path)
+        return False
+
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
+    form = aiohttp.FormData()
+    form.add_field("chat_id", TELEGRAM_CHAT_ID)
+    form.add_field("caption", caption[:1024])
+    form.add_field(
+        "document", path.read_bytes(),
+        filename=path.name,
+        content_type="application/zip",
+    )
+
+    try:
+        async with session.post(
+            url, data=form,
+            timeout=aiohttp.ClientTimeout(total=120),
+        ) as r:
+            if r.status != 200:
+                log.warning("Telegram error: %s", await r.text())
+                return False
+            return True
+    except Exception:
+        log.exception("Telegram send failed")
+        return False
+
+async def reporter():
+    saved = si(state_get("last_report_end", "0"))
+    if saved <= 0:
+        d = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        saved = int(d.timestamp())
+        state_set("last_report_end", saved)
+
+    last_end = saved
+
+    while True:
+        try:
+            eligible = ((now_ts() - REPORT_DELAY_SECONDS) // 3600) * 3600
+            while last_end < eligible:
+                start = last_end
+                end = start + 3600
+
+                path, metrics = await make_report(start, end)
+                best = max(metrics, key=lambda x: x["return_pct"]) if metrics else None
 
                 caption = (
-                    "Powerwinner hourly report\n"
-                    f"{utc_iso(start_ts)} → {utc_iso(end_ts)}\n"
-                    f"Trades: {count}"
+                    "📊 M03 Paper Money\n"
+                    f"{utc_iso(start)} → {utc_iso(end)}\n"
+                    + (
+                        f"Best: {best['account_id']} | "
+                        f"equity ${best['equity']:.2f} | "
+                        f"{best['return_pct']:+.2f}%"
+                        if best else "No account metrics"
+                    )
                 )
 
-                sent = await telegram_send_file(path, caption)
-
-                if not sent:
-                    log.warning(
-                        "Report was not confirmed by Telegram; will retry later: %s -> %s",
-                        utc_iso(start_ts),
-                        utc_iso(end_ts)
-                    )
+                ok = await tg_file(path, caption)
+                if not ok:
                     break
 
-                last_report_end = end_ts
-                set_state("last_report_end", last_report_end)
-
-                log.info(
-                    "Hourly report confirmed; last_report_end=%s",
-                    utc_iso(last_report_end)
-                )
+                last_end = end
+                state_set("last_report_end", last_end)
 
         except Exception:
-            log.exception("Hourly report failure")
+            log.exception("Reporter failed")
 
         await asyncio.sleep(REPORT_CHECK_INTERVAL)
 
-async def startup_message():
-    # Do not spam Telegram on Render restarts or redeploys.
-    log.info(
-        "Powerwinner Wallet Observer v2.4 started; activity tracking enabled"
-    )
-
-
 # ============================================================
-# HEALTH SERVER FOR RENDER
+# HEALTH
 # ============================================================
 
 async def health(request):
-    with db_connect() as conn:
-        trades = conn.execute("SELECT COUNT(*) c FROM trades").fetchone()["c"]
-        last = conn.execute("SELECT MAX(trade_ts) m FROM trades").fetchone()["m"]
-        activities = conn.execute("SELECT COUNT(*) c FROM activities").fetchone()["c"]
+    metrics = []
+    for capital in CAPITALS:
+        m = await account_metrics(account_id(capital))
+        if m:
+            metrics.append(m)
+
     return web.json_response({
         "ok": True,
-        "wallet": WALLET,
-        "db": str(DB_PATH),
-        "trades": trades,
-        "activities": activities,
-        "last_trade_utc": utc_iso(last) if last else None,
+        "version": "1.0-m03-paper-money",
+        "paper_only": True,
+        "strategy": "M03_P08_L2",
+        "capitals": CAPITALS,
+        "base_capital": BASE_CAPITAL,
+        "base_shares": BASE_SHARES,
+        "accounts": metrics,
+        "markets_tracked": len(markets),
         "ws_assets": len(subscribed_assets),
         "time_utc": utc_iso(),
     })
 
-async def run_web():
+async def web_server():
     app = web.Application()
     app.router.add_get("/", health)
     app.router.add_get("/health", health)
@@ -1311,8 +1122,7 @@ async def run_web():
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    log.info("Health server listening on port %s", PORT)
-
+    log.info("Health server on :%d", PORT)
 
 # ============================================================
 # MAIN
@@ -1321,29 +1131,19 @@ async def run_web():
 async def main():
     global session
 
-    if not TELEGRAM_BOT_TOKEN:
-        log.warning("TELEGRAM_BOT_TOKEN is not set")
-    if not TELEGRAM_CHAT_ID:
-        log.warning("TELEGRAM_CHAT_ID is not set")
-
     init_db()
-
-    headers = {
-        "User-Agent": "PowerwinnerWalletObserver/2.4",
+    session = aiohttp.ClientSession(headers={
+        "User-Agent": "M03PaperMoneyBot/1.0",
         "Accept": "application/json",
-    }
-    session = aiohttp.ClientSession(headers=headers)
+    })
 
     tasks = [
-        asyncio.create_task(run_web()),
-        asyncio.create_task(poll_trades()),
-        asyncio.create_task(poll_activity()),
-        asyncio.create_task(positions_poller()),
-        asyncio.create_task(market_ws_loop()),
-        asyncio.create_task(reconcile_trade_books()),
-        asyncio.create_task(cleanup_loop()),
-        asyncio.create_task(hourly_reporter()),
-        asyncio.create_task(startup_message()),
+        asyncio.create_task(web_server()),
+        asyncio.create_task(discovery_loop()),
+        asyncio.create_task(ws_loop()),
+        asyncio.create_task(strategy_loop()),
+        asyncio.create_task(resolution_loop()),
+        asyncio.create_task(reporter()),
     ]
 
     try:
