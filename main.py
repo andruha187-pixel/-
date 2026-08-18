@@ -123,68 +123,14 @@ session: Optional[aiohttp.ClientSession] = None
 #
 
 VARIANTS = [
-    {"name": "M03_P08_L2", "entry_move": 0.03, "pyramid_step": 0.08, "lookback": 2, "switch_move": 0.04, "max_buys_side": 6},
-    {"name": "M04_P08_L2", "entry_move": 0.04, "pyramid_step": 0.08, "lookback": 2, "switch_move": 0.04, "max_buys_side": 6},
-    {"name": "M05_P08_L2", "entry_move": 0.05, "pyramid_step": 0.08, "lookback": 2, "switch_move": 0.05, "max_buys_side": 6},
-    {"name": "M05_P10_L2", "entry_move": 0.05, "pyramid_step": 0.10, "lookback": 2, "switch_move": 0.05, "max_buys_side": 6},
-    {"name": "M06_P10_L2", "entry_move": 0.06, "pyramid_step": 0.10, "lookback": 2, "switch_move": 0.06, "max_buys_side": 6},
-    {"name": "M08_P10_L2", "entry_move": 0.08, "pyramid_step": 0.10, "lookback": 2, "switch_move": 0.08, "max_buys_side": 6},
-    {"name": "M05_P10_L3", "entry_move": 0.05, "pyramid_step": 0.10, "lookback": 3, "switch_move": 0.05, "max_buys_side": 6},
-    {"name": "M08_P12_L3", "entry_move": 0.08, "pyramid_step": 0.12, "lookback": 3, "switch_move": 0.08, "max_buys_side": 5},
-
-    # Prospective v2 filter derived from the first M03 research sample.
-    # IMPORTANT: keep these rules fixed while collecting new out-of-sample data.
     {
-        "name": "M03_V2_LOCK",
+        "name": "M03_P08_L2",
         "entry_move": 0.03,
         "pyramid_step": 0.08,
         "lookback": 2,
-        "switch_move": 999.0,       # effectively disabled
+        "switch_move": 0.04,
         "max_buys_side": 6,
-        "entry_price_min": 0.55,
-        "entry_price_max": 0.75,
-        "momentum_cap": 0.30,
-        "allow_switch": False,
     },
-    # 10-й вариант: исходный M03 без переворотов, новые покупки только до 90-й секунды.
-    {
-        "name": "M03_V3_NOSW90",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 999.0,
-        "max_buys_side": 5,
-        "allow_switch": False,
-        "entry_cutoff_sec": 90,
-    },
-
-    # 11-й вариант: исходный M03, но SWITCH разрешён только пока новая сторона дешёвая.
-    {
-        "name": "M03_V4_SW45",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 0.03,
-        "max_buys_side": 5,
-        "allow_switch": True,
-        "switch_price_max": 0.45,
-    },
-
-    # 12-й вариант: динамический M03 V5.
-    # Первые 60 сек: дорогие SWITCH > 0.45 блокируются.
-    # После 60 сек: <=0.45 разрешены; 0.46-0.50 только при momentum < 0.10;
-    # 0.51-0.70 блокируются; >0.70 оставляем как у исходного M03 для проверки.
-    {
-        "name": "M03_V5_DYNAMIC",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 0.03,
-        "max_buys_side": 5,
-        "allow_switch": True,
-        "dynamic_switch_v5": True,
-    },
-
 ]
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
@@ -1947,7 +1893,7 @@ async def health(request):
 
     return web.json_response({
         "ok": True,
-        "version": "1.8-original-plus-deposits",
+        "version": "2.0-m03-only-deposits",
         "symbol": SYMBOL,
         "decision_interval": DECISION_INTERVAL,
         "trade_window_seconds": TRADE_WINDOW_SECONDS,
@@ -1986,7 +1932,7 @@ async def main():
     init_db()
 
     session = aiohttp.ClientSession(headers={
-        "User-Agent": "PowerwinnerInspiredStrategySimulator/1.8",
+        "User-Agent": "PowerwinnerInspiredStrategySimulator/2.0",
         "Accept": "application/json",
     })
 
