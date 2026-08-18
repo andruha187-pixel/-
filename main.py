@@ -43,24 +43,17 @@ TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
 # makes variants comparable. Scale later after finding profitable logic.
 ORDER_SIZE = float(os.getenv("ORDER_SIZE", "10"))
 
-# ============================================================
-# EXACT M03 PAPER-MONEY ACCOUNTS
-# ============================================================
-# IMPORTANT:
-# The strategy engine below is left intact. These accounts merely mirror
-# successfully executed M03_P08_L2 signals from the original simulator.
-#
-# $1000 mirrors the original 10-share lot. Other accounts scale linearly.
-PAPER_CAPITALS = [
+# Virtual deposits mirror ONLY already-executed M03_P08_L2 decisions.
+# They never generate signals and never modify strategy_state.
+DEPOSIT_CAPITALS = [
     float(x.strip())
     for x in os.getenv(
-        "PAPER_CAPITALS",
+        "DEPOSIT_CAPITALS",
         "100,250,500,1000,2500",
     ).split(",")
     if x.strip()
 ]
-PAPER_BASE_CAPITAL = float(os.getenv("PAPER_BASE_CAPITAL", "1000"))
-PAPER_ACCOUNT_REPORTS = os.getenv("PAPER_ACCOUNT_REPORTS", "1").strip() not in {"0", "false", "False"}
+DEPOSIT_BASE_CAPITAL = float(os.getenv("DEPOSIT_BASE_CAPITAL", "1000"))
 
 
 # Crypto taker fee rate from current Polymarket docs.
@@ -90,8 +83,8 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "m03_exact_paper.db"
-REPORT_DIR = DATA_DIR / "m03_exact_paper_reports"
+DB_PATH = DATA_DIR / "strategy_simulator_deposits.db"
+REPORT_DIR = DATA_DIR / "strategy_deposit_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -211,6 +204,12 @@ price_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
 
 # strategy_state[(condition, variant)] -> state dict
 strategy_state = {}
+
+
+# Queue of EXACT successful original M03 executions.
+# Deposit worker consumes this; strategy loop never waits for account DB work.
+deposit_mirror_queue: asyncio.Queue = asyncio.Queue()
+deposit_signal_seq = 0
 
 # ============================================================
 # HELPERS
@@ -362,49 +361,53 @@ def init_db():
             PRIMARY KEY(condition_id, variant)
         );
 
-        CREATE TABLE IF NOT EXISTS paper_accounts (
+        CREATE TABLE IF NOT EXISTS deposit_accounts (
             account_id TEXT PRIMARY KEY,
-            initial_capital REAL,
-            cash REAL,
-            realized_pnl REAL DEFAULT 0,
-            created_ms INTEGER
+            initial_capital REAL NOT NULL,
+            cash REAL NOT NULL,
+            realized_pnl REAL NOT NULL DEFAULT 0,
+            created_ms INTEGER NOT NULL
         );
 
-        CREATE TABLE IF NOT EXISTS paper_account_trades (
+        CREATE TABLE IF NOT EXISTS deposit_trades (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account_id TEXT,
-            trade_ms INTEGER,
-            condition_id TEXT,
-            asset TEXT,
-            outcome TEXT,
-            signal_type TEXT,
-            requested_shares REAL,
-            filled_shares REAL,
+            signal_id INTEGER NOT NULL,
+            account_id TEXT NOT NULL,
+            trade_ms INTEGER NOT NULL,
+            condition_id TEXT NOT NULL,
+            asset TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            signal_type TEXT NOT NULL,
+            requested_shares REAL NOT NULL,
+            filled_shares REAL NOT NULL,
             avg_price REAL,
-            gross_cost REAL,
-            fee REAL,
-            total_cost REAL,
-            status TEXT
+            gross_cost REAL NOT NULL,
+            fee REAL NOT NULL,
+            total_cost REAL NOT NULL,
+            status TEXT NOT NULL,
+            fills_json TEXT,
+            UNIQUE(signal_id, account_id)
         );
 
-        CREATE TABLE IF NOT EXISTS paper_account_results (
-            account_id TEXT,
-            condition_id TEXT,
+        CREATE TABLE IF NOT EXISTS deposit_results (
+            account_id TEXT NOT NULL,
+            condition_id TEXT NOT NULL,
             winning_asset TEXT,
             winning_outcome TEXT,
-            total_cost REAL,
-            payout REAL,
-            pnl REAL,
-            settled_ms INTEGER,
+            total_cost REAL NOT NULL,
+            payout REAL NOT NULL,
+            pnl REAL NOT NULL,
+            trades INTEGER NOT NULL,
+            settled_ms INTEGER NOT NULL,
             PRIMARY KEY(account_id, condition_id)
         );
 
-        CREATE INDEX IF NOT EXISTS idx_account_trades_market
-            ON paper_account_trades(condition_id);
-        CREATE INDEX IF NOT EXISTS idx_account_trades_account
-            ON paper_account_trades(account_id);
-        CREATE INDEX IF NOT EXISTS idx_account_results_account
-            ON paper_account_results(account_id);
+        CREATE INDEX IF NOT EXISTS idx_deposit_trades_ms
+            ON deposit_trades(trade_ms);
+        CREATE INDEX IF NOT EXISTS idx_deposit_trades_condition
+            ON deposit_trades(condition_id);
+        CREATE INDEX IF NOT EXISTS idx_deposit_results_account
+            ON deposit_results(account_id);
 
         CREATE TABLE IF NOT EXISTS state (
             key TEXT PRIMARY KEY,
@@ -417,19 +420,13 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_results_ms ON market_results(settled_ms);
         """)
 
-        for capital in PAPER_CAPITALS:
-            account_id = f"CAP_{capital:g}"
+        for capital in DEPOSIT_CAPITALS:
+            aid = f"CAP_{capital:g}"
             conn.execute("""
-                INSERT OR IGNORE INTO paper_accounts(
+                INSERT OR IGNORE INTO deposit_accounts(
                     account_id, initial_capital, cash, realized_pnl, created_ms
                 ) VALUES (?,?,?,?,?)
-            """, (
-                account_id,
-                capital,
-                capital,
-                0.0,
-                now_ms(),
-            ))
+            """, (aid, capital, capital, 0.0, now_ms()))
         conn.commit()
 
 
@@ -843,153 +840,173 @@ async def ws_loop():
 
 
 # ============================================================
-# EXACT M03 ACCOUNT MIRROR
+# VIRTUAL DEPOSIT MIRROR
 # ============================================================
 
-def paper_account_id(capital):
+def deposit_account_id(capital):
     return f"CAP_{capital:g}"
 
-def paper_account_shares(capital):
-    # $1000 account == original ORDER_SIZE (10 shares by default).
-    return ORDER_SIZE * (float(capital) / PAPER_BASE_CAPITAL)
+def deposit_order_size(capital):
+    # CAP_1000 has exactly the original M03 ORDER_SIZE.
+    return ORDER_SIZE * (float(capital) / DEPOSIT_BASE_CAPITAL)
 
-def simulate_buy_snapshot(asks_snapshot, wanted):
+def simulate_buy_from_snapshot(asks_snapshot, wanted):
     remaining = float(wanted)
     fills = []
 
     for p in sorted(asks_snapshot):
-        q = sf(asks_snapshot[p], 0.0)
+        q = sf(asks_snapshot.get(p), 0.0)
         if q <= 0:
             continue
+
         take = min(q, remaining)
         if take > 0:
             fills.append((float(p), take))
             remaining -= take
+
         if remaining <= 1e-12:
             break
 
-    return fills, max(0.0, wanted - remaining)
+    return fills, max(0.0, float(wanted) - remaining)
 
-async def mirror_m03_to_accounts(
-    condition,
-    asset,
-    outcome,
-    signal_type,
-    asks_snapshot,
-    signal_ms,
-):
+async def deposit_mirror_worker():
     """
-    Mirrors one SUCCESSFUL original M03 execution to independent accounts.
+    Consume exact M03 executions.
 
-    It does NOT write strategy_state, price_history, books, or M03 last_buy.
-    Therefore virtual account fills cannot change future M03 signals.
+    No momentum, thresholds, timing, switches or pyramids are recalculated here.
+    Therefore this worker cannot create a different M03 trade sequence.
     """
-    for capital in PAPER_CAPITALS:
-        account_id = paper_account_id(capital)
-        requested = paper_account_shares(capital)
+    while True:
+        ev = await deposit_mirror_queue.get()
 
-        with db() as conn:
-            acc = conn.execute(
-                "SELECT * FROM paper_accounts WHERE account_id=?",
-                (account_id,),
-            ).fetchone()
+        try:
+            signal_id = int(ev["signal_id"])
+            signal_ms = int(ev["signal_ms"])
+            condition = str(ev["condition_id"])
+            asset = str(ev["asset"])
+            outcome = str(ev["outcome"])
+            signal_type = str(ev["signal_type"])
+            asks_snapshot = dict(ev["asks_snapshot"])
 
-        if not acc:
-            continue
+            for capital in DEPOSIT_CAPITALS:
+                aid = deposit_account_id(capital)
+                requested = deposit_order_size(capital)
 
-        available_cash = sf(acc["cash"])
-        if available_cash <= 0:
-            continue
+                with db() as conn:
+                    acc = conn.execute(
+                        "SELECT * FROM deposit_accounts WHERE account_id=?",
+                        (aid,),
+                    ).fetchone()
 
-        fills, filled = simulate_buy_snapshot(asks_snapshot, requested)
+                if not acc:
+                    continue
 
-        gross = sum(p * q for p, q in fills)
-        fee = sum(fee_usdc(q, p) for p, q in fills)
-        total = gross + fee
-
-        # A real cash account cannot spend more than available cash.
-        # Scale the SAME snapshot fill proportionally if needed.
-        if filled > 0 and total > available_cash and total > 0:
-            ratio = max(0.0, available_cash / total)
-            fills = [(p, q * ratio) for p, q in fills]
-            filled = sum(q for _, q in fills)
-            gross = sum(p * q for p, q in fills)
-            fee = sum(fee_usdc(q, p) for p, q in fills)
-            total = gross + fee
-
-        avg = (gross / filled) if filled > 0 else None
-
-        if filled <= 1e-12:
-            status = "NO_FILL"
-        elif filled + 1e-9 < requested:
-            status = "PARTIAL"
-        else:
-            status = "FULL"
-
-        with db() as conn:
-            conn.execute("""
-                INSERT INTO paper_account_trades(
-                    account_id, trade_ms, condition_id, asset, outcome,
-                    signal_type, requested_shares, filled_shares,
-                    avg_price, gross_cost, fee, total_cost, status
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """, (
-                account_id,
-                signal_ms,
-                condition,
-                asset,
-                outcome,
-                signal_type,
-                requested,
-                filled,
-                avg,
-                gross,
-                fee,
-                total,
-                status,
-            ))
-
-            if filled > 0:
-                conn.execute(
-                    "UPDATE paper_accounts SET cash=cash-? WHERE account_id=?",
-                    (total, account_id),
+                cash = sf(acc["cash"])
+                fills, filled = simulate_buy_from_snapshot(
+                    asks_snapshot,
+                    requested,
                 )
 
-            conn.commit()
+                gross = sum(p * q for p, q in fills)
+                fee = sum(fee_usdc(q, p) for p, q in fills)
+                total = gross + fee
 
-        if filled > 0:
-            log.info(
-                "%s | M03 %s %s | %.4fsh @ %.4f | cost=%.2f",
-                account_id,
-                signal_type,
-                outcome,
-                filled,
-                avg,
-                total,
-            )
+                # Real cash constraint. If insufficient, proportionally scale
+                # the already-calculated same-book fill.
+                if filled > 0 and total > cash and total > 0:
+                    ratio = max(0.0, cash / total)
+                    fills = [(p, q * ratio) for p, q in fills]
+                    filled = sum(q for _, q in fills)
+                    gross = sum(p * q for p, q in fills)
+                    fee = sum(fee_usdc(q, p) for p, q in fills)
+                    total = gross + fee
 
-def settle_m03_accounts_in_conn(
-    conn,
-    cid,
-    winning_asset,
-    winning_outcome,
-):
-    """Called from the SAME market settlement that settles the simulator."""
-    for capital in PAPER_CAPITALS:
-        account_id = paper_account_id(capital)
+                avg = gross / filled if filled > 0 else None
+
+                if filled <= 1e-12:
+                    status = "NO_FILL"
+                elif filled + 1e-9 < requested:
+                    status = "PARTIAL"
+                else:
+                    status = "FULL"
+
+                with db() as conn:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO deposit_trades(
+                            signal_id, account_id, trade_ms, condition_id,
+                            asset, outcome, signal_type, requested_shares,
+                            filled_shares, avg_price, gross_cost, fee,
+                            total_cost, status, fills_json
+                        ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """, (
+                        signal_id,
+                        aid,
+                        signal_ms,
+                        condition,
+                        asset,
+                        outcome,
+                        signal_type,
+                        requested,
+                        filled,
+                        avg,
+                        gross,
+                        fee,
+                        total,
+                        status,
+                        jd([
+                            {"price": p, "shares": q}
+                            for p, q in fills
+                        ]),
+                    ))
+
+                    if filled > 0:
+                        conn.execute(
+                            "UPDATE deposit_accounts SET cash=cash-? "
+                            "WHERE account_id=?",
+                            (total, aid),
+                        )
+
+                    conn.commit()
+
+                if filled > 0:
+                    log.info(
+                        "SIG#%d %s | M03 %s %s | %.4fsh @ %.4f | cost=%.2f",
+                        signal_id,
+                        aid,
+                        signal_type,
+                        outcome,
+                        filled,
+                        avg,
+                        total,
+                    )
+
+        except Exception:
+            log.exception("Deposit mirror worker failed")
+        finally:
+            deposit_mirror_queue.task_done()
+
+def settle_deposit_accounts(conn, cid, winning_asset, winning_outcome):
+    """
+    Settle all deposit positions using the SAME winner as original market_results.
+    """
+    for capital in DEPOSIT_CAPITALS:
+        aid = deposit_account_id(capital)
 
         exists = conn.execute("""
-            SELECT 1 FROM paper_account_results
+            SELECT 1
+            FROM deposit_results
             WHERE account_id=? AND condition_id=?
-        """, (account_id, cid)).fetchone()
+        """, (aid, cid)).fetchone()
 
         if exists:
             continue
 
         rows = conn.execute("""
-            SELECT * FROM paper_account_trades
+            SELECT *
+            FROM deposit_trades
             WHERE account_id=? AND condition_id=?
-        """, (account_id, cid)).fetchall()
+            ORDER BY id
+        """, (aid, cid)).fetchall()
 
         if not rows:
             continue
@@ -1003,31 +1020,94 @@ def settle_m03_accounts_in_conn(
         pnl = payout - total_cost
 
         conn.execute("""
-            INSERT INTO paper_account_results(
+            INSERT INTO deposit_results(
                 account_id, condition_id, winning_asset, winning_outcome,
-                total_cost, payout, pnl, settled_ms
-            ) VALUES (?,?,?,?,?,?,?,?)
+                total_cost, payout, pnl, trades, settled_ms
+            ) VALUES (?,?,?,?,?,?,?,?,?)
         """, (
-            account_id,
+            aid,
             cid,
             winning_asset,
             winning_outcome,
             total_cost,
             payout,
             pnl,
+            len(rows),
             now_ms(),
         ))
 
         conn.execute("""
-            UPDATE paper_accounts
+            UPDATE deposit_accounts
             SET cash=cash+?,
                 realized_pnl=realized_pnl+?
             WHERE account_id=?
         """, (
             payout,
             pnl,
-            account_id,
+            aid,
         ))
+
+def deposit_account_summary():
+    out = []
+
+    with db() as conn:
+        accounts = conn.execute("""
+            SELECT *
+            FROM deposit_accounts
+            ORDER BY initial_capital
+        """).fetchall()
+
+        for a in accounts:
+            aid = str(a["account_id"])
+            initial = sf(a["initial_capital"])
+            cash = sf(a["cash"])
+            realized = sf(a["realized_pnl"])
+
+            stats = conn.execute("""
+                SELECT
+                    COUNT(*) c,
+                    COALESCE(SUM(total_cost),0) cost,
+                    COALESCE(SUM(payout),0) payout,
+                    COALESCE(SUM(pnl),0) pnl,
+                    COALESCE(SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END),0) wins,
+                    COALESCE(SUM(CASE WHEN pnl<0 THEN 1 ELSE 0 END),0) losses
+                FROM deposit_results
+                WHERE account_id=?
+            """, (aid,)).fetchone()
+
+            pending = conn.execute("""
+                SELECT COALESCE(SUM(dt.total_cost),0) open_cost
+                FROM deposit_trades dt
+                LEFT JOIN deposit_results dr
+                  ON dr.account_id=dt.account_id
+                 AND dr.condition_id=dt.condition_id
+                WHERE dt.account_id=?
+                  AND dr.condition_id IS NULL
+            """, (aid,)).fetchone()
+
+            open_cost = sf(pending["open_cost"]) if pending else 0.0
+            settled_equity = initial + realized
+
+            out.append({
+                "account_id": aid,
+                "initial_capital": round(initial, 6),
+                "cash": round(cash, 6),
+                "open_cost": round(open_cost, 6),
+                "settled_equity": round(settled_equity, 6),
+                "realized_pnl": round(realized, 6),
+                "return_pct": round(
+                    ((settled_equity - initial) / initial * 100.0)
+                    if initial > 0 else 0.0,
+                    6,
+                ),
+                "settled_markets": si(stats["c"]),
+                "wins": si(stats["wins"]),
+                "losses": si(stats["losses"]),
+                "settled_cost": round(sf(stats["cost"]), 6),
+                "settled_payout": round(sf(stats["payout"]), 6),
+            })
+
+    return out
 
 # ============================================================
 # STRATEGY ENGINE
@@ -1071,12 +1151,14 @@ def store_signal(condition, variant, asset, outcome, ask, ref, mom, signal_type,
         conn.commit()
 
 async def execute_paper(condition, variant, asset, outcome, signal_type):
+    global deposit_signal_seq
+
     age = await ensure_book(asset)
 
-    # Snapshot the exact order book seen by the original strategy execution.
-    # Account simulations use this copy and never mutate the live book.
-    asks_snapshot = dict((books.get(asset) or {}).get("asks") or {})
-    mirror_signal_ms = now_ms()
+    # Immutable snapshot used only if THIS exact original M03 execution succeeds.
+    m03_asks_snapshot = None
+    if variant["name"] == "M03_P08_L2":
+        m03_asks_snapshot = dict((books.get(asset) or {}).get("asks") or {})
 
     fills, filled = simulate_buy(asset, ORDER_SIZE)
 
@@ -1121,18 +1203,29 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
         fee,
     )
 
-    # Mirror ONLY original M03. Run asynchronously from the captured snapshot
-    # so the exact strategy engine/timing is not blocked by account accounting.
-    if variant["name"] == "M03_P08_L2":
-        asyncio.create_task(
-            mirror_m03_to_accounts(
-                condition,
-                asset,
-                outcome,
-                signal_type,
-                asks_snapshot,
-                mirror_signal_ms,
-            )
+    # IMPORTANT: this happens only after the ORIGINAL M03 trade succeeded.
+    # No deposit strategy exists; deposits receive this exact decision.
+    if variant["name"] == "M03_P08_L2" and m03_asks_snapshot is not None:
+        deposit_signal_seq += 1
+        signal_id = deposit_signal_seq
+
+        deposit_mirror_queue.put_nowait({
+            "signal_id": signal_id,
+            "signal_ms": now_ms(),
+            "condition_id": condition,
+            "asset": asset,
+            "outcome": outcome,
+            "signal_type": signal_type,
+            "asks_snapshot": m03_asks_snapshot,
+        })
+
+        log.info(
+            "SIG#%d SOURCE M03 | %s %s | %.1fsh @ %.4f",
+            signal_id,
+            signal_type,
+            outcome,
+            filled,
+            avg,
         )
 
     return True
@@ -1368,9 +1461,8 @@ async def settle_market(cid, winning_asset, winning_outcome):
                 up_shares, down_shares, now_ms(),
             ))
 
-        # Settle the independent M03 virtual cash accounts from the same
-        # winner used by the original simulator.
-        settle_m03_accounts_in_conn(
+        # Virtual deposits settle from exactly this same winner.
+        settle_deposit_accounts(
             conn,
             cid,
             winning_asset,
@@ -1633,75 +1725,6 @@ def variant_summary(start_ms, end_ms):
 
     return sorted(out, key=lambda x: x["pnl"], reverse=True)
 
-
-def paper_account_status_rows():
-    out = []
-    with db() as conn:
-        accounts = conn.execute("""
-            SELECT * FROM paper_accounts
-            ORDER BY initial_capital
-        """).fetchall()
-
-        for a in accounts:
-            account_id = str(a["account_id"])
-            initial = sf(a["initial_capital"])
-            cash = sf(a["cash"])
-            realized = sf(a["realized_pnl"])
-
-            # Cost and PnL figures here are settled/realized.
-            rr = conn.execute("""
-                SELECT
-                    COUNT(*) AS markets,
-                    COALESCE(SUM(total_cost),0) AS cost,
-                    COALESCE(SUM(payout),0) AS payout,
-                    COALESCE(SUM(pnl),0) AS pnl,
-                    SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) AS wins,
-                    SUM(CASE WHEN pnl<0 THEN 1 ELSE 0 END) AS losses
-                FROM paper_account_results
-                WHERE account_id=?
-            """, (account_id,)).fetchone()
-
-            # Open positions at cost; separate from cash so a low cash number
-            # is never mistaken for account equity.
-            oo = conn.execute("""
-                SELECT COALESCE(SUM(t.total_cost),0) AS open_cost
-                FROM paper_account_trades t
-                LEFT JOIN paper_account_results r
-                  ON r.account_id=t.account_id
-                 AND r.condition_id=t.condition_id
-                WHERE t.account_id=?
-                  AND r.condition_id IS NULL
-            """, (account_id,)).fetchone()
-
-            open_cost = sf(oo["open_cost"]) if oo else 0.0
-            settled_pnl = sf(rr["pnl"]) if rr else 0.0
-
-            # "settled_equity" deliberately ignores unrealized mark-to-market:
-            # initial + realized PnL. This is directly comparable across accounts.
-            settled_equity = initial + settled_pnl
-
-            out.append({
-                "account_id": account_id,
-                "initial_capital": round(initial, 6),
-                "cash": round(cash, 6),
-                "open_positions_cost": round(open_cost, 6),
-                "settled_equity": round(settled_equity, 6),
-                "realized_pnl": round(realized, 6),
-                "return_pct": round(
-                    ((settled_equity - initial) / initial * 100.0)
-                    if initial > 0 else 0.0,
-                    6,
-                ),
-                "settled_markets": si(rr["markets"]) if rr else 0,
-                "wins": si(rr["wins"]) if rr else 0,
-                "losses": si(rr["losses"]) if rr else 0,
-                "settled_cost": round(sf(rr["cost"]), 6) if rr else 0.0,
-                "settled_payout": round(sf(rr["payout"]), 6) if rr else 0.0,
-            })
-
-    return out
-
-
 def make_report(start_ts, end_ts):
     sm = start_ts * 1000
     em = end_ts * 1000
@@ -1735,28 +1758,29 @@ def make_report(start_ts, end_ts):
             ORDER BY start_ts
         """, (em, start_ts - 300)).fetchall()
 
-        account_trades = conn.execute("""
-            SELECT * FROM paper_account_trades
+
+        deposit_trades_rows = conn.execute("""
+            SELECT * FROM deposit_trades
             WHERE trade_ms>=? AND trade_ms<?
-            ORDER BY trade_ms, account_id
+            ORDER BY signal_id, account_id
         """, (sm, em)).fetchall()
 
-        account_results = conn.execute("""
-            SELECT ar.*, dm.slug, dm.question, dm.end_ts
-            FROM paper_account_results ar
+        deposit_results_rows = conn.execute("""
+            SELECT dr.*, dm.slug, dm.question, dm.end_ts
+            FROM deposit_results dr
             JOIN discovered_markets dm
-              ON dm.condition_id=ar.condition_id
+              ON dm.condition_id=dr.condition_id
             WHERE (dm.end_ts * 1000) >= ?
               AND (dm.end_ts * 1000) < ?
-            ORDER BY dm.end_ts, ar.account_id
+            ORDER BY dm.end_ts, dr.account_id
         """, (sm, em)).fetchall()
 
     summary = variant_summary(sm, em)
-    account_rows = paper_account_status_rows()
+    deposit_summary = deposit_account_summary()
 
     lines = [
-        "POWERWINNER-INSPIRED STRATEGY SIMULATOR + EXACT M03 PAPER MONEY",
-        "=" * 74,
+        "POWERWINNER-INSPIRED STRATEGY SIMULATOR v1",
+        "=" * 70,
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
         f"Symbol: {SYMBOL}",
         f"Decision interval: {DECISION_INTERVAL}s",
@@ -1776,47 +1800,37 @@ def make_report(start_ts, end_ts):
 
     lines += [
         "",
-        "M03 EXACT PAPER-MONEY ACCOUNTS",
-        "These accounts mirror ONLY successful original M03_P08_L2 signals.",
+        "VIRTUAL DEPOSITS — EXACT M03 SIGNAL MIRROR",
     ]
 
-    for a in account_rows:
+    for a in deposit_summary:
         lines.append(
-            f"{a['account_id']}: settled_equity=${a['settled_equity']:.2f} | "
+            f"{a['account_id']}: equity=${a['settled_equity']:.2f} | "
             f"PnL=${a['realized_pnl']:+.2f} | "
             f"return={a['return_pct']:+.2f}% | "
-            f"cash=${a['cash']:.2f} | open_cost=${a['open_positions_cost']:.2f} | "
-            f"markets={a['settled_markets']} | W/L={a['wins']}/{a['losses']}"
+            f"W/L={a['wins']}/{a['losses']} | "
+            f"cash=${a['cash']:.2f} | open_cost=${a['open_cost']:.2f}"
         )
 
     lines += [
         "",
-        "FILES",
-        "m03_accounts.csv         - cumulative balance/PnL for every virtual capital",
-        "m03_account_trades.csv   - all mirrored M03 account fills in this hour",
-        "m03_account_results.csv  - settled market PnL per account in this hour",
-        "",
         "IMPORTANT",
-        "Virtual accounts do not modify M03 strategy_state or signals.",
+        "This is an independent paper strategy test. It does NOT copy Powerwinner.",
+        "All fills use the live public order book and taker fees.",
         "No real orders are placed.",
     ]
 
     d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+
     path = REPORT_DIR / f"strategy_sim_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
 
     summary_cols = [
         "variant", "entry_move", "pyramid_step", "lookback_ticks",
         "switch_move", "max_buys_side", "entry_price_min", "entry_price_max",
-        "momentum_cap", "allow_switch", "entry_cutoff_sec", "switch_price_max",
-        "markets_settled", "winning_markets", "losing_markets", "paper_trades",
+        "momentum_cap", "allow_switch", "entry_cutoff_sec", "switch_price_max", "markets_settled",
+        "winning_markets", "losing_markets", "paper_trades",
         "fees", "cost", "pnl", "roi_pct"
-    ]
-
-    account_cols = [
-        "account_id", "initial_capital", "cash", "open_positions_cost",
-        "settled_equity", "realized_pnl", "return_pct", "settled_markets",
-        "wins", "losses", "settled_cost", "settled_payout"
     ]
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -1825,18 +1839,17 @@ def make_report(start_ts, end_ts):
         z.writestr("signals.csv", csv_bytes(signals))
         z.writestr("market_results.csv", csv_bytes(results))
         z.writestr("markets.csv", csv_bytes(markets_rows))
-
-        # Always write account files, even when empty.
-        z.writestr("m03_accounts.csv", csv_bytes(account_rows, account_cols))
-        z.writestr("m03_account_trades.csv", csv_bytes(account_trades))
-        z.writestr("m03_account_results.csv", csv_bytes(account_results))
-
+        z.writestr("deposit_accounts.csv", csv_bytes(deposit_summary))
+        z.writestr("deposit_trades.csv", csv_bytes(deposit_trades_rows))
+        z.writestr("deposit_results.csv", csv_bytes(deposit_results_rows))
         z.writestr("report.txt", "\n".join(lines).encode("utf-8"))
 
-    log.info(
-        "REPORT ACCOUNT FILES | accounts=%d | trades=%d | results=%d",
-        len(account_rows), len(account_trades), len(account_results),
-    )
+        log.info(
+            "DEPOSIT REPORT | accounts=%d | trades=%d | results=%d",
+            len(deposit_summary),
+            len(deposit_trades_rows),
+            len(deposit_results_rows),
+        )
 
     return path, summary
 
@@ -1934,7 +1947,7 @@ async def health(request):
 
     return web.json_response({
         "ok": True,
-        "version": "1.9-m03-account-report-fix",
+        "version": "1.8-original-plus-deposits",
         "symbol": SYMBOL,
         "decision_interval": DECISION_INTERVAL,
         "trade_window_seconds": TRADE_WINDOW_SECONDS,
@@ -1946,7 +1959,7 @@ async def health(request):
         "paper_trades": t,
         "settled_variant_results": r,
         "aggregate_all_variant_pnl": p,
-        "m03_exact_accounts": paper_account_status_rows(),
+        "deposit_accounts": deposit_account_summary(),
         "time_utc": utc_iso(),
     })
 
@@ -1973,7 +1986,7 @@ async def main():
     init_db()
 
     session = aiohttp.ClientSession(headers={
-        "User-Agent": "PowerwinnerInspiredStrategySimulator/1.9",
+        "User-Agent": "PowerwinnerInspiredStrategySimulator/1.8",
         "Accept": "application/json",
     })
 
@@ -1984,6 +1997,7 @@ async def main():
         asyncio.create_task(strategy_loop()),
         asyncio.create_task(resolution_fallback_loop()),
         asyncio.create_task(report_loop()),
+        asyncio.create_task(deposit_mirror_worker()),
     ]
 
     log.info(
