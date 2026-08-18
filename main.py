@@ -1701,6 +1701,7 @@ def paper_account_status_rows():
 
     return out
 
+
 def make_report(start_ts, end_ts):
     sm = start_ts * 1000
     em = end_ts * 1000
@@ -1734,11 +1735,28 @@ def make_report(start_ts, end_ts):
             ORDER BY start_ts
         """, (em, start_ts - 300)).fetchall()
 
+        account_trades = conn.execute("""
+            SELECT * FROM paper_account_trades
+            WHERE trade_ms>=? AND trade_ms<?
+            ORDER BY trade_ms, account_id
+        """, (sm, em)).fetchall()
+
+        account_results = conn.execute("""
+            SELECT ar.*, dm.slug, dm.question, dm.end_ts
+            FROM paper_account_results ar
+            JOIN discovered_markets dm
+              ON dm.condition_id=ar.condition_id
+            WHERE (dm.end_ts * 1000) >= ?
+              AND (dm.end_ts * 1000) < ?
+            ORDER BY dm.end_ts, ar.account_id
+        """, (sm, em)).fetchall()
+
     summary = variant_summary(sm, em)
+    account_rows = paper_account_status_rows()
 
     lines = [
-        "POWERWINNER-INSPIRED STRATEGY SIMULATOR v1",
-        "=" * 70,
+        "POWERWINNER-INSPIRED STRATEGY SIMULATOR + EXACT M03 PAPER MONEY",
+        "=" * 74,
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
         f"Symbol: {SYMBOL}",
         f"Decision interval: {DECISION_INTERVAL}s",
@@ -1758,23 +1776,47 @@ def make_report(start_ts, end_ts):
 
     lines += [
         "",
+        "M03 EXACT PAPER-MONEY ACCOUNTS",
+        "These accounts mirror ONLY successful original M03_P08_L2 signals.",
+    ]
+
+    for a in account_rows:
+        lines.append(
+            f"{a['account_id']}: settled_equity=${a['settled_equity']:.2f} | "
+            f"PnL=${a['realized_pnl']:+.2f} | "
+            f"return={a['return_pct']:+.2f}% | "
+            f"cash=${a['cash']:.2f} | open_cost=${a['open_positions_cost']:.2f} | "
+            f"markets={a['settled_markets']} | W/L={a['wins']}/{a['losses']}"
+        )
+
+    lines += [
+        "",
+        "FILES",
+        "m03_accounts.csv         - cumulative balance/PnL for every virtual capital",
+        "m03_account_trades.csv   - all mirrored M03 account fills in this hour",
+        "m03_account_results.csv  - settled market PnL per account in this hour",
+        "",
         "IMPORTANT",
-        "This is an independent paper strategy test. It does NOT copy Powerwinner.",
-        "All fills use the live public order book and taker fees.",
+        "Virtual accounts do not modify M03 strategy_state or signals.",
         "No real orders are placed.",
     ]
 
     d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-
     path = REPORT_DIR / f"strategy_sim_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
 
     summary_cols = [
         "variant", "entry_move", "pyramid_step", "lookback_ticks",
         "switch_move", "max_buys_side", "entry_price_min", "entry_price_max",
-        "momentum_cap", "allow_switch", "entry_cutoff_sec", "switch_price_max", "markets_settled",
-        "winning_markets", "losing_markets", "paper_trades",
+        "momentum_cap", "allow_switch", "entry_cutoff_sec", "switch_price_max",
+        "markets_settled", "winning_markets", "losing_markets", "paper_trades",
         "fees", "cost", "pnl", "roi_pct"
+    ]
+
+    account_cols = [
+        "account_id", "initial_capital", "cash", "open_positions_cost",
+        "settled_equity", "realized_pnl", "return_pct", "settled_markets",
+        "wins", "losses", "settled_cost", "settled_payout"
     ]
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -1783,44 +1825,18 @@ def make_report(start_ts, end_ts):
         z.writestr("signals.csv", csv_bytes(signals))
         z.writestr("market_results.csv", csv_bytes(results))
         z.writestr("markets.csv", csv_bytes(markets_rows))
-        account_rows = paper_account_status_rows()
 
-        with db() as conn:
-            account_trades = conn.execute("""
-                SELECT * FROM paper_account_trades
-                WHERE trade_ms>=? AND trade_ms<?
-                ORDER BY trade_ms, account_id
-            """, (sm, em)).fetchall()
-
-            account_results = conn.execute("""
-                SELECT ar.*, dm.slug, dm.question, dm.end_ts
-                FROM paper_account_results ar
-                JOIN discovered_markets dm
-                  ON dm.condition_id=ar.condition_id
-                WHERE (dm.end_ts * 1000) >= ?
-                  AND (dm.end_ts * 1000) < ?
-                ORDER BY dm.end_ts, ar.account_id
-            """, (sm, em)).fetchall()
-
-        z.writestr("m03_accounts.csv", csv_bytes(account_rows))
+        # Always write account files, even when empty.
+        z.writestr("m03_accounts.csv", csv_bytes(account_rows, account_cols))
         z.writestr("m03_account_trades.csv", csv_bytes(account_trades))
         z.writestr("m03_account_results.csv", csv_bytes(account_results))
 
-        lines += [
-            "",
-            "M03 EXACT PAPER-MONEY ACCOUNTS",
-            "These accounts mirror ONLY successful original M03_P08_L2 signals.",
-            "The M03 signal engine/state above is unchanged.",
-        ]
-        for a in account_rows:
-            lines.append(
-                f"{a['account_id']}: settled_equity=${a['settled_equity']:.2f} | "
-                f"PnL=${a['realized_pnl']:+.2f} | "
-                f"return={a['return_pct']:+.2f}% | "
-                f"cash=${a['cash']:.2f} | open_cost=${a['open_positions_cost']:.2f}"
-            )
-
         z.writestr("report.txt", "\n".join(lines).encode("utf-8"))
+
+    log.info(
+        "REPORT ACCOUNT FILES | accounts=%d | trades=%d | results=%d",
+        len(account_rows), len(account_trades), len(account_results),
+    )
 
     return path, summary
 
@@ -1918,7 +1934,7 @@ async def health(request):
 
     return web.json_response({
         "ok": True,
-        "version": "1.8-m03-exact-paper",
+        "version": "1.9-m03-account-report-fix",
         "symbol": SYMBOL,
         "decision_interval": DECISION_INTERVAL,
         "trade_window_seconds": TRADE_WINDOW_SECONDS,
@@ -1957,7 +1973,7 @@ async def main():
     init_db()
 
     session = aiohttp.ClientSession(headers={
-        "User-Agent": "PowerwinnerInspiredStrategySimulator/1.8",
+        "User-Agent": "PowerwinnerInspiredStrategySimulator/1.9",
         "Accept": "application/json",
     })
 
