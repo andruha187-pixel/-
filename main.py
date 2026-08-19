@@ -43,7 +43,7 @@ TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
 # makes variants comparable. Scale later after finding profitable logic.
 ORDER_SIZE = float(os.getenv("ORDER_SIZE", "10"))
 
-# Virtual deposits mirror ONLY already-executed M03_P08_L2 decisions.
+# Virtual deposits mirror ONLY already-executed M03_V3_NOSW90 decisions.
 # They never generate signals and never modify strategy_state.
 DEPOSIT_CAPITALS = [
     float(x.strip())
@@ -83,8 +83,8 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "strategy_simulator_deposits.db"
-REPORT_DIR = DATA_DIR / "strategy_deposit_reports"
+DB_PATH = DATA_DIR / "m03_v3_nosw90_virtual.db"
+REPORT_DIR = DATA_DIR / "m03_v3_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -124,12 +124,14 @@ session: Optional[aiohttp.ClientSession] = None
 
 VARIANTS = [
     {
-        "name": "M03_P08_L2",
+        "name": "M03_V3_NOSW90",
         "entry_move": 0.03,
         "pyramid_step": 0.08,
         "lookback": 2,
-        "switch_move": 0.04,
-        "max_buys_side": 6,
+        "switch_move": 999.0,
+        "max_buys_side": 5,
+        "allow_switch": False,
+        "entry_cutoff_sec": 90,
     },
 ]
 
@@ -792,9 +794,10 @@ async def ws_loop():
 def deposit_account_id(capital):
     return f"CAP_{capital:g}"
 
-def deposit_order_size(capital):
-    # CAP_1000 has exactly the original M03 ORDER_SIZE.
-    return ORDER_SIZE * (float(capital) / DEPOSIT_BASE_CAPITAL)
+def deposit_order_size(current_balance):
+    # Real-like compounding: $1000 balance corresponds to 10 shares.
+    # Profit increases future size; loss decreases it.
+    return ORDER_SIZE * (max(0.0, float(current_balance)) / DEPOSIT_BASE_CAPITAL)
 
 def simulate_buy_from_snapshot(asks_snapshot, wanted):
     remaining = float(wanted)
@@ -836,7 +839,6 @@ async def deposit_mirror_worker():
 
             for capital in DEPOSIT_CAPITALS:
                 aid = deposit_account_id(capital)
-                requested = deposit_order_size(capital)
 
                 with db() as conn:
                     acc = conn.execute(
@@ -848,6 +850,8 @@ async def deposit_mirror_worker():
                     continue
 
                 cash = sf(acc["cash"])
+                current_balance = sf(acc["initial_capital"]) + sf(acc["realized_pnl"])
+                requested = deposit_order_size(current_balance)
                 fills, filled = simulate_buy_from_snapshot(
                     asks_snapshot,
                     requested,
@@ -916,7 +920,7 @@ async def deposit_mirror_worker():
 
                 if filled > 0:
                     log.info(
-                        "SIG#%d %s | M03 %s %s | %.4fsh @ %.4f | cost=%.2f",
+                        "SIG#%d %s | M03_V3 %s %s | %.4fsh @ %.4f | cost=%.2f",
                         signal_id,
                         aid,
                         signal_type,
@@ -1037,6 +1041,7 @@ def deposit_account_summary():
             out.append({
                 "account_id": aid,
                 "initial_capital": round(initial, 6),
+                "balance": round(settled_equity, 6),
                 "cash": round(cash, 6),
                 "open_cost": round(open_cost, 6),
                 "settled_equity": round(settled_equity, 6),
@@ -1103,7 +1108,7 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
 
     # Immutable snapshot used only if THIS exact original M03 execution succeeds.
     m03_asks_snapshot = None
-    if variant["name"] == "M03_P08_L2":
+    if variant["name"] == "M03_V3_NOSW90":
         m03_asks_snapshot = dict((books.get(asset) or {}).get("asks") or {})
 
     fills, filled = simulate_buy(asset, ORDER_SIZE)
@@ -1151,7 +1156,7 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
 
     # IMPORTANT: this happens only after the ORIGINAL M03 trade succeeded.
     # No deposit strategy exists; deposits receive this exact decision.
-    if variant["name"] == "M03_P08_L2" and m03_asks_snapshot is not None:
+    if variant["name"] == "M03_V3_NOSW90" and m03_asks_snapshot is not None:
         deposit_signal_seq += 1
         signal_id = deposit_signal_seq
 
@@ -1166,7 +1171,7 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
         })
 
         log.info(
-            "SIG#%d SOURCE M03 | %s %s | %.1fsh @ %.4f",
+            "SIG#%d SOURCE M03_V3 | %s %s | %.1fsh @ %.4f",
             signal_id,
             signal_type,
             outcome,
@@ -1725,7 +1730,7 @@ def make_report(start_ts, end_ts):
     deposit_summary = deposit_account_summary()
 
     lines = [
-        "POWERWINNER-INSPIRED STRATEGY SIMULATOR v1",
+        "M03_V3_NOSW90 — REAL-LIKE VIRTUAL TRADING",
         "=" * 70,
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
         f"Symbol: {SYMBOL}",
@@ -1733,7 +1738,7 @@ def make_report(start_ts, end_ts):
         f"Trading window: first {TRADE_WINDOW_SECONDS}s",
         f"Paper lot: {ORDER_SIZE} shares",
         "",
-        "VARIANTS RANKED BY REALIZED PNL",
+        "ONLY STRATEGY: M03_V3_NOSW90",
     ]
 
     for x in summary:
@@ -1746,12 +1751,12 @@ def make_report(start_ts, end_ts):
 
     lines += [
         "",
-        "VIRTUAL DEPOSITS — EXACT M03 SIGNAL MIRROR",
+        "VIRTUAL BALANCES — M03_V3_NOSW90",
     ]
 
     for a in deposit_summary:
         lines.append(
-            f"{a['account_id']}: equity=${a['settled_equity']:.2f} | "
+            f"{a['account_id']}: balance=${a['balance']:.2f} | "
             f"PnL=${a['realized_pnl']:+.2f} | "
             f"return={a['return_pct']:+.2f}% | "
             f"W/L={a['wins']}/{a['losses']} | "
@@ -1893,7 +1898,7 @@ async def health(request):
 
     return web.json_response({
         "ok": True,
-        "version": "2.0-m03-only-deposits",
+        "version": "3.0-m03-v3-nosw90-real-virtual",
         "symbol": SYMBOL,
         "decision_interval": DECISION_INTERVAL,
         "trade_window_seconds": TRADE_WINDOW_SECONDS,
@@ -1932,7 +1937,7 @@ async def main():
     init_db()
 
     session = aiohttp.ClientSession(headers={
-        "User-Agent": "PowerwinnerInspiredStrategySimulator/2.0",
+        "User-Agent": "M03V3NOSW90Virtual/3.0",
         "Accept": "application/json",
     })
 
