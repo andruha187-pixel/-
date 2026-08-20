@@ -1,23 +1,36 @@
-# M03_V3_NOSW90 — виртуальная торговля с реальными балансами
+# Strategy Simulator v1.8 — Binance shadow filters
 
-Только M03_V3_NOSW90:
-- entry_move = 0.03
-- pyramid_step = 0.08
-- lookback = 2
-- SWITCH запрещён полностью
-- максимум 5 покупок одной стороны
-- после 90-й секунды новые покупки запрещены
+Исходные 12 стратегий НЕ изменены.
 
-Счета: $100 / $250 / $500 / $1000 / $2500.
+Добавлен Binance USD-M Futures поток BTCUSDT:
+- aggTrade
+- depth20@100ms
 
-Баланс каждого счёта хранится в SQLite:
-- при покупке cash уменьшается на стоимость + комиссию;
-- больше доступного cash потратить нельзя;
-- после settlement payout возвращается в cash;
-- realized PnL меняет balance;
-- следующий размер позиции масштабируется от нового balance (компаундинг);
-- при Persistent Disk /var/data баланс переживает рестарт.
+Для каждого уже совершённого Polymarket-сигнала сохраняются:
+- BTC return 3s
+- BTC return 10s
+- EMA9 / EMA21 / EMA bias
+- RSI14
+- aggressive volume delta 10s
+- aggressive volume delta 30s
+- top-10 order-book imbalance
+- large-trade delta 30s
+- общий score
 
-Старт: $1000 = 10 shares, $500 = 5, $250 = 2.5, $100 = 1, $2500 = 25. После прибыли/убытка размер следующей сделки меняется пропорционально текущему закрытому балансу.
+Пять shadow-фильтров:
+- B1_MOM
+- B2_FLOW
+- B3_BOOK
+- B4_COMBO
+- B5_SCORE
 
-В ZIP: deposit_accounts.csv, deposit_trades.csv, deposit_results.csv плюс signals/paper_trades/market_results/markets/report. Поле balance показывает текущий закрытый баланс; cash — свободные деньги, из которых уже вычтены открытые покупки.
+Shadow-фильтры не меняют исходные 12 стратегий.
+Они только принимают или пропускают уже возникшие сделки и считают свой PnL.
+
+Новые файлы в часовом ZIP:
+- binance_signal_features.csv
+- binance_shadow_trades.csv
+- binance_shadow_results.csv
+- binance_shadow_summary.csv
+
+В report.txt выводятся 15 лучших комбинаций стратегия + Binance-фильтр.
