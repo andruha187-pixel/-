@@ -1,36 +1,36 @@
-# Strategy Simulator v1.8 — Binance shadow filters
+# Strategy Simulator V4 — Fingerprint Research
 
-Исходные 12 стратегий НЕ изменены.
+Все 12 BASE-стратегий Polymarket остаются без изменений.
 
-Добавлен Binance USD-M Futures поток BTCUSDT:
-- aggTrade
-- depth20@100ms
+## Контроль
+CONF60 — контрольный фильтр V3.
 
-Для каждого уже совершённого Polymarket-сигнала сохраняются:
-- BTC return 3s
-- BTC return 10s
-- EMA9 / EMA21 / EMA bias
-- RSI14
-- aggressive volume delta 10s
-- aggressive volume delta 30s
-- top-10 order-book imbalance
-- large-trade delta 30s
-- общий score
+## Новые shadow-фильтры
+- V4_RET10:
+  CONF60 + directional BTC return за 10 секунд >= +0.01%.
 
-Пять shadow-фильтров:
-- B1_MOM
-- B2_FLOW
-- B3_BOOK
-- B4_COMBO
-- B5_SCORE
+- V4_LARGE_FLOW_GUARD:
+  блокирует вход, если directional large-trade delta 10s > 0.34,
+  но directional total flow 10s <= 0.47.
 
-Shadow-фильтры не меняют исходные 12 стратегий.
-Они только принимают или пропускают уже возникшие сделки и считают свой PnL.
+- V4_COMBO:
+  одновременно RET10 + LARGE_FLOW_GUARD.
+  Это главный out-of-sample кандидат.
 
-Новые файлы в часовом ZIP:
-- binance_signal_features.csv
-- binance_shadow_trades.csv
-- binance_shadow_results.csv
-- binance_shadow_summary.csv
+- V4_BOOK_CONFIRM:
+  CONF60 + directional top-10 book imbalance >= 0.05.
 
-В report.txt выводятся 15 лучших комбинаций стратегия + Binance-фильтр.
+## Исправление Binance depth
+В V3 в сохранённых данных book_imbalance был 0 во всех строках.
+V4 использует правильный combined-stream URL:
+wss://fstream.binance.com/stream?streams=...
+
+В health добавлены:
+- binance_depth_feed_ok
+- binance_book_imbalance
+
+Чтобы CONF60 оставался сравнимым с V3, исправленный book по умолчанию
+НЕ входит в confidence: V4_CONF_USE_BOOK=0.
+Book тестируется отдельно через V4_BOOK_CONFIRM.
+
+Не меняй пороги в процессе одной серии тестов.

@@ -1,17 +1,13 @@
 services:
   - type: web
-    name: m03-paper-money
+    name: strategy-binance-v4
     runtime: python
     plan: starter
     buildCommand: pip install -r requirements.txt
     startCommand: python main.py
     healthCheckPath: /health
     envVars:
-      - key: PAPER_CAPITALS
-        value: "100,250,500,1000,2500"
-      - key: BASE_CAPITAL
-        value: "1000"
-      - key: BASE_SHARES
-        value: "10"
       - key: DATA_DIR
         value: /var/data
+      - key: BINANCE_SYMBOL
+        value: btcusdt
