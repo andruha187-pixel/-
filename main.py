@@ -1,4 +1,4 @@
-import os, io, csv, json, time, math, zipfile, sqlite3, asyncio, logging
+import os, io, csv, json, time, math, sqlite3, asyncio, logging
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict, deque
@@ -11,169 +11,463 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-VERSION = "5.0-guarded-pyramid-research"
+# ============================================================
+# FOUR-WAY A/B/C/E PAPER BOT — BINANCE CONF65 + V5 HEDGE
+# Polymarket BTC 5m
+#
+# A: M03_V3_NOSW90 + CONF65
+# B: M03_V2_LOCK    + CONF65
+# C: M03_V5_DYNAMIC + CONF65
+# E: M03_V5_DYNAMIC_HEDGE + CONF65 + dynamic opposite-side hedge
+#
+# Every strategy has an independent $500 PAPER account.
+# All four consume the same captured Polymarket book snapshot and the same
+# Binance feature snapshot on each decision tick.
+# ============================================================
+
+VERSION = "4.0-paper-abce-m03-conf65-v5-hedge"
+HOST = "https://clob.polymarket.com"
+GAMMA = "https://gamma-api.polymarket.com"
+POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+CHAIN_ID = 137
+
 PORT = int(os.getenv("PORT", "8080"))
-SYMBOL = "BTC"
-DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "3"))
-TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
-ORDER_SIZE = float(os.getenv("ORDER_SIZE", "10"))
-CRYPTO_FEE_RATE = float(os.getenv("CRYPTO_FEE_RATE", "0.07"))
-MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "1000"))
-REPORT_DELAY_SECONDS = int(os.getenv("REPORT_DELAY_SECONDS", "300"))
-REPORT_CHECK_INTERVAL = int(os.getenv("REPORT_CHECK_INTERVAL", "30"))
+DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    test = DATA_DIR / ".write_test"
+    test.write_text("ok")
+    test.unlink()
+except Exception:
+    DATA_DIR = Path("./data")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+# New DB: starts a clean, fair A/B/C/E comparison from the same moment.
+DB_PATH = DATA_DIR / "m03_fourway_conf65_hedge.db"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
-GAMMA = "https://gamma-api.polymarket.com"
-CLOB = "https://clob.polymarket.com"
-POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+# PAPER accounts: EACH strategy gets this amount independently.
+PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "500"))
+ORDER_SIZE = float(os.getenv("ORDER_SIZE", "10"))
+MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "1000"))
+DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "3"))
+TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
+MIN_FREE_CASH = float(os.getenv("MIN_FREE_CASH", "5"))
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
 
-DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
-try:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    t = DATA_DIR / ".write_test"; t.write_text("ok"); t.unlink()
-except Exception:
-    DATA_DIR = Path("./data"); DATA_DIR.mkdir(parents=True, exist_ok=True)
-DB_PATH = DATA_DIR / "guarded_pyramid_research.db"
-REPORT_DIR = DATA_DIR / "guarded_reports"; REPORT_DIR.mkdir(parents=True, exist_ok=True)
+# E / V5 DYNAMIC HEDGE risk controls.
+# Hedge starts only after the initial PAPER side has at least 20 actual shares.
+# It buys the opposite outcome just enough to target a settlement loss floor of -$10,
+# while preserving at least +$2 PnL if the initial side ultimately wins.
+HEDGE_START_SHARES = float(os.getenv("HEDGE_START_SHARES", "20"))
+HEDGE_MAX_LOSS = float(os.getenv("HEDGE_MAX_LOSS", "10"))
+HEDGE_MIN_UPSIDE = float(os.getenv("HEDGE_MIN_UPSIDE", "2"))
+HEDGE_MIN_ORDER_SHARES = float(os.getenv("HEDGE_MIN_ORDER_SHARES", "0.05"))
 
-logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO").upper(), format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("guard-v5")
+# Exact candidate definitions from the old research simulator.
+STRATEGIES = [
+    {
+        "name": "M03_V3_NOSW90",
+        "short": "A / V3 NOSW90",
+        "entry_move": 0.03,
+        "pyramid_step": 0.08,
+        "lookback": 2,
+        "switch_move": 999.0,
+        "max_buys_side": 5,
+        "allow_switch": False,
+        "entry_cutoff_sec": 90,
+    },
+    {
+        "name": "M03_V2_LOCK",
+        "short": "B / V2 LOCK",
+        "entry_move": 0.03,
+        "pyramid_step": 0.08,
+        "lookback": 2,
+        "switch_move": 999.0,
+        "max_buys_side": 6,
+        "entry_price_min": 0.55,
+        "entry_price_max": 0.75,
+        "momentum_cap": 0.30,
+        "allow_switch": False,
+    },
+    {
+        "name": "M03_V5_DYNAMIC",
+        "short": "C / V5 DYNAMIC",
+        "entry_move": 0.03,
+        "pyramid_step": 0.08,
+        "lookback": 2,
+        "switch_move": 0.03,
+        "max_buys_side": 5,
+        "allow_switch": True,
+        "dynamic_switch_v5": True,
+    },
+    {
+        "name": "M03_V5_DYNAMIC_HEDGE",
+        "short": "E / V5 DYNAMIC HEDGE",
+        "entry_move": 0.03,
+        "pyramid_step": 0.08,
+        "lookback": 2,
+        "switch_move": 0.03,
+        "max_buys_side": 5,
+        "allow_switch": True,
+        "dynamic_switch_v5": True,
+        "risk_hedge": True,
+    },
+]
+STRATEGY_BY_NAME = {x["name"]: x for x in STRATEGIES}
+
+# Binance CONF65 — exact old V2 scoring/feed, threshold changed to 65.
+BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "btcusdt").lower()
+BINANCE_WS = (
+    "wss://fstream.binance.com/market/stream?streams="
+    f"{BINANCE_SYMBOL}@aggTrade/"
+    f"{BINANCE_SYMBOL}@depth20@100ms"
+)
+BINANCE_LARGE_TRADE_USD = float(os.getenv("BINANCE_LARGE_TRADE_USD", "50000"))
+BINANCE_SIGNAL_MAX_AGE_MS = int(os.getenv("BINANCE_SIGNAL_MAX_AGE_MS", "1500"))
+REGIME_WINDOW_SEC = int(os.getenv("REGIME_WINDOW_SEC", "30"))
+START_PRICE_CAPTURE_WINDOW_SEC = int(os.getenv("START_PRICE_CAPTURE_WINDOW_SEC", "3"))
+CONF_MIN = float(os.getenv("CONF_MIN", "65"))
+W_IMPULSE = float(os.getenv("W_IMPULSE", "22"))
+W_FLOW = float(os.getenv("W_FLOW", "18"))
+W_BOOK = float(os.getenv("W_BOOK", "14"))
+W_LARGE = float(os.getenv("W_LARGE", "8"))
+W_TREND = float(os.getenv("W_TREND", "14"))
+W_DISTANCE = float(os.getenv("W_DISTANCE", "18"))
+W_POLY_PRICE = float(os.getenv("W_POLY_PRICE", "6"))
+
+# This build is intentionally PAPER-only. Four independent virtual accounts
+# cannot safely map to one real-money wallet without a separate execution design.
+ENABLE_LIVE = False
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s [%(levelname)s] %(message)s",
+)
+log = logging.getLogger("m03-fourway-conf65-hedge")
+
 session: Optional[aiohttp.ClientSession] = None
 
-# Base strategies. V2_LOCK gives the raw signals. V3 adds the 90-second cutoff.
-BASE_VARIANTS = [
-    dict(name="M03_V2_LOCK", entry_move=0.03, pyramid_step=0.08, lookback=2,
-         max_buys_side=6, entry_price_min=0.55, entry_price_max=0.75,
-         momentum_cap=0.30, cutoff=None),
-    dict(name="M03_V3_NOSW90", entry_move=0.03, pyramid_step=0.08, lookback=2,
-         max_buys_side=5, entry_price_min=None, entry_price_max=None,
-         momentum_cap=None, cutoff=90),
-]
-MIN_PRICE=float(os.getenv("MIN_PRICE","0.08")); MAX_PRICE=float(os.getenv("MAX_PRICE","0.95"))
+# Shared runtime market state.
+books = {}
+markets = {}
+subscribed_assets = set()
+ws_send_queue: asyncio.Queue = asyncio.Queue()
+price_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=120)))
 
-# Exact old V2 confidence weights (book INCLUDED).
-BINANCE_SYMBOL=os.getenv("BINANCE_SYMBOL","btcusdt").lower()
-BINANCE_WS=("wss://fstream.binance.com/market/stream?streams="
-            f"{BINANCE_SYMBOL}@aggTrade/{BINANCE_SYMBOL}@depth20@100ms")
-BINANCE_LARGE_TRADE_USD=float(os.getenv("BINANCE_LARGE_TRADE_USD","50000"))
-BINANCE_SIGNAL_MAX_AGE_MS=int(os.getenv("BINANCE_SIGNAL_MAX_AGE_MS","1500"))
-REGIME_WINDOW_SEC=int(os.getenv("REGIME_WINDOW_SEC","30"))
-START_PRICE_CAPTURE_WINDOW_SEC=int(os.getenv("START_PRICE_CAPTURE_WINDOW_SEC","3"))
-W_IMPULSE=float(os.getenv("W_IMPULSE","22")); W_FLOW=float(os.getenv("W_FLOW","18")); W_BOOK=float(os.getenv("W_BOOK","14"))
-W_LARGE=float(os.getenv("W_LARGE","8")); W_TREND=float(os.getenv("W_TREND","14")); W_DISTANCE=float(os.getenv("W_DISTANCE","18")); W_POLY_PRICE=float(os.getenv("W_POLY_PRICE","6"))
+# Independent BASE state per (market, strategy), never gated by CONF65.
+strategy_state = {}
 
-# New experiment knobs.
-GUARD_ENTRY_CONF=float(os.getenv("GUARD_ENTRY_CONF","60"))
-GUARD_CUTOFF_SEC=float(os.getenv("GUARD_CUTOFF_SEC","90"))
-GUARD_PYR2_CONF=float(os.getenv("GUARD_PYR2_CONF","58"))
-GUARD_PYR3_CONF=float(os.getenv("GUARD_PYR3_CONF","62"))
-GUARD_PYR4_CONF=float(os.getenv("GUARD_PYR4_CONF","65"))
-GUARD_PATH_MIN_STRONG=float(os.getenv("GUARD_PATH_MIN_STRONG","0.22"))
-GUARD_DANGER_PATH=float(os.getenv("GUARD_DANGER_PATH","0.18"))
-GUARD_FLOW_MIN=float(os.getenv("GUARD_FLOW_MIN","0.00"))
-GUARD_RET10_MIN=float(os.getenv("GUARD_RET10_MIN","0.00"))
+# Independent exact-shadow state per (market, strategy).
+shadow_accepted_sides = defaultdict(set)
 
-MODES=["CONF60","GUARD90","GUARD90_STEP","GUARD90_FLOW","GUARD90_ADAPTIVE","GUARD90_STRONG"]
+market_binance_start_price = {}
 
-books={}; markets={}; subscribed_assets=set(); ws_send_queue=asyncio.Queue()
-price_history=defaultdict(lambda: defaultdict(lambda: deque(maxlen=120)))
-base_state={}
-shadow_sides=defaultdict(set); shadow_buys=defaultdict(int)
-market_binance_start_price={}
-binance_trades=deque(maxlen=50000); binance_tick_prices=deque(maxlen=30000); binance_second_prices=deque(maxlen=600)
-binance_depth_bids=[]; binance_depth_asks=[]; binance_last_trade_ms=0; binance_last_event_ms=0
+# Binance futures state, shared by all four.
+binance_trades = deque(maxlen=50000)       # ts, price, quote, sign
+binance_tick_prices = deque(maxlen=30000)  # ts, price
+binance_second_prices = deque(maxlen=600)  # sec, price
+binance_depth_bids = []
+binance_depth_asks = []
+binance_last_event_ms = 0
+binance_last_trade_ms = 0
+binance_last_depth_ms = 0
+BINANCE_NO_TRADE_RECONNECT_MS = int(os.getenv("BINANCE_NO_TRADE_RECONNECT_MS", "5000"))
+MEMORY_KEEP_RESOLVED_SEC = int(os.getenv("MEMORY_KEEP_RESOLVED_SEC", "900"))
 
-def now_ts(): return int(time.time())
-def now_ms(): return int(time.time()*1000)
-def utc_iso(ts=None): return datetime.fromtimestamp(float(time.time() if ts is None else ts),tz=timezone.utc).isoformat()
-def sf(v,d=0.0):
-    try:return float(v)
-    except (TypeError,ValueError):return d
-def si(v,d=0):
-    try:return int(float(v))
-    except (TypeError,ValueError):return d
-def jd(v): return json.dumps(v,ensure_ascii=False,separators=(",",":"))
-def parse_jsonish(v):
-    if isinstance(v,list):return v
+settle_lock = asyncio.Lock()
+
+# ============================================================
+# Helpers / DB
+# ============================================================
+
+def now_ts():
+    return int(time.time())
+
+def now_ms():
+    return int(time.time() * 1000)
+
+def utc_iso(ts=None):
+    if ts is None:
+        ts = time.time()
+    return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+
+def sf(v, d=0.0):
     try:
-        x=json.loads(v) if v is not None else []
-        return x if isinstance(x,list) else []
-    except Exception:return []
-def fee_usdc(shares,price):
-    f=shares*CRYPTO_FEE_RATE*price*(1-price)
-    return round(f,5) if f>=0.000005 else 0.0
+        return float(v)
+    except (TypeError, ValueError):
+        return d
+
+def si(v, d=0):
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return d
+
+def jd(v):
+    return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
+def parse_jsonish(v):
+    if isinstance(v, list):
+        return v
+    if v is None:
+        return []
+    try:
+        x = json.loads(v)
+        return x if isinstance(x, list) else []
+    except Exception:
+        return []
+
+def parse_iso(s):
+    try:
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00")) if s else None
+    except Exception:
+        return None
 
 def db():
-    c=sqlite3.connect(DB_PATH,timeout=30); c.row_factory=sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL;"); c.execute("PRAGMA synchronous=NORMAL;"); return c
+    c = sqlite3.connect(DB_PATH, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL;")
+    c.execute("PRAGMA synchronous=NORMAL;")
+    return c
+
+def cash_key(strategy_name):
+    return f"paper_cash::{strategy_name}"
+
+def initial_key(strategy_name):
+    return f"paper_initial::{strategy_name}"
 
 def init_db():
     with db() as c:
         c.executescript("""
-        CREATE TABLE IF NOT EXISTS markets(condition_id TEXT PRIMARY KEY,question TEXT,slug TEXT,start_ts INTEGER,end_ts INTEGER,up_asset TEXT,down_asset TEXT,resolved INTEGER DEFAULT 0,winning_asset TEXT,winning_outcome TEXT);
-        CREATE TABLE IF NOT EXISTS features(id INTEGER PRIMARY KEY AUTOINCREMENT,signal_ms INTEGER,condition_id TEXT,variant TEXT,asset TEXT,outcome TEXT,signal_type TEXT,elapsed_sec REAL,poly_ask REAL,btc_price REAL,start_price REAL,distance_from_start_pct REAL,ret_1s REAL,ret_3s REAL,ret_10s REAL,flow_3s REAL,flow_10s REAL,flow_30s REAL,book_imbalance REAL,large_delta_10s REAL,large_delta_30s REAL,ema_bias REAL,rsi14 REAL,path_efficiency REAL,direction_changes INTEGER,realized_move REAL,regime TEXT,confidence REAL,data_age_ms INTEGER);
-        CREATE TABLE IF NOT EXISTS shadow_trades(id INTEGER PRIMARY KEY AUTOINCREMENT,trade_ms INTEGER,condition_id TEXT,variant TEXT,mode TEXT,asset TEXT,outcome TEXT,signal_type TEXT,elapsed_sec REAL,buy_no INTEGER,filled_shares REAL,avg_price REAL,gross_cost REAL,fee REAL,total_cost REAL,accepted INTEGER,reason TEXT);
-        CREATE TABLE IF NOT EXISTS shadow_results(condition_id TEXT,variant TEXT,mode TEXT,winning_asset TEXT,winning_outcome TEXT,total_cost REAL,payout REAL,pnl REAL,trades INTEGER,settled_ms INTEGER,PRIMARY KEY(condition_id,variant,mode));
-        CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT);
-        CREATE INDEX IF NOT EXISTS idx_st_ms ON shadow_trades(trade_ms); CREATE INDEX IF NOT EXISTS idx_sr_cond ON shadow_results(condition_id);
+        CREATE TABLE IF NOT EXISTS state(
+          key TEXT PRIMARY KEY,
+          value TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS markets(
+          condition_id TEXT PRIMARY KEY,
+          question TEXT,
+          slug TEXT,
+          start_ts INTEGER,
+          end_ts INTEGER,
+          up_asset TEXT,
+          down_asset TEXT,
+          resolved INTEGER DEFAULT 0,
+          winning_asset TEXT,
+          winning_outcome TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS signals(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          signal_ms INTEGER,
+          condition_id TEXT,
+          strategy TEXT,
+          asset TEXT,
+          outcome TEXT,
+          signal_type TEXT,
+          ask REAL,
+          reference_ask REAL,
+          momentum REAL,
+          elapsed_sec REAL,
+          confidence REAL,
+          binance_json TEXT,
+          accepted INTEGER,
+          reason TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS baseline_trades(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          trade_ms INTEGER,
+          condition_id TEXT,
+          strategy TEXT,
+          asset TEXT,
+          outcome TEXT,
+          signal_type TEXT,
+          requested_shares REAL,
+          filled_shares REAL,
+          avg_price REAL,
+          gross_cost REAL,
+          fee REAL,
+          total_cost REAL,
+          book_age_ms INTEGER,
+          fills_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS trades(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          trade_ms INTEGER,
+          mode TEXT,
+          strategy TEXT,
+          condition_id TEXT,
+          asset TEXT,
+          outcome TEXT,
+          signal_type TEXT,
+          requested_shares REAL,
+          filled_shares REAL,
+          avg_price REAL,
+          gross_cost REAL,
+          fee REAL,
+          total_cost REAL,
+          cash_before REAL,
+          cash_after REAL,
+          book_age_ms INTEGER,
+          fills_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS results(
+          condition_id TEXT,
+          strategy TEXT,
+          mode TEXT,
+          winning_asset TEXT,
+          winning_outcome TEXT,
+          total_cost REAL,
+          payout REAL,
+          pnl REAL,
+          trades INTEGER,
+          settled_ms INTEGER,
+          PRIMARY KEY(condition_id, strategy, mode)
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_signals_ms ON signals(signal_ms);
+        CREATE INDEX IF NOT EXISTS idx_signals_strategy ON signals(strategy, signal_ms);
+        CREATE INDEX IF NOT EXISTS idx_baseline_trades_ms ON baseline_trades(trade_ms);
+        CREATE INDEX IF NOT EXISTS idx_baseline_strategy ON baseline_trades(strategy, trade_ms);
+        CREATE INDEX IF NOT EXISTS idx_trades_ms ON trades(trade_ms);
+        CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy, trade_ms);
+        CREATE INDEX IF NOT EXISTS idx_results_strategy ON results(strategy, settled_ms);
         """)
 
-def state_get(k,d=None):
-    with db() as c:
-        r=c.execute("SELECT value FROM state WHERE key=?",(k,)).fetchone(); return r["value"] if r else d
-def state_set(k,v):
-    with db() as c:
-        c.execute("INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(k,str(v))); c.commit()
+        for strategy in STRATEGIES:
+            name = strategy["name"]
+            if c.execute("SELECT 1 FROM state WHERE key=?", (cash_key(name),)).fetchone() is None:
+                c.execute(
+                    "INSERT INTO state(key,value) VALUES(?,?)",
+                    (cash_key(name), str(PAPER_START_BALANCE)),
+                )
+            if c.execute("SELECT 1 FROM state WHERE key=?", (initial_key(name),)).fetchone() is None:
+                c.execute(
+                    "INSERT INTO state(key,value) VALUES(?,?)",
+                    (initial_key(name), str(PAPER_START_BALANCE)),
+                )
 
-async def get_json(url,params=None):
+        if c.execute("SELECT 1 FROM state WHERE key='trading_enabled'").fetchone() is None:
+            c.execute("INSERT INTO state(key,value) VALUES('trading_enabled','0')")
+        if c.execute("SELECT 1 FROM state WHERE key='mode'").fetchone() is None:
+            c.execute("INSERT INTO state(key,value) VALUES('mode','PAPER')")
+        c.commit()
+
+def state_get(k, d=None):
+    with db() as c:
+        r = c.execute("SELECT value FROM state WHERE key=?", (k,)).fetchone()
+        return r["value"] if r else d
+
+def state_set(k, v):
+    with db() as c:
+        c.execute(
+            "INSERT INTO state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (k, str(v)),
+        )
+        c.commit()
+
+def paper_cash(strategy_name):
+    return sf(state_get(cash_key(strategy_name), PAPER_START_BALANCE))
+
+def paper_initial(strategy_name):
+    return sf(state_get(initial_key(strategy_name), PAPER_START_BALANCE))
+
+def set_paper_cash(strategy_name, value):
+    state_set(cash_key(strategy_name), value)
+
+def trading_enabled():
+    return state_get("trading_enabled", "0") == "1"
+
+def current_mode():
+    return "PAPER"
+
+# Crypto 5m taker fee formula used by the research simulator.
+def fee_usdc(shares, price):
+    fee = shares * 0.07 * price * (1.0 - price)
+    return round(fee, 5) if fee >= 0.000005 else 0.0
+
+# ============================================================
+# HTTP / market discovery
+# ============================================================
+
+async def get_json(url, params=None):
     for i in range(3):
         try:
             async with session.get(url,params=params,timeout=aiohttp.ClientTimeout(total=12)) as r:
                 t=await r.text()
-                if r.status==200:return json.loads(t)
-        except Exception as e: log.warning("GET %s: %s",url,e)
+                if r.status==200: return json.loads(t)
+                log.warning("HTTP %s %s -> %s",r.status,url,t[:160])
+        except Exception as e: log.warning("GET failed %s: %s",url,e)
         await asyncio.sleep(.3*(i+1))
     return None
 
-def slot_start(slug):
-    try:return int(str(slug).rstrip("/").split("-")[-1])
-    except:return None
-async def fetch_event(slug):
+def slot_start_from_slug(slug):
+    try: return int(str(slug).rstrip("/").split("-")[-1])
+    except Exception: return None
+
+async def fetch_event_by_slug(slug):
     for url,params in ((f"{GAMMA}/events/slug/{slug}",None),(f"{GAMMA}/events",{"slug":slug})):
         d=await get_json(url,params)
-        if isinstance(d,dict):return d
-        if isinstance(d,list) and d:return d[0]
+        if isinstance(d,dict): return d
+        if isinstance(d,list) and d and isinstance(d[0],dict): return d[0]
     return None
 
 def parse_market(raw,event):
-    cid=str(raw.get("conditionId") or raw.get("condition_id") or ""); slug=str(raw.get("slug") or event.get("slug") or "")
-    if not cid:return None
-    toks=[str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]; outs=[str(x).upper() for x in parse_jsonish(raw.get("outcomes"))]
-    if len(toks)<2:return None
+    if not isinstance(raw,dict): return None
+    cid=str(raw.get("conditionId") or raw.get("condition_id") or "")
+    if not cid: return None
+    title=str(raw.get("question") or raw.get("title") or event.get("title") or "")
+    slug=str(raw.get("slug") or event.get("slug") or "")
+    text=(title+" "+slug).lower()
+    if "bitcoin" not in text and "btc" not in text: return None
+    outcomes=[str(x).strip().upper() for x in parse_jsonish(raw.get("outcomes"))]
+    tokens=[str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
+    if len(tokens)<2: return None
     up=down=None
-    for i,o in enumerate(outs[:len(toks)]):
-        if o in {"UP","YES"}:up=toks[i]
-        elif o in {"DOWN","NO"}:down=toks[i]
-    start=slot_start(slug)
-    if not start:return None
-    return dict(condition_id=cid,question=str(raw.get("question") or event.get("title") or ""),slug=slug,start_ts=start,end_ts=start+300,up_asset=up or toks[0],down_asset=down or toks[1])
+    for i,o in enumerate(outcomes):
+        if i>=len(tokens): break
+        if o in {"UP","YES"}: up=tokens[i]
+        elif o in {"DOWN","NO"}: down=tokens[i]
+    up=up or tokens[0]; down=down or tokens[1]
+    start=slot_start_from_slug(slug)
+    if not start:
+        dt=parse_iso(raw.get("startDate")) or parse_iso(event.get("startDate"))
+        start=int(dt.timestamp()) if dt else None
+    if not start: return None
+    end=start+300
+    return dict(condition_id=cid,question=title,slug=slug,start_ts=start,end_ts=end,up_asset=up,down_asset=down)
 
 async def discover_slot(slot):
-    ev=await fetch_event(f"btc-updown-5m-{slot}")
-    if not ev or not isinstance(ev.get("markets"),list):return None
+    slug=f"btc-updown-5m-{slot}"
+    ev=await fetch_event_by_slug(slug)
+    if not ev or not isinstance(ev.get("markets"),list): return None
     for raw in ev["markets"]:
         m=parse_market(raw,ev)
-        if m:return m
+        if m: return m
     return None
 
 def persist_market(m):
     with db() as c:
-        c.execute("INSERT INTO markets(condition_id,question,slug,start_ts,end_ts,up_asset,down_asset) VALUES(?,?,?,?,?,?,?) ON CONFLICT(condition_id) DO UPDATE SET question=excluded.question,slug=excluded.slug,start_ts=excluded.start_ts,end_ts=excluded.end_ts,up_asset=excluded.up_asset,down_asset=excluded.down_asset",(m["condition_id"],m["question"],m["slug"],m["start_ts"],m["end_ts"],m["up_asset"],m["down_asset"])); c.commit()
-async def subscribe(a):
+        c.execute("""INSERT INTO markets(condition_id,question,slug,start_ts,end_ts,up_asset,down_asset)
+          VALUES(?,?,?,?,?,?,?) ON CONFLICT(condition_id) DO UPDATE SET
+          question=excluded.question,slug=excluded.slug,start_ts=excluded.start_ts,end_ts=excluded.end_ts,
+          up_asset=excluded.up_asset,down_asset=excluded.down_asset""",
+          (m["condition_id"],m["question"],m["slug"],m["start_ts"],m["end_ts"],m["up_asset"],m["down_asset"]))
+        c.commit()
+
+async def subscribe_asset(a):
     if a and a not in subscribed_assets:
-        subscribed_assets.add(a); await ws_send_queue.put({"operation":"subscribe","assets_ids":[a]})
+        subscribed_assets.add(a)
+        await ws_send_queue.put({"operation":"subscribe","assets_ids":[a]})
+
 async def discovery_loop():
     while True:
         try:
@@ -181,360 +475,1641 @@ async def discovery_loop():
             for slot in (cur-300,cur,cur+300):
                 m=await discover_slot(slot)
                 if m and m["condition_id"] not in markets:
-                    markets[m["condition_id"]]=m; persist_market(m); await subscribe(m["up_asset"]); await subscribe(m["down_asset"])
-                    log.info("MARKET %s",m["slug"])
-        except Exception:log.exception("discovery")
+                    markets[m["condition_id"]]=m; persist_market(m)
+                    await subscribe_asset(m["up_asset"]); await subscribe_asset(m["down_asset"])
+                    log.info("MARKET %s | %s",m["slug"],utc_iso(m["start_ts"]))
+        except Exception: log.exception("Discovery failed")
         await asyncio.sleep(10)
 
+# ============================================================
+# Polymarket book
+# ============================================================
+
 def level_map(rows):
-    d={}
+    out={}
     for x in rows or []:
         if isinstance(x,dict):
-            p=sf(x.get("price"),math.nan); q=sf(x.get("size"))
-            if not math.isnan(p) and q>0:d[p]=q
-    return d
-def apply_book(a,p):books[a]={"bids":level_map(p.get("bids")),"asks":level_map(p.get("asks")),"received_ms":now_ms()}
-def apply_change(p):
+            p=sf(x.get("price"),math.nan); q=sf(x.get("size"),0)
+            if not math.isnan(p) and q>0: out[p]=q
+    return out
+
+def apply_book(asset,payload,source="ws"):
+    books[asset]={"bids":level_map(payload.get("bids")),"asks":level_map(payload.get("asks")),
+                  "received_ms":now_ms(),"source":source}
+
+def apply_price_change(payload):
     recv=now_ms()
-    for ch in p.get("price_changes") or p.get("priceChanges") or []:
-        a=str(ch.get("asset_id") or ch.get("token_id") or "");
-        if not a:continue
-        b=books.setdefault(a,{"bids":{},"asks":{},"received_ms":recv}); pr=sf(ch.get("price"),math.nan); q=sf(ch.get("size")); side=str(ch.get("side","")).upper()
-        if math.isnan(pr):continue
+    for ch in payload.get("price_changes") or payload.get("priceChanges") or []:
+        if not isinstance(ch,dict): continue
+        a=str(ch.get("asset_id") or ch.get("token_id") or ch.get("tokenId") or "")
+        if not a: continue
+        b=books.setdefault(a,{"bids":{},"asks":{},"received_ms":recv,"source":"delta"})
+        p=sf(ch.get("price"),math.nan); q=sf(ch.get("size"),0); side=str(ch.get("side","")).upper()
+        if math.isnan(p): continue
         target=b["bids"] if side=="BUY" else b["asks"]
-        if q<=0:target.pop(pr,None)
-        else:target[pr]=q
+        if q<=0: target.pop(p,None)
+        else: target[p]=q
         b["received_ms"]=recv
+
 def best_ask(a):
-    b=books.get(a); return min(b["asks"]) if b and b["asks"] else None
+    b=books.get(a)
+    return min(b["asks"]) if b and b["asks"] else None
+
 async def refresh_book(a):
-    d=await get_json(f"{CLOB}/book",{"token_id":a})
-    if isinstance(d,dict):apply_book(a,d);return True
+    d=await get_json(f"{HOST}/book",{"token_id":a})
+    if isinstance(d,dict): apply_book(a,d,"rest"); return True
     return False
+
 async def ensure_book(a):
     b=books.get(a)
-    if b and b["asks"] and now_ms()-b["received_ms"]<=MAX_BOOK_AGE_MS:return now_ms()-b["received_ms"]
-    await refresh_book(a); b=books.get(a); return now_ms()-b["received_ms"] if b else None
+    if b and b["asks"] and now_ms()-b["received_ms"]<=MAX_BOOK_AGE_MS:
+        return now_ms()-b["received_ms"]
+    await refresh_book(a); b=books.get(a)
+    return now_ms()-b["received_ms"] if b else None
 
-def simulate_buy(a,wanted):
+def simulate_buy(a,wanted,max_total=None):
     b=books.get(a)
-    if not b or not b["asks"]:return [],0
-    rem=wanted; fills=[]
+    if not b or not b["asks"]: return [],0.0
+    rem=wanted; fills=[]; spent=0.0
     for p in sorted(b["asks"]):
-        take=min(rem,b["asks"][p])
-        if take>0:fills.append((p,take));rem-=take
-        if rem<=1e-9:break
+        q=b["asks"][p]
+        take=min(q,rem)
+        if max_total is not None:
+            # Include estimated taker fee in affordability.
+            per_share=p + fee_usdc(1,p)
+            take=min(take,max(0.0,(max_total-spent)/per_share))
+        if take>1e-9:
+            fills.append((p,take)); spent += p*take + fee_usdc(take,p); rem-=take
+        if rem<=1e-9 or (max_total is not None and spent>=max_total-1e-8): break
     return fills,wanted-rem
 
 def parse_ws(raw):
-    if isinstance(raw,bytes):raw=raw.decode("utf-8","ignore")
-    if raw in ("","PING","PONG"):return []
+    if isinstance(raw,bytes): raw=raw.decode("utf-8","ignore")
+    if raw in ("","PING","PONG"): return []
     try:
-        x=json.loads(raw);return x if isinstance(x,list) else [x]
-    except:return []
-async def poly_sender(ws):
+        x=json.loads(raw); return x if isinstance(x,list) else [x]
+    except Exception: return []
+
+async def ws_sender(ws):
     while True:
-        m=await ws_send_queue.get()
-        try:await ws.send(jd(m))
-        except:await ws_send_queue.put(m);return
-async def poly_ping(ws):
+        msg=await ws_send_queue.get()
+        try: await ws.send(jd(msg))
+        except Exception:
+            await ws_send_queue.put(msg); return
+
+async def ws_ping(ws):
     while True:
-        try:await ws.send("PING")
-        except:return
+        try: await ws.send("PING")
+        except Exception: return
         await asyncio.sleep(10)
+
 async def poly_ws_loop():
     while True:
         try:
-            if not subscribed_assets:await asyncio.sleep(1);continue
-            async with websockets.connect(POLY_WS,ping_interval=None,max_size=20_000_000) as ws:
+            if not subscribed_assets: await asyncio.sleep(1); continue
+            async with websockets.connect(POLY_WS,ping_interval=None,close_timeout=5,max_size=20_000_000) as ws:
                 await ws.send(jd({"assets_ids":list(subscribed_assets),"type":"market","custom_feature_enabled":True}))
                 log.info("POLY WS connected | assets=%d",len(subscribed_assets))
-                sender=asyncio.create_task(poly_sender(ws)); ping=asyncio.create_task(poly_ping(ws))
+                sender=asyncio.create_task(ws_sender(ws)); ping=asyncio.create_task(ws_ping(ws))
                 try:
                     async for raw in ws:
                         for ev in parse_ws(raw):
-                            if not isinstance(ev,dict):continue
-                            et=str(ev.get("event_type") or ev.get("type") or ""); p=ev.get("payload") if isinstance(ev.get("payload"),dict) else ev
+                            if not isinstance(ev,dict): continue
+                            et=str(ev.get("event_type") or ev.get("type") or "")
+                            p=ev.get("payload") if isinstance(ev.get("payload"),dict) else ev
                             if et=="book":
                                 a=str(p.get("asset_id") or p.get("token_id") or "")
-                                if a:apply_book(a,p)
-                            elif et=="price_change":apply_change(p)
-                finally:sender.cancel();ping.cancel()
-        except Exception as e:log.warning("POLY reconnect: %s",e);await asyncio.sleep(1)
+                                if a: apply_book(a,p)
+                            elif et=="price_change": apply_price_change(p)
+                            elif et=="market_resolved": await settle_from_ws(p)
+                finally: sender.cancel(); ping.cancel()
+        except Exception as e:
+            log.warning("POLY WS reconnect: %s",e); await asyncio.sleep(1)
 
-# Binance features
+# ============================================================
+# Binance confidence engine - preserved from the old V2 research bot
+# ============================================================
 
-def _ema(vals,period):
-    if not vals:return None
-    a=2/(period+1);e=float(vals[0])
-    for v in vals[1:]:e=a*float(v)+(1-a)*e
+def _ema(values,period):
+    if not values:return None
+    alpha=2/(period+1); e=float(values[0])
+    for v in values[1:]: e=alpha*float(v)+(1-alpha)*e
     return e
-def _rsi(vals,period=14):
-    if len(vals)<period+1:return None
-    g=[];l=[]
+
+def _rsi(values,period=14):
+    if len(values)<period+1:return None
+    gains=[]; losses=[]
     for i in range(-period,0):
-        d=vals[i]-vals[i-1];g.append(max(d,0));l.append(max(-d,0))
-    ag=sum(g)/period;al=sum(l)/period
-    if al<=1e-12:return 100
-    return 100-100/(1+ag/al)
-def _latest_price():return float(binance_tick_prices[-1][1]) if binance_tick_prices else None
-def _price_ago(msago):
+        d=float(values[i])-float(values[i-1]); gains.append(max(d,0)); losses.append(max(-d,0))
+    ag=sum(gains)/period; al=sum(losses)/period
+    if al<=1e-12:return 100.0
+    rs=ag/al; return 100-100/(1+rs)
+
+def _latest_btc_price():
+    return float(binance_tick_prices[-1][1]) if binance_tick_prices else None
+
+def _price_ms_ago(msago):
     target=now_ms()-msago
-    for ts,p in reversed(binance_tick_prices):
-        if ts<=target:return float(p)
+    for ts,px in reversed(binance_tick_prices):
+        if ts<=target:return float(px)
     return None
-def _ret(msago):
-    a=_latest_price();b=_price_ago(msago);return a/b-1 if a and b else 0.0
-def _flow(sec):
-    cut=now_ms()-sec*1000;bu=se=0
+
+def _ret_ms(msago):
+    a=_latest_btc_price(); b=_price_ms_ago(msago)
+    return a/b-1 if a and b else 0.0
+
+def _signed_flow(sec):
+    cutoff=now_ms()-int(sec*1000); buy=sell=0.0
     for ts,p,q,s in reversed(binance_trades):
-        if ts<cut:break
-        if s>0:bu+=q
-        else:se+=q
-    t=bu+se;return (bu-se)/t if t else 0
-def _large(sec):
-    cut=now_ms()-sec*1000;bu=se=0
+        if ts<cutoff:break
+        if s>0:buy+=q
+        else:sell+=q
+    t=buy+sell; return (buy-sell)/t if t>1e-9 else 0.0
+
+def _large_delta(sec):
+    cutoff=now_ms()-int(sec*1000); buy=sell=0.0
     for ts,p,q,s in reversed(binance_trades):
-        if ts<cut:break
+        if ts<cutoff:break
         if q<BINANCE_LARGE_TRADE_USD:continue
-        if s>0:bu+=q
-        else:se+=q
-    t=bu+se;return (bu-se)/t if t else 0
-def _book():
-    b=sum(sf(x[1]) for x in binance_depth_bids[:10]);a=sum(sf(x[1]) for x in binance_depth_asks[:10]);t=a+b
-    return (b-a)/t if t else 0
-def _regime(sec=30):
-    cut=now_ms()-sec*1000;pts=[float(p) for t,p in binance_tick_prices if t>=cut]
+        if s>0:buy+=q
+        else:sell+=q
+    t=buy+sell; return (buy-sell)/t if t>1e-9 else 0.0
+
+def _book_imbalance():
+    bid=sum(sf(x[1]) for x in binance_depth_bids[:10]); ask=sum(sf(x[1]) for x in binance_depth_asks[:10])
+    t=bid+ask; return (bid-ask)/t if t>1e-9 else 0.0
+
+def _regime_features(sec=30):
+    cutoff=now_ms()-sec*1000; pts=[(t,float(p)) for t,p in binance_tick_prices if t>=cutoff]
     if len(pts)<4:return dict(path_efficiency=0,direction_changes=0,realized_move=0,regime="UNKNOWN")
-    net=pts[-1]-pts[0];path=sum(abs(pts[i]-pts[i-1]) for i in range(1,len(pts)));eff=abs(net)/path if path else 0
+    px=[p for _,p in pts]; net=px[-1]-px[0]; path=sum(abs(px[i]-px[i-1]) for i in range(1,len(px)))
+    eff=abs(net)/path if path>1e-12 else 0
     signs=[]
-    for i in range(1,len(pts)):
-        d=pts[i]-pts[i-1]
-        if abs(d)>1e-12:signs.append(1 if d>0 else -1)
-    ch=sum(1 for i in range(1,len(signs)) if signs[i]!=signs[i-1]);mv=pts[-1]/pts[0]-1 if pts[0] else 0
-    reg="TREND" if eff>=.55 and abs(mv)>=.0005 else ("CHOP" if eff<=.25 and ch>=6 else "MIXED")
-    return dict(path_efficiency=eff,direction_changes=ch,realized_move=mv,regime=reg)
-def _start_price(cid,m):
+    for i in range(1,len(px)):
+        d=px[i]-px[i-1]
+        if abs(d)>1e-12: signs.append(1 if d>0 else -1)
+    changes=sum(1 for i in range(1,len(signs)) if signs[i]!=signs[i-1])
+    move=px[-1]/px[0]-1 if px[0] else 0
+    regime="TREND" if eff>=.55 and abs(move)>=.0005 else ("CHOP" if eff<=.25 and changes>=6 else "MIXED")
+    return dict(path_efficiency=eff,direction_changes=changes,realized_move=move,regime=regime)
+
+def _ensure_start_price(cid,m):
     if cid in market_binance_start_price:return market_binance_start_price[cid]
-    target=m["start_ts"]*1000;best=None;bd=None
-    for ts,p in binance_tick_prices:
-        d=abs(ts-target)
-        if d<=START_PRICE_CAPTURE_WINDOW_SEC*1000 and (bd is None or d<bd):best=float(p);bd=d
-    if best is None:best=_latest_price()
+    target=m["start_ts"]*1000; best=None; bestdt=None
+    for ts,px in binance_tick_prices:
+        dt=abs(ts-target)
+        if dt<=START_PRICE_CAPTURE_WINDOW_SEC*1000 and (bestdt is None or dt<bestdt): best=float(px); bestdt=dt
+    if best is None:best=_latest_btc_price()
     if best is not None:market_binance_start_price[cid]=best
     return best
-def _confidence(outcome,poly,f):
-    d=1 if outcome.lower()=="up" else -1
-    impulse=max(-1,min(1,d*(.35*f["ret_250ms"]/.00020+.30*f["ret_500ms"]/.00030+.20*f["ret_1s"]/.00045+.15*f["ret_3s"]/.00080)))
-    flow=max(-1,min(1,d*(.45*f["flow_1s"]+.30*f["flow_3s"]+.25*f["flow_10s"])))
-    book=max(-1,min(1,d*f["book_imbalance"]));large=max(-1,min(1,d*(.65*f["large_delta_10s"]+.35*f["large_delta_30s"])))
-    trend=1 if d*f["ema_bias"]>0 else -1
-    if f["regime"]=="CHOP":trend*=.2
+
+def confidence_from_features(outcome,poly_ask,f):
+    direction=1.0 if outcome.lower()=="up" else -1.0
+    impulse_raw=.35*(f["ret_250ms"]/.00020)+.30*(f["ret_500ms"]/.00030)+.20*(f["ret_1s"]/.00045)+.15*(f["ret_3s"]/.00080)
+    impulse=max(-1,min(1,direction*impulse_raw))
+    flow=max(-1,min(1,direction*(.45*f["flow_1s"]+.30*f["flow_3s"]+.25*f["flow_10s"])))
+    book=max(-1,min(1,direction*f["book_imbalance"]))
+    large=max(-1,min(1,direction*(.65*f["large_delta_10s"]+.35*f["large_delta_30s"])))
+    trend=1.0 if direction*f["ema_bias"]>0 else -1.0
+    if f["regime"]=="CHOP":trend*=.20
     elif f["regime"]=="MIXED":trend*=.55
-    dist=max(-1,min(1,d*f["distance_from_start_pct"]/.0015));pc=0 if poly is None else max(-1,min(1,(.72-float(poly))/.22))
-    w=W_IMPULSE*impulse+W_FLOW*flow+W_BOOK*book+W_LARGE*large+W_TREND*trend+W_DISTANCE*dist+W_POLY_PRICE*pc
-    return max(0,min(100,50+w/2))
-def snapshot(cid,m,outcome,poly):
-    btc=_latest_price();start=_start_price(cid,m);dist=btc/start-1 if btc and start else 0;prices=[float(p) for _,p in binance_second_prices]
-    e9=_ema(prices[-60:],9) if prices else None;e21=_ema(prices[-90:],21) if prices else None;bias=e9/e21-1 if e9 and e21 else 0;r=_regime(REGIME_WINDOW_SEC)
-    f=dict(btc_price=btc,start_price=start,distance_from_start_pct=dist,ret_250ms=_ret(250),ret_500ms=_ret(500),ret_1s=_ret(1000),ret_3s=_ret(3000),ret_10s=_ret(10000),flow_1s=_flow(1),flow_3s=_flow(3),flow_10s=_flow(10),flow_30s=_flow(30),book_imbalance=_book(),large_delta_10s=_large(10),large_delta_30s=_large(30),ema_bias=bias,rsi14=_rsi(prices,14) if prices else None,data_age_ms=(now_ms()-binance_last_trade_ms if binance_last_trade_ms else 999999),**r)
-    f["confidence"]=_confidence(outcome,poly,f);return f
-async def binance_loop():
-    global binance_depth_bids,binance_depth_asks,binance_last_trade_ms,binance_last_event_ms
+    dist=max(-1,min(1,direction*(f["distance_from_start_pct"]/.0015)))
+    poly=0 if poly_ask is None else max(-1,min(1,(.72-float(poly_ask))/.22))
+    weighted=W_IMPULSE*impulse+W_FLOW*flow+W_BOOK*book+W_LARGE*large+W_TREND*trend+W_DISTANCE*dist+W_POLY_PRICE*poly
+    return max(0,min(100,50+weighted/2))
+
+def binance_snapshot(cid,m,outcome,poly_ask):
+    btc=_latest_btc_price(); start=_ensure_start_price(cid,m); dist=btc/start-1 if btc and start else 0
+    prices=[float(p) for _,p in binance_second_prices]
+    e9=_ema(prices[-60:],9) if prices else None; e21=_ema(prices[-90:],21) if prices else None
+    eb=e9/e21-1 if e9 and e21 else 0; reg=_regime_features(REGIME_WINDOW_SEC)
+    f=dict(btc_price=btc,start_price=start,distance_from_start_pct=dist,
+      ret_250ms=_ret_ms(250),ret_500ms=_ret_ms(500),ret_1s=_ret_ms(1000),ret_3s=_ret_ms(3000),ret_10s=_ret_ms(10000),
+      flow_1s=_signed_flow(1),flow_3s=_signed_flow(3),flow_10s=_signed_flow(10),flow_30s=_signed_flow(30),
+      book_imbalance=_book_imbalance(),large_delta_10s=_large_delta(10),large_delta_30s=_large_delta(30),
+      ema9=e9,ema21=e21,ema_bias=eb,rsi14=_rsi(prices,14) if prices else None,
+      data_age_ms=max(0,now_ms()-binance_last_trade_ms) if binance_last_trade_ms else 999999,**reg)
+    f["confidence"]=confidence_from_features(outcome,poly_ask,f)
+    return f
+
+async def binance_ws_loop():
+    """
+    Exact old V2 combined Binance Futures feed: aggTrade + depth20@100ms.
+
+    One intentional safety fix versus old V2: CONF freshness is measured from
+    the last valid aggTrade only. Depth messages never refresh trade freshness.
+    """
+    global binance_depth_bids, binance_depth_asks
+    global binance_last_event_ms, binance_last_trade_ms, binance_last_depth_ms
+
     while True:
         try:
-            async with websockets.connect(BINANCE_WS,ping_interval=20,ping_timeout=20,max_size=4_000_000) as ws:
-                log.info("BINANCE V2 feed connected | %s",BINANCE_SYMBOL.upper())
+            async with websockets.connect(
+                BINANCE_WS,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=5,
+                max_size=10_000_000,
+            ) as ws:
+                log.info("BINANCE V2 WS connected | %s", BINANCE_SYMBOL.upper())
                 async for raw in ws:
-                    d=json.loads(raw);p=d.get("data",d);stream=str(d.get("stream",""));binance_last_event_ms=now_ms()
-                    if "aggtrade" in stream.lower() or p.get("e")=="aggTrade":
-                        ts=si(p.get("T") or p.get("E") or now_ms());px=sf(p.get("p"));qty=sf(p.get("q"));q=px*qty;sg=-1 if bool(p.get("m")) else 1
-                        if px>0 and qty>0:
-                            binance_last_trade_ms=now_ms();binance_trades.append((ts,px,q,sg));binance_tick_prices.append((ts,px));sec=ts//1000
-                            if binance_second_prices and binance_second_prices[-1][0]==sec:binance_second_prices[-1]=(sec,px)
-                            else:binance_second_prices.append((sec,px))
+                    recv_ms = now_ms()
+                    data = json.loads(raw)
+                    payload = data.get("data", data)
+                    stream = str(data.get("stream", ""))
+                    binance_last_event_ms = recv_ms
+
+                    if "aggtrade" in stream.lower() or payload.get("e") == "aggTrade":
+                        ts = si(payload.get("T") or payload.get("E") or recv_ms)
+                        price = sf(payload.get("p"))
+                        qty = sf(payload.get("q"))
+                        if price <= 0 or qty <= 0:
+                            continue
+                        quote = price * qty
+                        sign = -1 if bool(payload.get("m")) else 1
+                        binance_trades.append((ts, price, quote, sign))
+                        binance_tick_prices.append((ts, price))
+                        binance_last_trade_ms = recv_ms
+                        sec = ts // 1000
+                        if binance_second_prices and binance_second_prices[-1][0] == sec:
+                            binance_second_prices[-1] = (sec, price)
+                        else:
+                            binance_second_prices.append((sec, price))
+
                     elif "depth" in stream.lower():
-                        binance_depth_bids=p.get("b") or [];binance_depth_asks=p.get("a") or []
-        except Exception as e:log.warning("BINANCE reconnect: %s",e);await asyncio.sleep(1)
+                        binance_depth_bids = payload.get("b") or payload.get("bids") or []
+                        binance_depth_asks = payload.get("a") or payload.get("asks") or []
+                        binance_last_depth_ms = recv_ms
 
-# Strategy + guard
+        except Exception as e:
+            log.warning("BINANCE V2 WS reconnect: %s", e)
+        await asyncio.sleep(1)
 
-def get_base(cid,v):
-    k=(cid,v["name"])
-    if k not in base_state:base_state[k]={"buys":defaultdict(int),"last_buy":{},"primary":None}
-    return base_state[k]
-def momentum(cid,a,lookback):
-    h=price_history[cid][a]
-    if len(h)<=lookback:return None,None
-    return h[-1][1]-h[-1-lookback][1],h[-1-lookback][1]
-def req_conf(next_buy):return GUARD_PYR2_CONF if next_buy<=2 else (GUARD_PYR3_CONF if next_buy==3 else GUARD_PYR4_CONF)
-def decide(mode,f,typ,elapsed,before):
-    if f["data_age_ms"]>BINANCE_SIGNAL_MAX_AGE_MS:return False,"stale"
-    conf=f["confidence"];d=1 if f["_outcome"].lower()=="up" else -1;dr=d*f["ret_10s"];df=d*f["flow_10s"];path=f["path_efficiency"]
-    if mode=="CONF60":return conf>=60,f"conf={conf:.1f}"
-    if typ=="ENTRY":return conf>=GUARD_ENTRY_CONF,f"entry={conf:.1f}"
-    if elapsed>GUARD_CUTOFF_SEC:return False,"after90"
-    if before<=0:return False,"no_position"
-    nb=before+1
-    if mode=="GUARD90":return conf>=60,f"conf={conf:.1f}"
-    rq=req_conf(nb)
-    if conf<rq:return False,f"conf<{rq:.0f}"
-    if mode=="GUARD90_STEP":return True,"step_ok"
-    if nb>=3 and not (dr>=GUARD_RET10_MIN or df>=GUARD_FLOW_MIN):return False,"direction_bad"
-    if mode=="GUARD90_FLOW":return True,"flow_ok"
-    if mode=="GUARD90_ADAPTIVE":
-        if nb>=3 and path<GUARD_DANGER_PATH and dr<=0 and df<=0:return False,"danger_cap20"
-        return True,"adaptive_ok"
-    if mode=="GUARD90_STRONG":
-        if nb>=3 and path<GUARD_PATH_MIN_STRONG:return False,"weak_path"
-        return True,"strong_ok"
-    return False,"unknown"
-def store_feature(ms,cid,v,a,outcome,typ,elapsed,poly,f):
-    with db() as c:
-        c.execute("INSERT INTO features(signal_ms,condition_id,variant,asset,outcome,signal_type,elapsed_sec,poly_ask,btc_price,start_price,distance_from_start_pct,ret_1s,ret_3s,ret_10s,flow_3s,flow_10s,flow_30s,book_imbalance,large_delta_10s,large_delta_30s,ema_bias,rsi14,path_efficiency,direction_changes,realized_move,regime,confidence,data_age_ms) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(ms,cid,v["name"],a,outcome,typ,elapsed,poly,f["btc_price"],f["start_price"],f["distance_from_start_pct"],f["ret_1s"],f["ret_3s"],f["ret_10s"],f["flow_3s"],f["flow_10s"],f["flow_30s"],f["book_imbalance"],f["large_delta_10s"],f["large_delta_30s"],f["ema_bias"],f["rsi14"],f["path_efficiency"],f["direction_changes"],f["realized_move"],f["regime"],f["confidence"],f["data_age_ms"]));c.commit()
-def record_trade(ms,cid,v,mode,a,outcome,typ,elapsed,buy_no,filled,avg,gross,fee,total,ok,reason):
-    with db() as c:
-        c.execute("INSERT INTO shadow_trades(trade_ms,condition_id,variant,mode,asset,outcome,signal_type,elapsed_sec,buy_no,filled_shares,avg_price,gross_cost,fee,total_cost,accepted,reason) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(ms,cid,v["name"],mode,a,outcome,typ,elapsed,buy_no,filled if ok else 0,avg if ok else None,gross if ok else 0,fee if ok else 0,total if ok else 0,1 if ok else 0,reason));c.commit()
-async def process_signal(m,v,a,outcome,typ,elapsed):
-    age=await ensure_book(a);fills,filled=simulate_buy(a,ORDER_SIZE)
-    if filled<=0:return False
-    gross=sum(p*q for p,q in fills);fee=sum(fee_usdc(q,p) for p,q in fills);avg=gross/filled;total=gross+fee;ms=now_ms();f=snapshot(m["condition_id"],m,outcome,best_ask(a));f["_outcome"]=outcome
-    store_feature(ms,m["condition_id"],v,a,outcome,typ,elapsed,best_ask(a),f)
-    for mode in MODES:
-        sk=(m["condition_id"],v["name"],mode);ck=(m["condition_id"],v["name"],mode,a);before=shadow_buys[ck]
-        if typ=="PYRAMID" and a not in shadow_sides[sk]:ok=False;why="no_position"
-        else:ok,why=decide(mode,f,typ,elapsed,before)
-        if ok:
-            if typ=="ENTRY":shadow_sides[sk].add(a)
-            shadow_buys[ck]+=1
-        record_trade(ms,m["condition_id"],v,mode,a,outcome,typ,elapsed,shadow_buys[ck] if ok else before,filled,avg,gross,fee,total,ok,f"{why};conf={f['confidence']:.1f};regime={f['regime']};path={f['path_efficiency']:.3f};dr10={(1 if outcome=='Up' else -1)*f['ret_10s']:.5f};df10={(1 if outcome=='Up' else -1)*f['flow_10s']:.3f}")
-    st=get_base(m["condition_id"],v);st["buys"][a]+=1;st["last_buy"][a]=avg
-    if typ=="ENTRY":st["primary"]=a
-    return True
-async def evaluate(m,v,elapsed):
-    if v["cutoff"] is not None and elapsed>v["cutoff"]:return
-    st=get_base(m["condition_id"],v);cands=[]
-    for a,outcome in ((m["up_asset"],"Up"),(m["down_asset"],"Down")):
-        ask=best_ask(a)
-        if ask is None or not(MIN_PRICE<=ask<=MAX_PRICE):continue
-        mom,ref=momentum(m["condition_id"],a,v["lookback"])
-        if mom is None:continue
-        buys=st["buys"][a];typ=None
-        if buys==0:
-            if st["primary"] is not None:continue
-            if v["entry_price_min"] is not None and ask<v["entry_price_min"]:continue
-            if v["entry_price_max"] is not None and ask>v["entry_price_max"]:continue
-            if v["momentum_cap"] is not None and mom>v["momentum_cap"]:continue
-            if mom>=v["entry_move"]:typ="ENTRY"
-        else:
-            if a!=st["primary"]:continue
-            if v["momentum_cap"] is not None and mom>v["momentum_cap"]:continue
-            last=st["last_buy"].get(a)
-            if last is not None and ask>=last+v["pyramid_step"] and mom>0 and buys<v["max_buys_side"]:typ="PYRAMID"
-        if typ:cands.append((mom,a,outcome,typ))
-    if cands:
-        cands.sort(reverse=True);_,a,outcome,typ=cands[0];await process_signal(m,v,a,outcome,typ,elapsed)
-async def strategy_loop():
+
+async def binance_watchdog_loop():
+    """
+    Diagnostic only. It never marks Binance fresh from depth.
+    If aggTrade is missing, strategy entries remain blocked.
+    """
     while True:
-        st=time.monotonic();n=time.time()
         try:
-            for cid,m in list(markets.items()):
-                elapsed=n-m["start_ts"]
-                if -30<=elapsed<=310:
-                    for a in (m["up_asset"],m["down_asset"]):
-                        ask=best_ask(a)
-                        if ask is not None:price_history[cid][a].append((now_ms(),ask))
-                if elapsed<0 or elapsed>TRADE_WINDOW_SECONDS:continue
-                if best_ask(m["up_asset"]) is None or best_ask(m["down_asset"]) is None:continue
-                for v in BASE_VARIANTS:await evaluate(m,v,elapsed)
-        except Exception:log.exception("strategy")
-        await asyncio.sleep(max(.05,DECISION_INTERVAL-(time.monotonic()-st)))
+            await asyncio.sleep(10)
+            age = now_ms() - binance_last_trade_ms if binance_last_trade_ms else None
+            if age is None or age > BINANCE_NO_TRADE_RECONNECT_MS:
+                log.warning(
+                    "BINANCE WATCHDOG | aggTrade_age=%s | ticks=%d | trades=%d | depth_age=%s",
+                    f"{age}ms" if age is not None else "NONE",
+                    len(binance_tick_prices),
+                    len(binance_trades),
+                    (
+                        f"{now_ms() - binance_last_depth_ms}ms"
+                        if binance_last_depth_ms else "NONE"
+                    ),
+                )
+        except Exception:
+            log.exception("BINANCE watchdog failed")
 
-# Resolution / reports
 
-def resolve_winner(raw):
-    outs=[str(x) for x in parse_jsonish(raw.get("outcomes"))];toks=[str(x) for x in parse_jsonish(raw.get("clobTokenIds"))];prs=[sf(x,-1) for x in parse_jsonish(raw.get("outcomePrices"))]
-    if len(outs)>=2 and len(toks)>=2 and len(prs)>=2:
-        i=max(range(len(prs)),key=lambda j:prs[j]);other=max([prs[j] for j in range(len(prs)) if j!=i] or [-1])
-        if prs[i]>=.999 and other<=.001 and (raw.get("closed") or raw.get("resolved") or prs[i]>=.9999):return toks[i],outs[i]
-    return None,None
-async def settle(cid,win,out):
+
+# ============================================================
+# Runtime cleanup
+# ============================================================
+
+def cleanup_old_runtime():
+    cutoff = now_ts() - MEMORY_KEEP_RESOLVED_SEC
     with db() as c:
-        for v in BASE_VARIANTS:
-            for mode in MODES:
-                if c.execute("SELECT 1 FROM shadow_results WHERE condition_id=? AND variant=? AND mode=?",(cid,v["name"],mode)).fetchone():continue
-                rows=c.execute("SELECT * FROM shadow_trades WHERE condition_id=? AND variant=? AND mode=? AND accepted=1",(cid,v["name"],mode)).fetchall();cost=sum(sf(r["total_cost"]) for r in rows);payout=sum(sf(r["filled_shares"]) for r in rows if str(r["asset"])==win);pnl=payout-cost
-                c.execute("INSERT INTO shadow_results(condition_id,variant,mode,winning_asset,winning_outcome,total_cost,payout,pnl,trades,settled_ms) VALUES(?,?,?,?,?,?,?,?,?,?)",(cid,v["name"],mode,win,out,cost,payout,pnl,len(rows),now_ms()))
-        c.execute("UPDATE markets SET resolved=1,winning_asset=?,winning_outcome=? WHERE condition_id=?",(win,out,cid));c.commit()
+        rows = c.execute(
+            "SELECT condition_id FROM markets WHERE resolved=1 AND end_ts<?",
+            (cutoff,),
+        ).fetchall()
+
+    old_cids = {
+        str(r["condition_id"])
+        for r in rows
+        if str(r["condition_id"]) in markets
+    }
+    if not old_cids:
+        return 0
+
+    for cid in old_cids:
+        markets.pop(cid, None)
+        price_history.pop(cid, None)
+        market_binance_start_price.pop(cid, None)
+
+    for key in list(strategy_state):
+        if key[0] in old_cids:
+            strategy_state.pop(key, None)
+
+    for key in list(shadow_accepted_sides):
+        if key[0] in old_cids:
+            shadow_accepted_sides.pop(key, None)
+
+    keep_assets = set()
+    for m in markets.values():
+        if m.get("up_asset"):
+            keep_assets.add(str(m["up_asset"]))
+        if m.get("down_asset"):
+            keep_assets.add(str(m["down_asset"]))
+
+    for asset in list(books):
+        if asset not in keep_assets:
+            books.pop(asset, None)
+
+    subscribed_assets.intersection_update(keep_assets)
+    return len(old_cids)
+
+async def cleanup_loop():
+    while True:
+        try:
+            removed = cleanup_old_runtime()
+            if removed:
+                log.info(
+                    "CLEANUP | removed_markets=%d | markets=%d | books=%d | assets=%d",
+                    removed, len(markets), len(books), len(subscribed_assets)
+                )
+        except Exception:
+            log.exception("Cleanup failed")
+        await asyncio.sleep(60)
+
+# ============================================================
+# Four-strategy exact-shadow engine
+# ============================================================
+
+def get_st(cid, strategy_name):
+    key = (cid, strategy_name)
+    if key not in strategy_state:
+        strategy_state[key] = {
+            "buys": defaultdict(int),
+            "last_buy": {},
+            "started_sides": set(),
+            "primary_asset": None,
+        }
+    return strategy_state[key]
+
+def momentum_for(cid, asset, lookback):
+    h = price_history[cid][asset]
+    if len(h) <= lookback:
+        return None, None
+    return h[-1][1] - h[-1 - lookback][1], h[-1 - lookback][1]
+
+def snapshot_book(asset, captured_ms):
+    b = books.get(asset)
+    if not b or not b.get("asks"):
+        return None
+    return {
+        "bids": dict(b.get("bids") or {}),
+        "asks": dict(b.get("asks") or {}),
+        "received_ms": int(b.get("received_ms") or captured_ms),
+        "captured_ms": captured_ms,
+    }
+
+def best_ask_snapshot(book_snapshot):
+    if not book_snapshot or not book_snapshot["asks"]:
+        return None
+    return min(book_snapshot["asks"])
+
+def simulate_buy_snapshot(book_snapshot, wanted):
+    if not book_snapshot or not book_snapshot["asks"]:
+        return [], 0.0
+    rem = float(wanted)
+    fills = []
+    for p in sorted(book_snapshot["asks"]):
+        q = sf(book_snapshot["asks"][p])
+        take = min(q, rem)
+        if take > 1e-9:
+            fills.append((float(p), take))
+            rem -= take
+        if rem <= 1e-9:
+            break
+    return fills, wanted - rem
+
+def binance_core_snapshot(cid, market):
+    # Capture Binance features once for this market decision tick.
+    # confidence itself is recalculated per strategy signal because outcome and
+    # Polymarket ask can differ.
+    f = binance_snapshot(cid, market, "Up", None)
+    f.pop("confidence", None)
+    return f
+
+def features_for_signal(core, outcome, poly_ask):
+    f = dict(core)
+    f["confidence"] = confidence_from_features(outcome, poly_ask, f)
+    return f
+
+def store_signal(cid, strategy_name, asset, outcome, typ, ask, ref, mom, elapsed, f, accepted, reason):
+    with db() as c:
+        c.execute(
+            """INSERT INTO signals(
+              signal_ms,condition_id,strategy,asset,outcome,signal_type,
+              ask,reference_ask,momentum,elapsed_sec,confidence,binance_json,
+              accepted,reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now_ms(), cid, strategy_name, asset, outcome, typ,
+                ask, ref, mom, elapsed, f.get("confidence"), jd(f),
+                1 if accepted else 0, reason,
+            ),
+        )
+        c.commit()
+
+def execute_baseline_from_snapshot(cid, strategy, asset, outcome, typ, book_snapshot):
+    """
+    Execute the UNFILTERED base strategy only in the internal simulator.
+
+    This advances the strategy's own buys/last_buy/started_sides even if
+    CONF65 later blocks the trade, matching the old research shadow design.
+    It never touches that strategy's $500 PAPER account.
+    """
+    fills, filled = simulate_buy_snapshot(book_snapshot, ORDER_SIZE)
+    if filled <= 1e-8:
+        return None
+
+    gross = sum(p * q for p, q in fills)
+    fee = sum(fee_usdc(q, p) for p, q in fills)
+    avg = gross / filled
+    total = gross + fee
+    trade_ms = now_ms()
+    age = max(0, int(book_snapshot["captured_ms"]) - int(book_snapshot["received_ms"]))
+
+    with db() as c:
+        c.execute(
+            """INSERT INTO baseline_trades(
+              trade_ms,condition_id,strategy,asset,outcome,signal_type,
+              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
+              book_age_ms,fills_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                trade_ms, cid, strategy["name"], asset, outcome, typ,
+                ORDER_SIZE, filled, avg, gross, fee, total, age,
+                jd([{"price": p, "shares": q} for p, q in fills]),
+            ),
+        )
+        c.commit()
+
+    st = get_st(cid, strategy["name"])
+    st["buys"][asset] += 1
+    st["last_buy"][asset] = avg
+    st["started_sides"].add(asset)
+
+    if typ == "ENTRY" and not bool(strategy.get("allow_switch", True)):
+        st["primary_asset"] = asset
+
+    log.info(
+        "BASE %-16s | %-7s %-4s | %.2fsh @ %.4f | cost=%.4f",
+        strategy["name"], typ, outcome, filled, avg, total,
+    )
+
+    return {
+        "trade_ms": trade_ms,
+        "age": age,
+        "fills": fills,
+        "filled": filled,
+        "gross": gross,
+        "fee": fee,
+        "avg": avg,
+        "total": total,
+    }
+
+def exact_shadow_decision(cid, strategy_name, asset, typ, f):
+    """
+    Exact old V2 shadow logic, now CONF65:
+      ENTRY/SWITCH -> can start a shadow side only if fresh and conf>=65.
+      PYRAMID      -> requires that side to have an accepted ENTRY/SWITCH
+                      and fresh conf>=65.
+    """
+    fresh = f["data_age_ms"] <= BINANCE_SIGNAL_MAX_AGE_MS
+    conf_ok = fresh and f["confidence"] >= CONF_MIN
+    sides = shadow_accepted_sides[(cid, strategy_name)]
+
+    if typ in {"ENTRY", "SWITCH"}:
+        accepted = conf_ok
+        if accepted:
+            sides.add(asset)
+        if accepted:
+            reason = f"conf={f['confidence']:.1f};fresh=True"
+        else:
+            reason = f"blocked_conf={f['confidence']:.1f};fresh={fresh}"
+        return accepted, reason
+
+    if typ == "PYRAMID":
+        if asset not in sides:
+            return False, "no_shadow_position"
+        accepted = conf_ok
+        if accepted:
+            reason = f"conf={f['confidence']:.1f};fresh=True"
+        else:
+            reason = f"blocked_conf={f['confidence']:.1f};fresh={fresh}"
+        return accepted, reason
+
+    return False, "unknown_signal"
+
+def _trim_baseline_fills_to_budget(fills, max_total):
+    if max_total <= 0:
+        return [], 0.0
+    out = []
+    spent = 0.0
+    shares = 0.0
+    for p, q in fills:
+        per_share = p + fee_usdc(1, p)
+        affordable = max(0.0, (max_total - spent) / per_share)
+        take = min(q, affordable)
+        if take <= 1e-9:
+            break
+        out.append((p, take))
+        spent += p * take + fee_usdc(take, p)
+        shares += take
+        if spent >= max_total - 1e-8:
+            break
+    return out, shares
+
+def paper_has_asset_position(strategy_name, cid, asset):
+    with db() as c:
+        row = c.execute(
+            """SELECT COALESCE(SUM(filled_shares),0) AS sh
+               FROM trades
+               WHERE mode='PAPER' AND strategy=? AND condition_id=? AND asset=?
+                 AND signal_type<>'HEDGE'""",
+            (strategy_name, cid, asset),
+        ).fetchone()
+    return sf(row["sh"] if row else 0) > 1e-8
+
+def paper_market_exposure(strategy_name, cid):
+    """Return actual PAPER exposure for one strategy/market.
+
+    For the hedge variant the protected/primary side is the asset of the first
+    actual non-HEDGE PAPER fill. HEDGE fills never alter the V5 base/shadow state.
+    """
+    with db() as c:
+        rows = c.execute(
+            """SELECT id,asset,outcome,signal_type,filled_shares,total_cost
+               FROM trades
+               WHERE mode='PAPER' AND strategy=? AND condition_id=?
+               ORDER BY id""",
+            (strategy_name, cid),
+        ).fetchall()
+
+    total_cost = sum(sf(r["total_cost"]) for r in rows)
+    shares = defaultdict(float)
+    outcomes = {}
+    primary_asset = None
+    primary_outcome = None
+
+    for r in rows:
+        asset = str(r["asset"])
+        shares[asset] += sf(r["filled_shares"])
+        outcomes[asset] = str(r["outcome"])
+        if primary_asset is None and str(r["signal_type"]).upper() != "HEDGE":
+            primary_asset = asset
+            primary_outcome = str(r["outcome"])
+
+    return {
+        "rows": rows,
+        "total_cost": total_cost,
+        "shares": shares,
+        "outcomes": outcomes,
+        "primary_asset": primary_asset,
+        "primary_outcome": primary_outcome,
+    }
+
+
+def _hedge_plan_from_snapshot(book_snapshot, needed_improvement, max_total):
+    """Build the smallest opposite-side taker fill that improves settlement PnL.
+
+    Each hedge share pays $1 if the protected side loses, but costs ask + fee now.
+    Therefore the loss-floor improvement per share is 1 - all-in cost/share.
+    The plan walks real ask levels and respects the upside/cash spending cap.
+    """
+    if not book_snapshot or not book_snapshot.get("asks"):
+        return [], 0.0, 0.0
+    if needed_improvement <= 1e-9 or max_total <= 1e-9:
+        return [], 0.0, 0.0
+
+    fills = []
+    spent = 0.0
+    improved = 0.0
+
+    for p in sorted(book_snapshot["asks"]):
+        q = sf(book_snapshot["asks"][p])
+        p = sf(p)
+        if q <= 1e-9 or p <= 0 or p >= 1:
+            continue
+
+        fee_per_share = 0.07 * p * (1.0 - p)
+        all_in = p + fee_per_share
+        improvement_per_share = 1.0 - all_in
+        if improvement_per_share <= 1e-9:
+            continue
+
+        remaining_gap = max(0.0, needed_improvement - improved)
+        need_shares = remaining_gap / improvement_per_share
+        affordable = max(0.0, (max_total - spent) / all_in)
+        take = min(q, need_shares, affordable)
+        if take <= 1e-9:
+            break
+
+        fills.append((p, take))
+        # Use the bot's own fee function for the recorded all-in cost.
+        level_cost = p * take + fee_usdc(take, p)
+        spent += level_cost
+        improved += take - level_cost
+
+        if improved >= needed_improvement - 1e-6:
+            break
+        if spent >= max_total - 1e-8:
+            break
+
+    return fills, spent, improved
+
+
+def maybe_execute_hedge(market, strategy, tick_books):
+    """Risk-manager for E / V5 DYNAMIC HEDGE.
+
+    Trigger: >= HEDGE_START_SHARES actual shares on the first actual V5 side.
+    Goal: if that primary side loses at settlement, target PnL >= -HEDGE_MAX_LOSS.
+    Constraint: preserve at least HEDGE_MIN_UPSIDE if the primary side wins.
+
+    Existing opposite-side V5 SWITCH/PYRAMID shares count as protection, so the
+    hedge only buys the missing amount. It does not use CONF65 and does not touch
+    V5 baseline/shadow state because this is risk management, not a direction signal.
+    """
+    if not strategy.get("risk_hedge"):
+        return None
+
+    name = strategy["name"]
+    cid = market["condition_id"]
+    ex = paper_market_exposure(name, cid)
+    primary = ex["primary_asset"]
+    if not primary:
+        return None
+
+    primary_shares = sf(ex["shares"].get(primary, 0.0))
+    if primary_shares + 1e-8 < HEDGE_START_SHARES:
+        return None
+
+    if primary == str(market["up_asset"]):
+        hedge_asset = str(market["down_asset"])
+        hedge_outcome = "Down"
+    elif primary == str(market["down_asset"]):
+        hedge_asset = str(market["up_asset"])
+        hedge_outcome = "Up"
+    else:
+        return None
+
+    total_cost = sf(ex["total_cost"])
+    hedge_shares = sf(ex["shares"].get(hedge_asset, 0.0))
+
+    # Settlement PnL of the two possible outcomes using actual shares/cost paid.
+    pnl_if_primary_wins = primary_shares - total_cost
+    pnl_if_primary_loses = hedge_shares - total_cost
+    target_floor = -abs(HEDGE_MAX_LOSS)
+
+    if pnl_if_primary_loses >= target_floor - 1e-6:
+        return None
+
+    # Do not buy protection that would reduce a primary-side win below +$2.
+    upside_budget = pnl_if_primary_wins - HEDGE_MIN_UPSIDE
+    cash = paper_cash(name)
+    cash_budget = max(0.0, cash - MIN_FREE_CASH)
+    max_total = min(max(0.0, upside_budget), cash_budget)
+    if max_total <= 1e-8:
+        log.info(
+            "HEDGE %-16s BLOCK | primary=%s %.2fsh | lose=%+.2f | win=%+.2f | no upside budget",
+            name, ex["primary_outcome"], primary_shares,
+            pnl_if_primary_loses, pnl_if_primary_wins,
+        )
+        return None
+
+    book_snapshot = tick_books["books"].get(hedge_asset)
+    if not book_snapshot:
+        return None
+
+    needed = target_floor - pnl_if_primary_loses
+    fills, _planned_cost, _improved = _hedge_plan_from_snapshot(
+        book_snapshot, needed, max_total
+    )
+    filled = sum(q for _p, q in fills)
+    if filled + 1e-9 < HEDGE_MIN_ORDER_SHARES:
+        return None
+
+    gross = sum(p * q for p, q in fills)
+    fee = sum(fee_usdc(q, p) for p, q in fills)
+    total = gross + fee
+    avg = gross / filled
+    after = cash - total
+    age = max(
+        0,
+        int(book_snapshot.get("captured_ms") or now_ms())
+        - int(book_snapshot.get("received_ms") or now_ms()),
+    )
+
+    with db() as c:
+        c.execute(
+            """INSERT INTO trades(
+              trade_ms,mode,strategy,condition_id,asset,outcome,signal_type,
+              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
+              cash_before,cash_after,book_age_ms,fills_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now_ms(), "PAPER", name, cid, hedge_asset, hedge_outcome, "HEDGE",
+                filled, filled, avg, gross, fee, total,
+                cash, after, age,
+                jd([{"price": p, "shares": q} for p, q in fills]),
+            ),
+        )
+        c.execute(
+            "INSERT INTO state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (cash_key(name), str(after)),
+        )
+        c.commit()
+
+    new_cost = total_cost + total
+    new_hedge_shares = hedge_shares + filled
+    new_loss_pnl = new_hedge_shares - new_cost
+    new_win_pnl = primary_shares - new_cost
+
+    log.info(
+        "HEDGE %-16s | protect %s %.2fsh | buy %s %.2fsh @ %.4f | "
+        "lose %+.2f -> %+.2f | win %+.2f -> %+.2f | cost=%.4f",
+        name, ex["primary_outcome"], primary_shares,
+        hedge_outcome, filled, avg,
+        pnl_if_primary_loses, new_loss_pnl,
+        pnl_if_primary_wins, new_win_pnl, total,
+    )
+    return {
+        "primary_asset": primary,
+        "hedge_asset": hedge_asset,
+        "filled": filled,
+        "avg": avg,
+        "total": total,
+        "pnl_if_primary_loses_before": pnl_if_primary_loses,
+        "pnl_if_primary_loses_after": new_loss_pnl,
+        "pnl_if_primary_wins_before": pnl_if_primary_wins,
+        "pnl_if_primary_wins_after": new_win_pnl,
+    }
+
+
+def paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base):
+    name = strategy["name"]
+
+    # The exact shadow state may accept a PYRAMID after a theoretical entry
+    # which the $500 account itself could not afford. Do not create a real
+    # PAPER pyramid on a side this account never actually bought.
+    if typ == "PYRAMID" and not paper_has_asset_position(name, cid, asset):
+        log.warning(
+            "PAPER %-16s SKIP PYRAMID %-4s | no actual PAPER position",
+            name, outcome,
+        )
+        return False
+
+    cash = paper_cash(name)
+    available = max(0.0, cash - MIN_FREE_CASH)
+    fills = list(base["fills"])
+    filled = base["filled"]
+    theoretical_total = base["total"]
+
+    cash_limited = theoretical_total > available + 1e-8
+    if cash_limited:
+        fills, filled = _trim_baseline_fills_to_budget(fills, available)
+
+    if filled <= 1e-8:
+        log.warning(
+            "PAPER %-16s CASH BLOCK %s %s | cash=%.2f available=%.2f",
+            name, typ, outcome, cash, available,
+        )
+        return False
+
+    gross = sum(p * q for p, q in fills)
+    fee = sum(fee_usdc(q, p) for p, q in fills)
+    total = gross + fee
+    avg = gross / filled
+    after = cash - total
+
+    with db() as c:
+        c.execute(
+            """INSERT INTO trades(
+              trade_ms,mode,strategy,condition_id,asset,outcome,signal_type,
+              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
+              cash_before,cash_after,book_age_ms,fills_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now_ms(), "PAPER", name, cid, asset, outcome, typ,
+                ORDER_SIZE, filled, avg, gross, fee, total,
+                cash, after, base["age"],
+                jd([{"price": p, "shares": q} for p, q in fills]),
+            ),
+        )
+        c.execute(
+            "INSERT INTO state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (cash_key(name), str(after)),
+        )
+        c.commit()
+
+    suffix = " CASH_LIMITED" if cash_limited else ""
+    log.info(
+        "PAPER %-16s%s | %-7s %-4s | %.2fsh @ %.4f | cost=%.4f | cash %.2f -> %.2f",
+        name, suffix, typ, outcome, filled, avg, total, cash, after,
+    )
+    return True
+
+def candidate_for_strategy(cid, strategy, elapsed, tick_books):
+    """
+    Pure signal-selection step. It mirrors the old research evaluate_variant:
+    one strongest-momentum candidate per strategy per decision tick.
+    """
+    entry_cutoff_sec = strategy.get("entry_cutoff_sec")
+    if entry_cutoff_sec is not None and elapsed > float(entry_cutoff_sec):
+        return None
+
+    st = get_st(cid, strategy["name"])
+    allow_switch = bool(strategy.get("allow_switch", True))
+    entry_price_min = strategy.get("entry_price_min")
+    entry_price_max = strategy.get("entry_price_max")
+    momentum_cap = strategy.get("momentum_cap")
+    primary_asset = st.get("primary_asset")
+
+    candidates = []
+
+    for asset, outcome in tick_books["sides"]:
+        snap = tick_books["books"].get(asset)
+        ask = best_ask_snapshot(snap)
+        if ask is None or ask < MIN_PRICE or ask > MAX_PRICE:
+            continue
+
+        mom, ref = momentum_for(cid, asset, strategy["lookback"])
+        if mom is None:
+            continue
+
+        buys = st["buys"][asset]
+        signal = None
+
+        if buys == 0:
+            if not st["started_sides"]:
+                if entry_price_min is not None and ask < float(entry_price_min):
+                    continue
+                if entry_price_max is not None and ask > float(entry_price_max):
+                    continue
+                if momentum_cap is not None and mom > float(momentum_cap):
+                    continue
+
+                if mom >= strategy["entry_move"]:
+                    signal = "ENTRY"
+
+            else:
+                if not allow_switch:
+                    continue
+
+                switch_price_max = strategy.get("switch_price_max")
+                if switch_price_max is not None and ask > float(switch_price_max):
+                    continue
+
+                if strategy.get("dynamic_switch_v5"):
+                    if elapsed <= 60.0 and ask > 0.45:
+                        continue
+                    if elapsed > 60.0:
+                        if 0.45 < ask <= 0.50 and mom >= 0.10:
+                            continue
+                        if 0.50 < ask <= 0.70:
+                            continue
+
+                if mom >= strategy["switch_move"]:
+                    signal = "SWITCH"
+
+        else:
+            if not allow_switch and primary_asset is not None and asset != primary_asset:
+                continue
+
+            if momentum_cap is not None and mom > float(momentum_cap):
+                continue
+
+            last_buy = st["last_buy"].get(asset)
+            if (
+                last_buy is not None
+                and ask >= last_buy + strategy["pyramid_step"]
+                and mom > 0
+                and buys < strategy["max_buys_side"]
+            ):
+                signal = "PYRAMID"
+
+        if signal:
+            candidates.append((mom, asset, outcome, ask, ref, signal))
+
+    if not candidates:
+        return None
+
+    candidates.sort(reverse=True, key=lambda x: x[0])
+    mom, asset, outcome, ask, ref, signal = candidates[0]
+    return {
+        "mom": mom,
+        "asset": asset,
+        "outcome": outcome,
+        "ask": ask,
+        "ref": ref,
+        "signal": signal,
+    }
+
+def evaluate_strategy(market, strategy, elapsed, tick_books, binance_core):
+    cid = market["condition_id"]
+    candidate = candidate_for_strategy(cid, strategy, elapsed, tick_books)
+    if not candidate:
+        return
+
+    asset = candidate["asset"]
+    outcome = candidate["outcome"]
+    typ = candidate["signal"]
+
+    # Base strategy advances first, independently of CONF65.
+    base = execute_baseline_from_snapshot(
+        cid,
+        strategy,
+        asset,
+        outcome,
+        typ,
+        tick_books["books"][asset],
+    )
+    if not base:
+        return
+
+    # Every strategy sees the same Binance core snapshot for this market tick.
+    f = features_for_signal(binance_core, outcome, candidate["ask"])
+    accepted, shadow_reason = exact_shadow_decision(
+        cid, strategy["name"], asset, typ, f
+    )
+    reason = (
+        f"{shadow_reason};regime={f['regime']};age={f['data_age_ms']}ms;"
+        f"base_avg={base['avg']:.4f}"
+    )
+
+    store_signal(
+        cid,
+        strategy["name"],
+        asset,
+        outcome,
+        typ,
+        candidate["ask"],
+        candidate["ref"],
+        candidate["mom"],
+        elapsed,
+        f,
+        accepted,
+        reason,
+    )
+
+    if not accepted:
+        log.info(
+            "BLOCK %-16s | %-7s %-4s | %s",
+            strategy["name"], typ, outcome, reason,
+        )
+        return
+
+    paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base)
+
+async def strategy_loop():
+    """
+    A/B/C/E fairness:
+      * one 3-second scheduler;
+      * one captured Polymarket order-book snapshot per market/tick;
+      * one Binance core-feature snapshot per market/tick;
+      * four independent base states;
+      * four independent CONF65 shadow states;
+      * four independent $500 PAPER accounts;
+      * E's HEDGE layer executes after the normal V5 decision on the same book tick.
+    """
+    while True:
+        started = time.monotonic()
+        n = time.time()
+
+        try:
+            for cid, market in list(markets.items()):
+                elapsed = n - market["start_ts"]
+
+                if not (-30 <= elapsed <= 310):
+                    continue
+
+                # Refresh both books before capturing the common tick snapshot.
+                for asset in (market["up_asset"], market["down_asset"]):
+                    await ensure_book(asset)
+
+                captured_ms = now_ms()
+                up_snap = snapshot_book(market["up_asset"], captured_ms)
+                down_snap = snapshot_book(market["down_asset"], captured_ms)
+                if not up_snap or not down_snap:
+                    continue
+
+                sides = [
+                    (market["up_asset"], "Up"),
+                    (market["down_asset"], "Down"),
+                ]
+                tick_books = {
+                    "captured_ms": captured_ms,
+                    "sides": sides,
+                    "books": {
+                        market["up_asset"]: up_snap,
+                        market["down_asset"]: down_snap,
+                    },
+                }
+
+                # One price-history observation shared by all strategies.
+                for asset, _outcome in sides:
+                    ask = best_ask_snapshot(tick_books["books"][asset])
+                    if ask is not None:
+                        price_history[cid][asset].append((captured_ms, ask))
+
+                if not trading_enabled() or elapsed < 0 or elapsed > TRADE_WINDOW_SECONDS:
+                    continue
+
+                # One Binance feature capture shared by all four candidates.
+                core = binance_core_snapshot(cid, market)
+
+                # No await inside evaluations: all four use this same tick snapshot.
+                for strategy in STRATEGIES:
+                    evaluate_strategy(market, strategy, elapsed, tick_books, core)
+
+                # E risk management is deliberately separate from V5 signal state.
+                # It can also top up a previously partial hedge when the book improves.
+                for strategy in STRATEGIES:
+                    if strategy.get("risk_hedge"):
+                        maybe_execute_hedge(market, strategy, tick_books)
+
+        except Exception:
+            log.exception("Strategy loop failed")
+
+        await asyncio.sleep(max(0.05, DECISION_INTERVAL - (time.monotonic() - started)))
+
+# ============================================================
+# Settlement / independent balances
+# ============================================================
+
+def resolve_winner(row):
+    outcomes = [str(x) for x in parse_jsonish(row.get("outcomes"))]
+    tokens = [str(x) for x in parse_jsonish(row.get("clobTokenIds"))]
+    prices = [sf(x, -1) for x in parse_jsonish(row.get("outcomePrices"))]
+    if len(outcomes) >= 2 and len(tokens) >= 2 and len(prices) >= 2:
+        i = max(range(len(prices)), key=lambda j: prices[j])
+        others = [prices[j] for j in range(len(prices)) if j != i]
+        if (
+            prices[i] >= .999
+            and max(others or [-1]) <= .001
+            and bool(row.get("closed", False) or row.get("resolved", False) or prices[i] >= .9999)
+        ):
+            return tokens[i], outcomes[i]
+    return None, None
+
+async def settle_from_ws(ev):
+    cid = str(ev.get("market") or ev.get("condition_id") or "")
+    win = str(ev.get("winning_asset_id") or ev.get("winning_asset") or "")
+    out = str(ev.get("winning_outcome") or "")
+    if cid and win:
+        await settle_market(cid, win, out)
+
+async def settle_market(cid, win, out):
+    async with settle_lock:
+        settled = []
+
+        with db() as c:
+            for strategy in STRATEGIES:
+                name = strategy["name"]
+
+                existing = c.execute(
+                    "SELECT 1 FROM results WHERE condition_id=? AND strategy=? AND mode='PAPER'",
+                    (cid, name),
+                ).fetchone()
+                if existing:
+                    continue
+
+                rows = c.execute(
+                    """SELECT * FROM trades
+                       WHERE condition_id=? AND strategy=? AND mode='PAPER'""",
+                    (cid, name),
+                ).fetchall()
+
+                cost = sum(sf(r["total_cost"]) for r in rows)
+                payout = sum(
+                    sf(r["filled_shares"])
+                    for r in rows
+                    if str(r["asset"]) == win
+                )
+                pnl = payout - cost
+                cash = paper_cash(name)
+                after = cash + payout
+
+                c.execute(
+                    """INSERT INTO results(
+                      condition_id,strategy,mode,winning_asset,winning_outcome,
+                      total_cost,payout,pnl,trades,settled_ms
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
+                    (
+                        cid, name, "PAPER", win, out,
+                        cost, payout, pnl, len(rows), now_ms(),
+                    ),
+                )
+                c.execute(
+                    "INSERT INTO state(key,value) VALUES(?,?) "
+                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (cash_key(name), str(after)),
+                )
+                settled.append((strategy, pnl, after, len(rows)))
+
+            c.execute(
+                """UPDATE markets
+                   SET resolved=1,winning_asset=?,winning_outcome=?
+                   WHERE condition_id=?""",
+                (win, out, cid),
+            )
+            c.commit()
+
+        if settled:
+            for strategy, pnl, after, trades_n in settled:
+                log.info(
+                    "SETTLED %-16s | winner=%s | trades=%d | pnl=%+.2f | cash=%.2f",
+                    strategy["name"], out, trades_n, pnl, after,
+                )
+
+            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+                lines = [f"✅ MARKET SETTLED | Winner: {out}", ""]
+                for strategy, pnl, after, trades_n in settled:
+                    lines.extend([
+                        f"{strategy['short']}",
+                        f"PnL: ${pnl:+.2f} | Cash: ${after:.2f} | Trades: {trades_n}",
+                        "",
+                    ])
+                await tg_send("\n".join(lines).strip())
+
 async def resolution_loop():
     while True:
         try:
-            with db() as c:rows=c.execute("SELECT * FROM markets WHERE resolved=0 AND end_ts<? ORDER BY end_ts LIMIT 50",(now_ts()-10,)).fetchall()
+            cutoff = now_ts() - 10
+            with db() as c:
+                rows = c.execute(
+                    """SELECT * FROM markets
+                       WHERE resolved=0 AND end_ts<?
+                       ORDER BY end_ts LIMIT 50""",
+                    (cutoff,),
+                ).fetchall()
+
             for r in rows:
-                ev=await fetch_event(r["slug"])
-                if not ev or not isinstance(ev.get("markets"),list):continue
-                raw=next((x for x in ev["markets"] if str(x.get("conditionId") or "")==r["condition_id"]),None) or (ev["markets"][0] if len(ev["markets"])==1 else None)
-                if raw:
-                    w,o=resolve_winner(raw)
-                    if w:await settle(r["condition_id"],w,o)
-        except Exception:log.exception("resolution")
+                ev = await fetch_event_by_slug(r["slug"])
+                if not ev or not isinstance(ev.get("markets"), list):
+                    continue
+                raw = next(
+                    (
+                        x for x in ev["markets"]
+                        if str(x.get("conditionId") or "") == r["condition_id"]
+                    ),
+                    None,
+                )
+                if raw is None and len(ev["markets"]) == 1:
+                    raw = ev["markets"][0]
+                if not raw:
+                    continue
+                win, out = resolve_winner(raw)
+                if win:
+                    await settle_market(r["condition_id"], win, out)
+
+        except Exception:
+            log.exception("Resolution fallback failed")
+
         await asyncio.sleep(10)
 
-def csv_bytes(rows,cols=None):
-    s=io.StringIO()
-    if rows:
-        cols=cols or list(rows[0].keys());w=csv.DictWriter(s,fieldnames=cols,extrasaction="ignore");w.writeheader();[w.writerow(dict(r)) for r in rows]
-    elif cols:
-        w=csv.DictWriter(s,fieldnames=cols);w.writeheader()
-    return s.getvalue().encode("utf-8-sig")
-def summary(sm,em):
-    out=[]
+def account_stats(strategy_name):
+    cash = paper_cash(strategy_name)
+    initial = paper_initial(strategy_name)
+
     with db() as c:
-        for v in BASE_VARIANTS:
-            for mode in MODES:
-                rows=c.execute("SELECT sr.* FROM shadow_results sr JOIN markets m ON m.condition_id=sr.condition_id WHERE sr.variant=? AND sr.mode=? AND m.end_ts*1000>=? AND m.end_ts*1000<?",(v["name"],mode,sm,em)).fetchall();pnl=sum(sf(r["pnl"]) for r in rows);cost=sum(sf(r["total_cost"]) for r in rows);wins=sum(sf(r["pnl"])>0 for r in rows);loss=sum(sf(r["pnl"])<0 for r in rows);trades=sum(si(r["trades"]) for r in rows)
-                out.append(dict(variant=v["name"],mode=mode,markets=len(rows),wins=wins,losses=loss,trades=trades,cost=round(cost,5),pnl=round(pnl,5),roi_pct=round(pnl/cost*100,4) if cost else 0))
-    return sorted(out,key=lambda x:x["pnl"],reverse=True)
-def make_report(start,end):
-    sm=start*1000;em=end*1000;su=summary(sm,em)
-    with db() as c:
-        tr=c.execute("SELECT * FROM shadow_trades WHERE trade_ms>=? AND trade_ms<? ORDER BY trade_ms",(sm,em)).fetchall();ft=c.execute("SELECT * FROM features WHERE signal_ms>=? AND signal_ms<? ORDER BY signal_ms",(sm,em)).fetchall();rs=c.execute("SELECT sr.* FROM shadow_results sr JOIN markets m ON m.condition_id=sr.condition_id WHERE m.end_ts*1000>=? AND m.end_ts*1000<? ORDER BY m.end_ts,sr.variant,sr.mode",(sm,em)).fetchall()
-    d1=datetime.fromtimestamp(start,tz=timezone.utc);d2=datetime.fromtimestamp(end,tz=timezone.utc);path=REPORT_DIR/f"guard_v5_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
-    lines=[VERSION,f"Period: {utc_iso(start)} -> {utc_iso(end)}","", "RANKING"]+[f"{x['variant']} + {x['mode']}: {x['pnl']:+.2f} | ROI {x['roi_pct']:+.2f}% | W/L {x['wins']}/{x['losses']} | trades {x['trades']}" for x in su]
-    with zipfile.ZipFile(path,"w",zipfile.ZIP_DEFLATED) as z:
-        z.writestr("guard_summary.csv",csv_bytes(su));z.writestr("guard_trades.csv",csv_bytes(tr));z.writestr("guard_results.csv",csv_bytes(rs));z.writestr("binance_features.csv",csv_bytes(ft));z.writestr("report.txt","\n".join(lines).encode())
-    return path,su
-async def tg_file(path,caption):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:return True
-    form=aiohttp.FormData();form.add_field("chat_id",TELEGRAM_CHAT_ID);form.add_field("caption",caption[:1024]);form.add_field("document",path.read_bytes(),filename=path.name,content_type="application/zip")
-    async with session.post(f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument",data=form,timeout=aiohttp.ClientTimeout(total=120)) as r:return r.status==200
-async def report_loop():
-    last=si(state_get("last_report_end","0"))
-    if last<=0:last=int(datetime.now(timezone.utc).replace(minute=0,second=0,microsecond=0).timestamp());state_set("last_report_end",last)
+        realized = sf(
+            c.execute(
+                """SELECT COALESCE(SUM(pnl),0) p
+                   FROM results
+                   WHERE mode='PAPER' AND strategy=?""",
+                (strategy_name,),
+            ).fetchone()["p"]
+        )
+        settled_markets = c.execute(
+            """SELECT COUNT(*) c FROM results
+               WHERE mode='PAPER' AND strategy=?""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        traded_markets = c.execute(
+            """SELECT COUNT(*) c FROM results
+               WHERE mode='PAPER' AND strategy=? AND trades>0""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        wins = c.execute(
+            """SELECT COUNT(*) c FROM results
+               WHERE mode='PAPER' AND strategy=? AND trades>0 AND pnl>0""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        losses = c.execute(
+            """SELECT COUNT(*) c FROM results
+               WHERE mode='PAPER' AND strategy=? AND trades>0 AND pnl<0""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        breakeven = c.execute(
+            """SELECT COUNT(*) c FROM results
+               WHERE mode='PAPER' AND strategy=? AND trades>0 AND ABS(pnl)<0.0000001""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        trades = c.execute(
+            """SELECT COUNT(*) c FROM trades
+               WHERE mode='PAPER' AND strategy=?""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        fees = sf(
+            c.execute(
+                """SELECT COALESCE(SUM(fee),0) f FROM trades
+                   WHERE mode='PAPER' AND strategy=?""",
+                (strategy_name,),
+            ).fetchone()["f"]
+        )
+        open_cost = sf(
+            c.execute(
+                """SELECT COALESCE(SUM(t.total_cost),0) x
+                   FROM trades t
+                   LEFT JOIN results r
+                     ON r.condition_id=t.condition_id
+                    AND r.strategy=t.strategy
+                    AND r.mode=t.mode
+                   WHERE t.mode='PAPER'
+                     AND t.strategy=?
+                     AND r.condition_id IS NULL""",
+                (strategy_name,),
+            ).fetchone()["x"]
+        )
+        avg_win = sf(
+            c.execute(
+                """SELECT COALESCE(AVG(pnl),0) x FROM results
+                   WHERE mode='PAPER' AND strategy=? AND trades>0 AND pnl>0""",
+                (strategy_name,),
+            ).fetchone()["x"]
+        )
+        avg_loss = sf(
+            c.execute(
+                """SELECT COALESCE(AVG(pnl),0) x FROM results
+                   WHERE mode='PAPER' AND strategy=? AND trades>0 AND pnl<0""",
+                (strategy_name,),
+            ).fetchone()["x"]
+        )
+        worst_loss = sf(
+            c.execute(
+                """SELECT COALESCE(MIN(pnl),0) x FROM results
+                   WHERE mode='PAPER' AND strategy=? AND trades>0""",
+                (strategy_name,),
+            ).fetchone()["x"]
+        )
+        hedge_trades = c.execute(
+            """SELECT COUNT(*) c FROM trades
+               WHERE mode='PAPER' AND strategy=? AND signal_type='HEDGE'""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        hedge_cost = sf(
+            c.execute(
+                """SELECT COALESCE(SUM(total_cost),0) x FROM trades
+                   WHERE mode='PAPER' AND strategy=? AND signal_type='HEDGE'""",
+                (strategy_name,),
+            ).fetchone()["x"]
+        )
+
+    equity_cost = cash + open_cost
+    return {
+        "strategy": strategy_name,
+        "initial": initial,
+        "cash": cash,
+        "equity_cost": equity_cost,
+        "realized": realized,
+        "total_return": equity_cost - initial,
+        "settled_markets": settled_markets,
+        "traded_markets": traded_markets,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "trades": trades,
+        "fees": fees,
+        "open_cost": open_cost,
+        "avg_win": avg_win,
+        "avg_loss": avg_loss,
+        "worst_loss": worst_loss,
+        "hedge_trades": hedge_trades,
+        "hedge_cost": hedge_cost,
+    }
+
+def all_account_stats():
+    return {s["name"]: account_stats(s["name"]) for s in STRATEGIES}
+
+# ============================================================
+# Telegram control / separate reports
+# ============================================================
+
+def keyboard():
+    return {
+        "keyboard": [
+            [{"text": "▶️ START"}, {"text": "⏹ STOP"}],
+            [{"text": "💰 BALANCE"}, {"text": "📊 STATISTICS"}],
+            [{"text": "📈 POSITIONS"}, {"text": "📜 TRADES"}],
+            [{"text": "🟢 PAPER"}, {"text": "🔴 LIVE"}],
+            [{"text": "🚨 EMERGENCY STOP"}],
+        ],
+        "resize_keyboard": True,
+    }
+
+async def tg_send(text):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        await session.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text[:4096],
+                "reply_markup": keyboard(),
+            },
+            timeout=aiohttp.ClientTimeout(total=15),
+        )
+    except Exception:
+        log.exception("Telegram send failed")
+
+def format_balance_block(strategy, s):
+    return (
+        f"{strategy['short']}\n"
+        f"Initial: ${s['initial']:.2f}\n"
+        f"Cash: ${s['cash']:.2f}\n"
+        f"Open positions: ${s['open_cost']:.2f}\n"
+        f"Equity: ${s['equity_cost']:.2f}\n"
+        f"Realized PnL: ${s['realized']:+.2f}"
+    )
+
+def format_stats_block(strategy, s):
+    denom = s["wins"] + s["losses"]
+    wr = (s["wins"] / denom * 100.0) if denom else 0.0
+    return (
+        f"{strategy['short']}\n"
+        f"Traded markets: {s['traded_markets']}\n"
+        f"W/L: {s['wins']}/{s['losses']} ({wr:.1f}% wins)\n"
+        f"Trades: {s['trades']}\n"
+        f"Fees: ${s['fees']:.2f}\n"
+        f"Avg win/loss: ${s['avg_win']:+.2f} / ${s['avg_loss']:+.2f}\n"
+        f"Worst market: ${s['worst_loss']:+.2f}\n"
+        + (f"Hedges: {s['hedge_trades']} | Hedge cost: ${s['hedge_cost']:.2f}\n" if strategy.get("risk_hedge") else "")
+        + f"Realized PnL: ${s['realized']:+.2f}\n"
+        f"Equity: ${s['equity_cost']:.2f}"
+    )
+
+async def send_balances():
+    stats = all_account_stats()
+    blocks = [
+        format_balance_block(strategy, stats[strategy["name"]])
+        for strategy in STRATEGIES
+    ]
+    total_equity = sum(stats[s["name"]]["equity_cost"] for s in STRATEGIES)
+    total_initial = sum(stats[s["name"]]["initial"] for s in STRATEGIES)
+    await tg_send(
+        "💰 FOUR INDEPENDENT PAPER ACCOUNTS\n\n"
+        + "\n\n".join(blocks)
+        + f"\n\nCombined test equity: ${total_equity:.2f} / ${total_initial:.2f}"
+    )
+
+async def send_statistics():
+    stats = all_account_stats()
+    blocks = [
+        format_stats_block(strategy, stats[strategy["name"]])
+        for strategy in STRATEGIES
+    ]
+    await tg_send("📊 A/B/C/E STATISTICS\n\n" + "\n\n".join(blocks))
+
+async def send_positions():
+    for strategy in STRATEGIES:
+        name = strategy["name"]
+        with db() as c:
+            rows = c.execute(
+                """SELECT t.condition_id,t.outcome,
+                          SUM(t.filled_shares) shares,
+                          SUM(t.total_cost) cost,
+                          MAX(t.trade_ms) last_ms
+                   FROM trades t
+                   LEFT JOIN results r
+                     ON r.condition_id=t.condition_id
+                    AND r.strategy=t.strategy
+                    AND r.mode=t.mode
+                   WHERE t.mode='PAPER'
+                     AND t.strategy=?
+                     AND r.condition_id IS NULL
+                   GROUP BY t.condition_id,t.outcome
+                   ORDER BY last_ms DESC
+                   LIMIT 15""",
+                (name,),
+            ).fetchall()
+
+        if rows:
+            body = "\n".join(
+                f"{r['condition_id'][-6:]} {r['outcome']}: "
+                f"{r['shares']:.2f} sh | ${r['cost']:.2f}"
+                for r in rows
+            )
+        else:
+            body = "None"
+        await tg_send(f"📈 {strategy['short']} OPEN POSITIONS\n{body}")
+
+async def send_trades():
+    # Separate Telegram message for each strategy, as requested.
+    for strategy in STRATEGIES:
+        name = strategy["name"]
+        with db() as c:
+            rows = c.execute(
+                """SELECT * FROM trades
+                   WHERE mode='PAPER' AND strategy=?
+                   ORDER BY id DESC LIMIT 10""",
+                (name,),
+            ).fetchall()
+
+        if rows:
+            lines = []
+            for r in rows:
+                dt = datetime.fromtimestamp(
+                    sf(r["trade_ms"]) / 1000.0, tz=timezone.utc
+                ).strftime("%H:%M:%S")
+                lines.append(
+                    f"{dt} {r['outcome']} {r['signal_type']} "
+                    f"{r['filled_shares']:.2f}sh @ {r['avg_price']:.3f} | "
+                    f"${r['total_cost']:.2f}"
+                )
+            body = "\n".join(lines)
+        else:
+            body = "No trades yet."
+
+        await tg_send(f"📜 {strategy['short']} LAST TRADES\n{body}")
+
+async def handle_tg(text):
+    t = text.strip().upper()
+
+    if t in {"/START", "▶️ START", "START"}:
+        state_set("trading_enabled", "1")
+        await tg_send(
+            "▶️ A/B/C/E trading STARTED\n"
+            "PAPER only | 4 independent accounts | CONF65 | E hedge ON"
+        )
+
+    elif t in {"⏹ STOP", "STOP", "/STOP"}:
+        state_set("trading_enabled", "0")
+        await tg_send(
+            "⏹ New entries stopped for ALL 4 strategies.\n"
+            "Existing PAPER positions remain until resolution."
+        )
+
+    elif t in {"🚨 EMERGENCY STOP", "EMERGENCY STOP"}:
+        state_set("trading_enabled", "0")
+        await tg_send("🚨 EMERGENCY STOP active. No new PAPER orders.")
+
+    elif t in {"🟢 PAPER", "PAPER"}:
+        await tg_send("🟢 Mode = PAPER\nAll four accounts are virtual and independent.")
+
+    elif t in {"🔴 LIVE", "LIVE"}:
+        await tg_send(
+            "🔒 LIVE is disabled in this 4-way A/B/C/E build.\n"
+            "The four independent $500 accounts are for PAPER comparison only."
+        )
+
+    elif t in {"💰 BALANCE", "BALANCE", "/BALANCE"}:
+        await send_balances()
+
+    elif t in {"📊 STATISTICS", "STATISTICS", "/STATS"}:
+        await send_statistics()
+
+    elif t in {"📈 POSITIONS", "POSITIONS"}:
+        await send_positions()
+
+    elif t in {"📜 TRADES", "TRADES"}:
+        await send_trades()
+
+    else:
+        await tg_send(
+            "M03 FOUR-WAY + Binance CONF65 + E HEDGE\n"
+            "A: M03_V3_NOSW90\n"
+            "B: M03_V2_LOCK\n"
+            "C: M03_V5_DYNAMIC\n"
+            "E: M03_V5_DYNAMIC_HEDGE (-$10 floor target after 20sh)\n"
+            "Each has its own $500 PAPER balance."
+        )
+
+async def telegram_loop():
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        log.warning("Telegram not configured")
+        return
+
+    offset = 0
+    await tg_send(
+        f"🤖 {VERSION} online\n"
+        f"Trading: {'ON' if trading_enabled() else 'OFF'}\n"
+        f"CONF >= {CONF_MIN:.1f}\n"
+        "A/B/C/E each starts with an independent PAPER balance."
+    )
+
     while True:
         try:
-            elig=((now_ts()-REPORT_DELAY_SECONDS)//3600)*3600
-            while last<elig:
-                path,su=make_report(last,last+3600);best=su[0] if su else None;ok=await tg_file(path,f"🧪 Guard V5\n{utc_iso(last)} → {utc_iso(last+3600)}\nBest: {best['variant']} + {best['mode']} {best['pnl']:+.2f}" if best else "Guard V5")
-                if not ok:break
-                last+=3600;state_set("last_report_end",last)
-        except Exception:log.exception("report")
-        await asyncio.sleep(REPORT_CHECK_INTERVAL)
+            async with session.get(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
+                params={"timeout": 25, "offset": offset},
+                timeout=aiohttp.ClientTimeout(total=35),
+            ) as r:
+                d = await r.json()
 
-async def health(req):
-    return web.json_response(dict(ok=True,version=VERSION,markets=len(markets),assets=len(subscribed_assets),books=len(books),binance_ticks=len(binance_tick_prices),binance_trade_age_ms=(now_ms()-binance_last_trade_ms if binance_last_trade_ms else None),shadow_states=len(shadow_buys),time_utc=utc_iso()))
+            for u in d.get("result", []):
+                offset = max(offset, si(u.get("update_id")) + 1)
+                msg = u.get("message") or {}
+                chat = str((msg.get("chat") or {}).get("id", ""))
+                if chat != str(TELEGRAM_CHAT_ID):
+                    continue
+                text = msg.get("text")
+                if text:
+                    await handle_tg(text)
+
+        except Exception as e:
+            log.warning("Telegram polling: %s", e)
+            await asyncio.sleep(2)
+
+# ============================================================
+# Health
+# ============================================================
+
+async def health(request):
+    stats = all_account_stats()
+    return web.json_response({
+        "ok": True,
+        "version": VERSION,
+        "strategy": "M03 V3 NOSW90 / V2 LOCK / V5 DYNAMIC / V5 DYNAMIC HEDGE + Binance CONF65",
+        "mode": "PAPER",
+        "trading_enabled": trading_enabled(),
+        "live_enabled": False,
+        "paper": stats,
+        "markets_tracked": len(markets),
+        "books": len(books),
+        "binance_trade_age_ms": (
+            max(0, now_ms() - binance_last_trade_ms)
+            if binance_last_trade_ms else None
+        ),
+        "binance_ticks": len(binance_tick_prices),
+        "binance_trades": len(binance_trades),
+        "binance_depth_age_ms": (
+            max(0, now_ms() - binance_last_depth_ms)
+            if binance_last_depth_ms else None
+        ),
+        "binance_regime": _regime_features(REGIME_WINDOW_SEC).get("regime"),
+        "base_states": len(strategy_state),
+        "shadow_states": len(shadow_accepted_sides),
+        "time_utc": utc_iso(),
+    })
+
 async def web_server():
-    app=web.Application();app.router.add_get("/",health);app.router.add_get("/health",health);r=web.AppRunner(app);await r.setup();await web.TCPSite(r,"0.0.0.0",PORT).start();log.info("Health :%d",PORT)
+    app = web.Application()
+    app.router.add_get("/", health)
+    app.router.add_get("/health", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log.info("Health server :%d", PORT)
 
 async def main():
     global session
-    init_db();session=aiohttp.ClientSession(headers={"User-Agent":VERSION,"Accept":"application/json"})
-    tasks=[asyncio.create_task(x()) for x in (web_server,discovery_loop,poly_ws_loop,binance_loop,strategy_loop,resolution_loop,report_loop)]
-    log.info("%s started | modes=%s",VERSION,MODES)
-    try:await asyncio.gather(*tasks)
+    init_db()
+    session = aiohttp.ClientSession(
+        headers={
+            "User-Agent": "M03FourWayCONF65Hedge/4.0",
+            "Accept": "application/json",
+        }
+    )
+
+    tasks = [
+        asyncio.create_task(x())
+        for x in (
+            web_server,
+            discovery_loop,
+            poly_ws_loop,
+            binance_ws_loop,
+            binance_watchdog_loop,
+            strategy_loop,
+            resolution_loop,
+            telegram_loop,
+            cleanup_loop,
+        )
+    ]
+
+    balances = ", ".join(
+        f"{s['name']}=${paper_cash(s['name']):.2f}"
+        for s in STRATEGIES
+    )
+    log.info(
+        "%s started | PAPER ONLY | CONF>=%.1f | lot=%.1f | %s",
+        VERSION, CONF_MIN, ORDER_SIZE, balances,
+    )
+
+    try:
+        await asyncio.gather(*tasks)
     finally:
-        for t in tasks:t.cancel()
+        for t in tasks:
+            t.cancel()
         await session.close()
-if __name__=="__main__":
-    try:asyncio.run(main())
-    except KeyboardInterrupt:pass
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
