@@ -1,116 +1,185 @@
-# M03 Four-Way CONF65 PAPER Bot v4.0 — V5 Dynamic Hedge
+# M03 Five-Way CONF65 PAPER Bot v5.0 — E Loss-Floor + F Pair Hedge
 
-One process compares four independent PAPER strategies on the same BTC 5-minute Polymarket order-book snapshots and the same Binance CONF65 feature snapshot.
+Один процесс одновременно сравнивает пять независимых PAPER-стратегий на одних и тех же BTC 5-minute Polymarket стаканах и одном Binance CONF65 snapshot.
 
-## Strategies
+## Стратегии
 
 ### A — M03_V3_NOSW90 + CONF65
-- entry move: 0.03
-- pyramid step: 0.08
-- lookback: 2
-- no side switching
-- max 5 buys on a side
-- all new buys stop after second 90
+Без изменений.
 
 ### B — M03_V2_LOCK + CONF65
-- entry move: 0.03
-- pyramid step: 0.08
-- lookback: 2
-- no side switching
-- max 6 buys
-- first-entry price band: 0.55–0.75
-- momentum cap: 0.30
+Без изменений.
 
 ### C — M03_V5_DYNAMIC + CONF65
-- entry move: 0.03
-- pyramid step: 0.08
-- lookback: 2
-- switch move: 0.03
-- max 5 buys per side
-- original V5 dynamic switch rules preserved
+Чистый V5 Dynamic — контрольная версия.
 
 ### E — M03_V5_DYNAMIC_HEDGE + CONF65
-E has the same normal V5 base rules and CONF65 filtering as C. Its only extra component is a separate risk-management hedge layer.
+Старая версия защиты:
+- включается после 20 фактически купленных shares основной стороны;
+- пытается удержать проигрыш рынка около `-$10`;
+- старается сохранить минимум `+$2`, если исходная сторона победит.
 
-Default hedge rules:
-- first actual non-HEDGE PAPER fill defines the protected/primary side;
-- hedge becomes eligible once the primary side reaches 20 actual shares;
-- existing opposite-side V5 SWITCH/PYRAMID shares already count as protection;
-- the bot buys only the missing opposite-side shares needed to target `PnL >= -$10` if the primary side loses;
-- hedge sizing walks the captured opposite-side order-book asks and includes the same taker-fee formula used by the simulator;
-- hedge spending is capped so that the projected PnL if the primary side wins stays at least `+$2`;
-- HEDGE orders do not require Binance CONF65 because they are risk management, not a new directional signal;
-- HEDGE orders do not modify V5 `buys`, `last_buy`, `started_sides`, or shadow acceptance state;
-- if a hedge was partial because of book depth or the upside cap, E can top it up on a later decision tick when possible.
+### F — M03_V5_DYNAMIC_PAIR_HEDGE + CONF65
+Новая версия. Обычная направленная логика F полностью совпадает с C / V5 Dynamic.
 
-Environment controls:
+После КАЖДОЙ фактической обычной покупки F создаётся отдельная 1:1 hedge-цель на противоположную сторону.
+
+Пример:
 
 ```text
-HEDGE_START_SHARES=20
-HEDGE_MAX_LOSS=10
-HEDGE_MIN_UPSIDE=2
-HEDGE_MIN_ORDER_SHARES=0.05
+BUY 10 Up @ 0.60
+=> создаётся цель BUY 10 Down LIMIT
 ```
 
-`HEDGE_MAX_LOSS=10` means the target floor is `-$10`, not a guaranteed stop. If the opposite outcome is too expensive, liquidity is insufficient, or preserving `HEDGE_MIN_UPSIDE` prevents enough hedge spending, E buys only the protection that fits those constraints.
+Цена лимита рассчитывается максимально высокой, при которой полностью собранная пара оставляет минимум:
 
-## Fair A/B/C/E timing
+```text
+PAIR_LOCKED_PROFIT=0.25
+```
 
-All four variants run in one process with:
-- one ~3-second scheduler;
-- one captured Polymarket book snapshot per market/tick;
-- one shared Binance core-feature snapshot per market/tick;
-- independent base states;
-- independent CONF65 shadow states;
-- independent PAPER balances.
+В расчёт входит фактическая стоимость исходной покупки вместе с taker fee. Для resting hedge limit PAPER-модель использует maker fee = 0.
 
-E's normal V5 decision is evaluated on the same tick as C. Only after the normal strategy evaluations does E's independent hedge risk-manager run against that same captured book.
+Для равных объёмов `q`:
 
-## PAPER balances and database
+```text
+hedge_budget = q - base_total_cost - PAIR_LOCKED_PROFIT
+max_maker_price = hedge_budget / q
+```
 
-Each strategy starts from its own `$500` by default. Balances are not pooled.
+Цена округляется ВНИЗ по текущему `tick_size`.
 
-This version intentionally uses a new database so A/B/C/E begin a fresh fair comparison together:
+Пример: 10 Up @ 0.60 обходятся примерно в `$6.168` с taker fee. При цели `+$0.25`:
 
-`/var/data/m03_fourway_conf65_hedge.db`
+```text
+max maker Down price = (10 - 6.168 - 0.25) / 10
+                     = 0.3582
+```
 
-The previous three-way database is not overwritten.
+При `tick_size=0.01` PAPER limit:
+
+```text
+10 Down LIMIT @ 0.35
+```
+
+Если он полностью исполнится как maker:
+
+```text
+10 - 6.168 - 3.50 = +0.332
+```
+
+То есть любая сторона settlement даёт около `+$0.33` для этой пары.
+
+## Если цена уже дошла до hedge-уровня
+
+Если post-only limit сразу пересёк бы текущий ask, F сначала пробует полный FOK-style PAPER hedge:
+
+1. нужен весь объём сразу;
+2. используется текущая глубина ask;
+3. taker fee учитывается полностью;
+4. сделка разрешается только если сохраняется `PAIR_LOCKED_PROFIT`.
+
+Если полный FOK не проходит, создаётся resting PAPER limit ниже текущего ask.
+
+F не догоняет противоположную сторону дороже цены, совместимой с locked-profit целью.
+
+## Быстрый resting-limit checker
+
+Pending hedge limits проверяются отдельным циклом:
+
+```text
+PAIR_HEDGE_CHECK_INTERVAL=0.20
+```
+
+Он использует уже получаемый WebSocket-стакан и не ждёт 3-секундного основного V5 decision loop.
+
+По умолчанию:
+
+```text
+PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE=1
+```
+
+PAPER-limit получает fill только при наблюдаемой crossing liquidity. Если видно только часть объёма, hedge исполняется частично и остаток продолжает стоять.
+
+Одна и та же отображаемая ask-liquidity не используется сразу несколькими PAPER-ордерами в одном проходе.
+
+Важно: это симуляция. Публичный стакан не показывает реальную queue position будущего maker-ордера, поэтому live fill-rate может отличаться. Модель специально не считает ордер полностью исполненным только от одного касания цены.
+
+## Min order size и tick size
+
+Код не использует фиксированный минимум в долларах.
+
+Из CLOB book сохраняются:
+- `min_order_size`;
+- `tick_size`.
+
+F создаёт pair hedge только если фактический размер покупки не меньше текущего `min_order_size`.
+
+## Комиссии
+
+- обычные V5 PAPER-покупки: taker fee;
+- E HEDGE: taker fee;
+- F `PAIR_HEDGE_LIMIT`: maker fee = 0;
+- F `PAIR_HEDGE_FOK`: taker fee.
+
+Maker rebates намеренно не добавляются — это консервативнее.
+
+## Резервирование cash
+
+Pending F limits резервируют виртуальный cash. F не может продолжать открывать V5-позиции так, будто эти деньги всё ещё свободны.
+
+После partial fill резерв уменьшается. После полного fill исчезает.
+
+## Новая база
+
+```text
+/var/data/m03_fiveway_conf65_pairhedge.db
+```
+
+Все A/B/C/E/F начинают новый тест одновременно с одинакового стартового баланса. Старая v4 база не перезаписывается.
 
 ## Telegram
 
-- `BALANCE` shows four independent accounts.
-- `STATISTICS` shows W/L, fees, average win/loss, worst market, realized PnL and equity.
-- E statistics additionally show hedge count and total hedge cost.
-- `POSITIONS` shows each strategy's open outcome positions.
-- `TRADES` shows the last 10 trades per strategy; E protection orders are labeled `HEDGE`.
-- Settlement reports show each strategy independently.
-- `START` / `STOP` control all four accounts together.
+`BALANCE`
+- 5 независимых счетов;
+- у F дополнительно показывает cash, зарезервированный под pending pair limits.
 
-## LIVE
+`STATISTICS`
+- W/L, fees, avg win/loss, worst market, PnL;
+- E: количество и стоимость старых HEDGE;
+- F: pair orders, filled, pending, LIMIT/FOK fills и сумму locked PnL полностью закрытых пар.
 
-This build remains PAPER-only. LIVE is intentionally disabled while the four virtual strategies are being compared.
+`POSITIONS`
+- открытые позиции;
+- у F дополнительно список pending pair limits.
 
-## Render deployment
+`TRADES`
+- F hedge fills:
+  - `PAIR_HEDGE_LIMIT`
+  - `PAIR_HEDGE_FOK`
 
-1. Replace the repository files with this package.
+## Render
+
+1. Заменить файлы репозитория содержимым архива.
 2. Build command: `pip install -r requirements.txt`
 3. Start command: `python main.py`
 4. Persistent disk: `/var/data`
-5. Keep your existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` environment values.
-6. Add the four hedge environment values above, or leave them unset to use the defaults.
-7. Keep `CONF_MIN=65`.
-8. Deploy and press `START` in Telegram.
+5. Оставить текущие `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, `CONF_MIN=65`.
+6. Новые F-параметры можно не добавлять — defaults встроены.
 
-Startup log should contain:
+## Проверка
 
-`4.0-paper-abce-m03-conf65-v5-hedge started | PAPER ONLY | CONF>=65.0`
+```text
+python test_fiveway.py
+```
 
-## Verification
+Ожидаемая последняя строка:
 
-Run:
+```text
+five-way CONF65 + E loss-floor + F pair-hedge regression: OK
+```
 
-`python test_fourway.py`
+## LIVE
 
-Expected final line:
+Версия намеренно остаётся PAPER-only. Она не отправляет реальные hedge orders в Polymarket.
 
-`four-way CONF65 + V5 hedge regression: OK`
+Сначала стоит собрать статистику C vs E vs F: сколько pair limits реально исполняется, средний locked PnL, комиссии, worst market и итоговый PnL.

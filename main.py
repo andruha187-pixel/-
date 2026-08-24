@@ -12,20 +12,21 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# FOUR-WAY A/B/C/E PAPER BOT — BINANCE CONF65 + V5 HEDGE
+# FIVE-WAY A/B/C/E/F PAPER BOT — BINANCE CONF65 + TWO V5 HEDGE MODELS
 # Polymarket BTC 5m
 #
 # A: M03_V3_NOSW90 + CONF65
 # B: M03_V2_LOCK    + CONF65
 # C: M03_V5_DYNAMIC + CONF65
-# E: M03_V5_DYNAMIC_HEDGE + CONF65 + dynamic opposite-side hedge
+# E: M03_V5_DYNAMIC_HEDGE + CONF65 + dynamic loss-floor hedge
+# F: M03_V5_DYNAMIC_PAIR_HEDGE + CONF65 + per-fill resting pair hedge
 #
 # Every strategy has an independent $500 PAPER account.
-# All four consume the same captured Polymarket book snapshot and the same
+# All five consume the same captured Polymarket book snapshot and the same
 # Binance feature snapshot on each decision tick.
 # ============================================================
 
-VERSION = "4.0-paper-abce-m03-conf65-v5-hedge"
+VERSION = "5.0-paper-abcef-m03-conf65-pair-hedge"
 HOST = "https://clob.polymarket.com"
 GAMMA = "https://gamma-api.polymarket.com"
 POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
@@ -42,8 +43,8 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# New DB: starts a clean, fair A/B/C/E comparison from the same moment.
-DB_PATH = DATA_DIR / "m03_fourway_conf65_hedge.db"
+# New DB: starts a clean, fair A/B/C/E/F comparison from the same moment.
+DB_PATH = DATA_DIR / "m03_fiveway_conf65_pairhedge.db"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -66,6 +67,23 @@ HEDGE_START_SHARES = float(os.getenv("HEDGE_START_SHARES", "20"))
 HEDGE_MAX_LOSS = float(os.getenv("HEDGE_MAX_LOSS", "10"))
 HEDGE_MIN_UPSIDE = float(os.getenv("HEDGE_MIN_UPSIDE", "2"))
 HEDGE_MIN_ORDER_SHARES = float(os.getenv("HEDGE_MIN_ORDER_SHARES", "0.05"))
+
+
+# F / V5 DYNAMIC PAIR HEDGE.
+# Every actual V5 PAPER fill creates an equal-share opposite-side hedge target.
+# The resting maker limit is calculated so the completed pair locks at least
+# PAIR_LOCKED_PROFIT after the original trade's taker fee. Makers pay zero fee.
+# If the target is already marketable when created, F first tries a full-size
+# taker FOK-style paper fill, but only when the full all-in cost still preserves
+# the same locked-profit target. Otherwise a post-only-style resting limit is
+# simulated below the current ask.
+PAIR_LOCKED_PROFIT = float(os.getenv("PAIR_LOCKED_PROFIT", "0.25"))
+PAIR_HEDGE_CHECK_INTERVAL = float(os.getenv("PAIR_HEDGE_CHECK_INTERVAL", "0.20"))
+PAIR_DEFAULT_TICK_SIZE = float(os.getenv("PAIR_DEFAULT_TICK_SIZE", "0.01"))
+PAIR_DEFAULT_MIN_ORDER_SIZE = float(os.getenv("PAIR_DEFAULT_MIN_ORDER_SIZE", "1"))
+PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE = os.getenv(
+    "PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE", "1"
+).strip().lower() not in {"0", "false", "no", "off"}
 
 # Exact candidate definitions from the old research simulator.
 STRATEGIES = [
@@ -116,6 +134,18 @@ STRATEGIES = [
         "dynamic_switch_v5": True,
         "risk_hedge": True,
     },
+    {
+        "name": "M03_V5_DYNAMIC_PAIR_HEDGE",
+        "short": "F / V5 PAIR HEDGE",
+        "entry_move": 0.03,
+        "pyramid_step": 0.08,
+        "lookback": 2,
+        "switch_move": 0.03,
+        "max_buys_side": 5,
+        "allow_switch": True,
+        "dynamic_switch_v5": True,
+        "pair_hedge": True,
+    },
 ]
 STRATEGY_BY_NAME = {x["name"]: x for x in STRATEGIES}
 
@@ -139,7 +169,7 @@ W_TREND = float(os.getenv("W_TREND", "14"))
 W_DISTANCE = float(os.getenv("W_DISTANCE", "18"))
 W_POLY_PRICE = float(os.getenv("W_POLY_PRICE", "6"))
 
-# This build is intentionally PAPER-only. Four independent virtual accounts
+# This build is intentionally PAPER-only. Five independent virtual accounts
 # cannot safely map to one real-money wallet without a separate execution design.
 ENABLE_LIVE = False
 
@@ -147,7 +177,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("m03-fourway-conf65-hedge")
+log = logging.getLogger("m03-fiveway-conf65-pairhedge")
 
 session: Optional[aiohttp.ClientSession] = None
 
@@ -166,7 +196,7 @@ shadow_accepted_sides = defaultdict(set)
 
 market_binance_start_price = {}
 
-# Binance futures state, shared by all four.
+# Binance futures state, shared by all five.
 binance_trades = deque(maxlen=50000)       # ts, price, quote, sign
 binance_tick_prices = deque(maxlen=30000)  # ts, price
 binance_second_prices = deque(maxlen=600)  # sec, price
@@ -332,6 +362,33 @@ def init_db():
           PRIMARY KEY(condition_id, strategy, mode)
         );
 
+        CREATE TABLE IF NOT EXISTS pair_hedges(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          created_ms INTEGER,
+          updated_ms INTEGER,
+          condition_id TEXT,
+          strategy TEXT,
+          base_trade_id INTEGER,
+          base_asset TEXT,
+          base_outcome TEXT,
+          base_signal_type TEXT,
+          base_shares REAL,
+          base_total_cost REAL,
+          hedge_asset TEXT,
+          hedge_outcome TEXT,
+          requested_shares REAL,
+          filled_shares REAL DEFAULT 0,
+          limit_price REAL,
+          target_profit REAL,
+          min_order_size REAL,
+          tick_size REAL,
+          status TEXT,
+          fill_mode TEXT,
+          hedge_total_cost REAL DEFAULT 0,
+          locked_pnl REAL DEFAULT 0,
+          last_note TEXT
+        );
+
         CREATE INDEX IF NOT EXISTS idx_signals_ms ON signals(signal_ms);
         CREATE INDEX IF NOT EXISTS idx_signals_strategy ON signals(strategy, signal_ms);
         CREATE INDEX IF NOT EXISTS idx_baseline_trades_ms ON baseline_trades(trade_ms);
@@ -339,6 +396,10 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trades_ms ON trades(trade_ms);
         CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy, trade_ms);
         CREATE INDEX IF NOT EXISTS idx_results_strategy ON results(strategy, settled_ms);
+        CREATE INDEX IF NOT EXISTS idx_pair_hedges_status ON pair_hedges(status, condition_id);
+        CREATE INDEX IF NOT EXISTS idx_pair_hedges_strategy ON pair_hedges(strategy, created_ms);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_pair_hedges_base_trade
+          ON pair_hedges(strategy, base_trade_id);
         """)
 
         for strategy in STRATEGIES:
@@ -494,8 +555,21 @@ def level_map(rows):
     return out
 
 def apply_book(asset,payload,source="ws"):
-    books[asset]={"bids":level_map(payload.get("bids")),"asks":level_map(payload.get("asks")),
-                  "received_ms":now_ms(),"source":source}
+    prev = books.get(asset) or {}
+    books[asset] = {
+        "bids": level_map(payload.get("bids")),
+        "asks": level_map(payload.get("asks")),
+        "received_ms": now_ms(),
+        "source": source,
+        "min_order_size": sf(
+            payload.get("min_order_size") or payload.get("minOrderSize"),
+            sf(prev.get("min_order_size"), PAIR_DEFAULT_MIN_ORDER_SIZE),
+        ),
+        "tick_size": sf(
+            payload.get("tick_size") or payload.get("tickSize"),
+            sf(prev.get("tick_size"), PAIR_DEFAULT_TICK_SIZE),
+        ),
+    }
 
 def apply_price_change(payload):
     recv=now_ms()
@@ -503,13 +577,45 @@ def apply_price_change(payload):
         if not isinstance(ch,dict): continue
         a=str(ch.get("asset_id") or ch.get("token_id") or ch.get("tokenId") or "")
         if not a: continue
-        b=books.setdefault(a,{"bids":{},"asks":{},"received_ms":recv,"source":"delta"})
+        b=books.setdefault(
+            a,
+            {
+                "bids": {},
+                "asks": {},
+                "received_ms": recv,
+                "source": "delta",
+                "min_order_size": PAIR_DEFAULT_MIN_ORDER_SIZE,
+                "tick_size": PAIR_DEFAULT_TICK_SIZE,
+            },
+        )
         p=sf(ch.get("price"),math.nan); q=sf(ch.get("size"),0); side=str(ch.get("side","")).upper()
         if math.isnan(p): continue
         target=b["bids"] if side=="BUY" else b["asks"]
         if q<=0: target.pop(p,None)
         else: target[p]=q
         b["received_ms"]=recv
+
+def apply_tick_size_change(payload):
+    a = str(payload.get("asset_id") or payload.get("token_id") or payload.get("tokenId") or "")
+    if not a:
+        return
+    b = books.setdefault(
+        a,
+        {
+            "bids": {},
+            "asks": {},
+            "received_ms": now_ms(),
+            "source": "tick",
+            "min_order_size": PAIR_DEFAULT_MIN_ORDER_SIZE,
+            "tick_size": PAIR_DEFAULT_TICK_SIZE,
+        },
+    )
+    new_tick = sf(
+        payload.get("new_tick_size") or payload.get("tick_size") or payload.get("tickSize"),
+        sf(b.get("tick_size"), PAIR_DEFAULT_TICK_SIZE),
+    )
+    if new_tick > 0:
+        b["tick_size"] = new_tick
 
 def best_ask(a):
     b=books.get(a)
@@ -522,7 +628,13 @@ async def refresh_book(a):
 
 async def ensure_book(a):
     b=books.get(a)
-    if b and b["asks"] and now_ms()-b["received_ms"]<=MAX_BOOK_AGE_MS:
+    fresh = bool(b and b.get("asks") and now_ms()-b["received_ms"]<=MAX_BOOK_AGE_MS)
+    has_constraints = bool(
+        b
+        and sf(b.get("min_order_size"), 0) > 0
+        and sf(b.get("tick_size"), 0) > 0
+    )
+    if fresh and has_constraints:
         return now_ms()-b["received_ms"]
     await refresh_book(a); b=books.get(a)
     return now_ms()-b["received_ms"] if b else None
@@ -581,6 +693,7 @@ async def poly_ws_loop():
                                 a=str(p.get("asset_id") or p.get("token_id") or "")
                                 if a: apply_book(a,p)
                             elif et=="price_change": apply_price_change(p)
+                            elif et in {"tick_size_change", "tickSizeChange"}: apply_tick_size_change(p)
                             elif et=="market_resolved": await settle_from_ws(p)
                 finally: sender.cancel(); ping.cancel()
         except Exception as e:
@@ -832,7 +945,7 @@ async def cleanup_loop():
         await asyncio.sleep(60)
 
 # ============================================================
-# Four-strategy exact-shadow engine
+# Five-strategy exact-shadow engine
 # ============================================================
 
 def get_st(cid, strategy_name):
@@ -861,6 +974,8 @@ def snapshot_book(asset, captured_ms):
         "asks": dict(b.get("asks") or {}),
         "received_ms": int(b.get("received_ms") or captured_ms),
         "captured_ms": captured_ms,
+        "min_order_size": sf(b.get("min_order_size"), PAIR_DEFAULT_MIN_ORDER_SIZE),
+        "tick_size": sf(b.get("tick_size"), PAIR_DEFAULT_TICK_SIZE),
     }
 
 def best_ask_snapshot(book_snapshot):
@@ -1028,7 +1143,7 @@ def paper_has_asset_position(strategy_name, cid, asset):
             """SELECT COALESCE(SUM(filled_shares),0) AS sh
                FROM trades
                WHERE mode='PAPER' AND strategy=? AND condition_id=? AND asset=?
-                 AND signal_type<>'HEDGE'""",
+                 AND signal_type NOT LIKE '%HEDGE%'""",
             (strategy_name, cid, asset),
         ).fetchone()
     return sf(row["sh"] if row else 0) > 1e-8
@@ -1058,7 +1173,7 @@ def paper_market_exposure(strategy_name, cid):
         asset = str(r["asset"])
         shares[asset] += sf(r["filled_shares"])
         outcomes[asset] = str(r["outcome"])
-        if primary_asset is None and str(r["signal_type"]).upper() != "HEDGE":
+        if primary_asset is None and "HEDGE" not in str(r["signal_type"]).upper():
             primary_asset = asset
             primary_outcome = str(r["outcome"])
 
@@ -1249,21 +1364,473 @@ def maybe_execute_hedge(market, strategy, tick_books):
     }
 
 
+def _floor_to_tick(price, tick):
+    tick = sf(tick, PAIR_DEFAULT_TICK_SIZE)
+    if tick <= 0:
+        tick = PAIR_DEFAULT_TICK_SIZE
+    if price <= 0:
+        return 0.0
+    steps = math.floor((float(price) + 1e-12) / tick)
+    value = steps * tick
+    # Avoid floating noise such as 0.33999999999999997 in logs/DB.
+    return float(f"{value:.8f}")
+
+
+def _pair_order_reserved_cash(strategy_name, exclude_order_id=None):
+    sql = """SELECT COALESCE(SUM((requested_shares-filled_shares)*limit_price),0) x
+             FROM pair_hedges
+             WHERE strategy=? AND status IN ('PENDING','PARTIAL')"""
+    params = [strategy_name]
+    if exclude_order_id is not None:
+        sql += " AND id<>?"
+        params.append(int(exclude_order_id))
+    with db() as c:
+        row = c.execute(sql, tuple(params)).fetchone()
+    return sf(row["x"] if row else 0.0)
+
+
+def _pair_visible_fok_plan(book_snapshot, wanted, max_total):
+    """Paper proxy for a full-size taker FOK hedge.
+
+    It walks current asks, includes the crypto taker fee, and succeeds only if
+    all requested shares fit inside max_total. Otherwise it returns no fill.
+    """
+    if not book_snapshot or not book_snapshot.get("asks") or wanted <= 1e-9:
+        return [], 0.0
+    rem = float(wanted)
+    fills = []
+    total = 0.0
+    for p in sorted(book_snapshot["asks"]):
+        q = sf(book_snapshot["asks"][p])
+        p = sf(p)
+        if p <= 0 or p >= 1 or q <= 1e-9:
+            continue
+        take = min(q, rem)
+        if take <= 1e-9:
+            continue
+        level_total = p * take + fee_usdc(take, p)
+        if total + level_total > max_total + 1e-9:
+            # A FOK hedge must fit the whole requested size and the profit budget.
+            return [], 0.0
+        fills.append((p, take))
+        total += level_total
+        rem -= take
+        if rem <= 1e-9:
+            break
+    if rem > 1e-8:
+        return [], 0.0
+    return fills, total
+
+
+def _insert_pair_hedge_trade(
+    strategy_name, cid, asset, outcome, signal_type, requested,
+    fills, maker, source_note="", reserved_after=0.0
+):
+    filled = sum(sf(q) for _p, q in fills)
+    if filled <= 1e-9:
+        return None
+    cash = paper_cash(strategy_name)
+    gross = sum(sf(p) * sf(q) for p, q in fills)
+    fee = 0.0 if maker else sum(fee_usdc(sf(q), sf(p)) for p, q in fills)
+    total = gross + fee
+    # Keep enough cash for other already-resting pair limits after this fill.
+    if cash - total - max(0.0, sf(reserved_after)) < MIN_FREE_CASH - 1e-8:
+        return None
+    after = cash - total
+    avg = gross / filled
+    with db() as c:
+        cur = c.execute(
+            """INSERT INTO trades(
+              trade_ms,mode,strategy,condition_id,asset,outcome,signal_type,
+              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
+              cash_before,cash_after,book_age_ms,fills_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                now_ms(), "PAPER", strategy_name, cid, asset, outcome, signal_type,
+                requested, filled, avg, gross, fee, total,
+                cash, after, 0,
+                jd([
+                    {"price": sf(p), "shares": sf(q), "maker": bool(maker)}
+                    for p, q in fills
+                ]),
+            ),
+        )
+        trade_id = cur.lastrowid
+        c.execute(
+            "INSERT INTO state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (cash_key(strategy_name), str(after)),
+        )
+        c.commit()
+    log.info(
+        "%-18s %-16s | %s %.2fsh @ %.4f | fee=%.4f | cash %.2f -> %.2f | %s",
+        signal_type, strategy_name, outcome, filled, avg, fee, cash, after, source_note,
+    )
+    return {
+        "trade_id": trade_id,
+        "filled": filled,
+        "avg": avg,
+        "gross": gross,
+        "fee": fee,
+        "total": total,
+        "cash_after": after,
+    }
+
+
+def create_pair_hedge_order(market, strategy, base_trade, tick_books):
+    """Create F's one-to-one opposite-side hedge target after every actual V5 fill.
+
+    A completed equal-share pair has the same settlement payout regardless of
+    winner. Therefore the maximum maker hedge cost is:
+        base_shares - base_total_cost - PAIR_LOCKED_PROFIT
+
+    The resting limit uses zero maker fee. If the target is already marketable,
+    the function first tries a full-size FOK-style taker hedge using the same
+    locked-profit budget; if that is too expensive or too shallow, it places a
+    post-only-style paper limit below the current ask instead.
+    """
+    if not strategy.get("pair_hedge") or not base_trade:
+        return None
+
+    name = strategy["name"]
+    cid = market["condition_id"]
+    base_asset = str(base_trade["asset"])
+    base_outcome = str(base_trade["outcome"])
+    shares = sf(base_trade["filled"])
+    base_total = sf(base_trade["total"])
+    if shares <= 1e-9:
+        return None
+
+    if base_asset == str(market["up_asset"]):
+        hedge_asset, hedge_outcome = str(market["down_asset"]), "Down"
+    elif base_asset == str(market["down_asset"]):
+        hedge_asset, hedge_outcome = str(market["up_asset"]), "Up"
+    else:
+        return None
+
+    snap = tick_books["books"].get(hedge_asset)
+    if not snap or not snap.get("asks"):
+        return None
+
+    min_size = max(
+        0.0,
+        sf(snap.get("min_order_size"), PAIR_DEFAULT_MIN_ORDER_SIZE),
+    )
+    tick = max(
+        1e-8,
+        sf(snap.get("tick_size"), PAIR_DEFAULT_TICK_SIZE),
+    )
+
+    # Equal-share pair payout is `shares` whichever outcome wins.
+    hedge_budget = shares - base_total - PAIR_LOCKED_PROFIT
+    if hedge_budget <= 1e-9:
+        note = (
+            f"NO_PAIR_BUDGET base={shares:.2f}sh cost={base_total:.4f} "
+            f"target={PAIR_LOCKED_PROFIT:.2f}"
+        )
+        log.info("PAIR %-16s SKIP | %s", name, note)
+        return None
+
+    max_maker_price = hedge_budget / shares
+    maker_limit = _floor_to_tick(max_maker_price, tick)
+    if maker_limit <= 0 or maker_limit >= 1:
+        return None
+
+    if shares + 1e-9 < min_size:
+        log.info(
+            "PAIR %-16s SKIP MIN_SIZE | %.2fsh < %.2fsh | %s -> %s",
+            name, shares, min_size, base_outcome, hedge_outcome,
+        )
+        with db() as c:
+            c.execute(
+                """INSERT INTO pair_hedges(
+                  created_ms,updated_ms,condition_id,strategy,base_trade_id,
+                  base_asset,base_outcome,base_signal_type,base_shares,base_total_cost,
+                  hedge_asset,hedge_outcome,requested_shares,filled_shares,
+                  limit_price,target_profit,min_order_size,tick_size,status,fill_mode,last_note
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    now_ms(), now_ms(), cid, name, base_trade["trade_id"],
+                    base_asset, base_outcome, base_trade["signal_type"], shares, base_total,
+                    hedge_asset, hedge_outcome, shares, 0.0,
+                    maker_limit, PAIR_LOCKED_PROFIT, min_size, tick,
+                    "SKIPPED_MIN_SIZE", "", "below market min_order_size",
+                ),
+            )
+            c.commit()
+        return None
+
+    # Respect cash already reserved by other resting pair orders.
+    cash = paper_cash(name)
+    other_reserved = _pair_order_reserved_cash(name)
+    if cash - other_reserved - hedge_budget < MIN_FREE_CASH - 1e-8:
+        log.info(
+            "PAIR %-16s SKIP CASH | reserve=%.2f budget=%.2f cash=%.2f",
+            name, other_reserved, hedge_budget, cash,
+        )
+        return None
+
+    best = best_ask_snapshot(snap)
+    created = now_ms()
+
+    # If a post-only limit at maker_limit would immediately cross, first try
+    # a full-size taker FOK under the exact locked-profit budget.
+    if best is not None and best <= maker_limit + 1e-12:
+        fok_fills, fok_total = _pair_visible_fok_plan(snap, shares, hedge_budget)
+        if fok_fills:
+            trade = _insert_pair_hedge_trade(
+                name, cid, hedge_asset, hedge_outcome, "PAIR_HEDGE_FOK",
+                shares, fok_fills, maker=False,
+                source_note=f"base_trade={base_trade['trade_id']} target=+{PAIR_LOCKED_PROFIT:.2f}",
+                reserved_after=other_reserved,
+            )
+            if trade:
+                locked = shares - base_total - trade["total"]
+                with db() as c:
+                    c.execute(
+                        """INSERT INTO pair_hedges(
+                          created_ms,updated_ms,condition_id,strategy,base_trade_id,
+                          base_asset,base_outcome,base_signal_type,base_shares,base_total_cost,
+                          hedge_asset,hedge_outcome,requested_shares,filled_shares,
+                          limit_price,target_profit,min_order_size,tick_size,status,fill_mode,
+                          hedge_total_cost,locked_pnl,last_note
+                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (
+                            created, now_ms(), cid, name, base_trade["trade_id"],
+                            base_asset, base_outcome, base_trade["signal_type"], shares, base_total,
+                            hedge_asset, hedge_outcome, shares, shares,
+                            maker_limit, PAIR_LOCKED_PROFIT, min_size, tick,
+                            "FILLED", "FOK", trade["total"], locked,
+                            f"locked_pnl={locked:+.4f}",
+                        ),
+                    )
+                    c.commit()
+                log.info(
+                    "PAIR LOCKED %-16s | %.2f %s + %.2f %s | FOK | locked=%+.4f",
+                    name, shares, base_outcome, shares, hedge_outcome, locked,
+                )
+                return {"status": "FILLED", "mode": "FOK", "locked_pnl": locked}
+
+        # FOK did not fit. Simulate the highest non-marketable post-only bid.
+        post_only_cap = _floor_to_tick(sf(best) - tick, tick)
+        maker_limit = min(maker_limit, post_only_cap)
+
+    if maker_limit <= 0:
+        return None
+
+    reserved = shares * maker_limit
+    if cash - other_reserved - reserved < MIN_FREE_CASH - 1e-8:
+        return None
+
+    locked_if_filled = shares - base_total - reserved
+    with db() as c:
+        cur = c.execute(
+            """INSERT INTO pair_hedges(
+              created_ms,updated_ms,condition_id,strategy,base_trade_id,
+              base_asset,base_outcome,base_signal_type,base_shares,base_total_cost,
+              hedge_asset,hedge_outcome,requested_shares,filled_shares,
+              limit_price,target_profit,min_order_size,tick_size,status,fill_mode,last_note
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                created, created, cid, name, base_trade["trade_id"],
+                base_asset, base_outcome, base_trade["signal_type"], shares, base_total,
+                hedge_asset, hedge_outcome, shares, 0.0,
+                maker_limit, PAIR_LOCKED_PROFIT, min_size, tick,
+                "PENDING", "LIMIT", f"locked_if_filled={locked_if_filled:+.4f}",
+            ),
+        )
+        order_id = cur.lastrowid
+        c.commit()
+
+    log.info(
+        "PAIR ORDER %-16s | base #%d %.2fsh %s cost=%.4f -> "
+        "%.2fsh %s LIMIT %.4f | locked_if_full=%+.4f",
+        name, base_trade["trade_id"], shares, base_outcome, base_total,
+        shares, hedge_outcome, maker_limit, locked_if_filled,
+    )
+    return {
+        "status": "PENDING",
+        "order_id": order_id,
+        "limit_price": maker_limit,
+        "requested_shares": shares,
+        "locked_if_filled": locked_if_filled,
+    }
+
+
+def _pair_limit_fill(order, available_asks):
+    """Consume a paper proxy of sell liquidity at/below a resting buy limit.
+
+    A real maker fill depends on queue position. This simulator deliberately
+    requires visible crossing size when PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE=1.
+    The fill is recorded at the resting limit price with zero maker fee.
+    """
+    remaining = max(0.0, sf(order["requested_shares"]) - sf(order["filled_shares"]))
+    if remaining <= 1e-9:
+        return 0.0
+
+    limit_price = sf(order["limit_price"])
+    eligible = [
+        p for p in sorted(available_asks)
+        if p <= limit_price + 1e-12 and sf(available_asks.get(p)) > 1e-9
+    ]
+    if not eligible:
+        return 0.0
+
+    if not PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE:
+        return remaining
+
+    fillable = sum(sf(available_asks[p]) for p in eligible)
+    return min(remaining, fillable)
+
+
+def process_pair_hedges_for_market(market):
+    """Fast PAPER fill engine for F's resting hedge limits."""
+    cid = market["condition_id"]
+    strategy_name = "M03_V5_DYNAMIC_PAIR_HEDGE"
+
+    if now_ts() >= int(market["end_ts"]):
+        with db() as c:
+            c.execute(
+                """UPDATE pair_hedges
+                   SET status='EXPIRED',updated_ms=?,last_note='market ended'
+                   WHERE condition_id=? AND strategy=? AND status IN ('PENDING','PARTIAL')""",
+                (now_ms(), cid, strategy_name),
+            )
+            c.commit()
+        return 0
+
+    with db() as c:
+        orders = c.execute(
+            """SELECT * FROM pair_hedges
+               WHERE condition_id=? AND strategy=?
+                 AND status IN ('PENDING','PARTIAL')
+               ORDER BY hedge_asset,limit_price DESC,created_ms,id""",
+            (cid, strategy_name),
+        ).fetchall()
+
+    if not orders:
+        return 0
+
+    # Consume each observed ask level at most once per fast loop so several
+    # pending paper orders cannot all claim the same displayed liquidity.
+    liquidity = {}
+    for asset in {str(r["hedge_asset"]) for r in orders}:
+        b = books.get(asset)
+        if not b or not b.get("asks"):
+            continue
+        if now_ms() - int(b.get("received_ms") or 0) > MAX_BOOK_AGE_MS:
+            continue
+        liquidity[asset] = {sf(p): sf(q) for p, q in b["asks"].items() if sf(q) > 1e-9}
+
+    fills_done = 0
+    for order in orders:
+        asset = str(order["hedge_asset"])
+        available = liquidity.get(asset)
+        if not available:
+            continue
+
+        fill_qty = _pair_limit_fill(order, available)
+        if fill_qty <= 1e-9:
+            continue
+
+        # Consume visible crossing liquidity from best ask upward.
+        left = fill_qty
+        for p in sorted(available):
+            if p > sf(order["limit_price"]) + 1e-12 or left <= 1e-9:
+                break
+            take = min(sf(available[p]), left)
+            available[p] = max(0.0, sf(available[p]) - take)
+            left -= take
+
+        # Resting maker order executes at its own limit price in this paper proxy.
+        limit_price = sf(order["limit_price"])
+        other_reserved = _pair_order_reserved_cash(
+            strategy_name, exclude_order_id=order["id"]
+        )
+        remaining_after = max(
+            0.0,
+            sf(order["requested_shares"]) - sf(order["filled_shares"]) - fill_qty,
+        )
+        reserved_after = other_reserved + remaining_after * limit_price
+        trade = _insert_pair_hedge_trade(
+            strategy_name,
+            cid,
+            asset,
+            str(order["hedge_outcome"]),
+            "PAIR_HEDGE_LIMIT",
+            fill_qty,
+            [(limit_price, fill_qty)],
+            maker=True,
+            source_note=f"pair_order={order['id']} base_trade={order['base_trade_id']}",
+            reserved_after=reserved_after,
+        )
+        if not trade:
+            continue
+
+        new_filled = sf(order["filled_shares"]) + trade["filled"]
+        status = "FILLED" if new_filled >= sf(order["requested_shares"]) - 1e-8 else "PARTIAL"
+        new_hedge_total_cost = sf(order["hedge_total_cost"]) + trade["total"]
+        # If partial, this is the PnL on the paired portion only after allocating
+        # the original base cost pro-rata to the shares actually paired.
+        paired_base_cost = (
+            sf(order["base_total_cost"]) * new_filled / sf(order["base_shares"])
+            if sf(order["base_shares"]) > 1e-9 else 0.0
+        )
+        paired_locked = new_filled - paired_base_cost - new_filled * limit_price
+
+        with db() as c:
+            c.execute(
+                """UPDATE pair_hedges
+                   SET filled_shares=?,status=?,updated_ms=?,fill_mode='LIMIT',
+                       hedge_total_cost=?,locked_pnl=?,last_note=?
+                   WHERE id=?""",
+                (
+                    new_filled, status, now_ms(), new_hedge_total_cost,
+                    paired_locked, f"paired_locked={paired_locked:+.4f}",
+                    order["id"],
+                ),
+            )
+            c.commit()
+
+        fills_done += 1
+        log.info(
+            "PAIR %s %-16s | order=%d %.2f/%.2fsh %s @ %.4f | paired_locked=%+.4f",
+            status, strategy_name, order["id"], new_filled,
+            sf(order["requested_shares"]), order["hedge_outcome"],
+            limit_price, paired_locked,
+        )
+
+    return fills_done
+
+
+async def pair_hedge_loop():
+    """Independent fast checker for F's already-resting PAPER hedge limits."""
+    while True:
+        try:
+            for market in list(markets.values()):
+                if not market.get("resolved"):
+                    process_pair_hedges_for_market(market)
+        except Exception:
+            log.exception("Pair hedge loop failed")
+        await asyncio.sleep(max(0.05, PAIR_HEDGE_CHECK_INTERVAL))
+
+
 def paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base):
     name = strategy["name"]
 
     # The exact shadow state may accept a PYRAMID after a theoretical entry
-    # which the $500 account itself could not afford. Do not create a real
-    # PAPER pyramid on a side this account never actually bought.
+    # which the $500 account itself could not afford. Risk-management hedge fills
+    # must never masquerade as an actual V5 position for this check.
     if typ == "PYRAMID" and not paper_has_asset_position(name, cid, asset):
         log.warning(
             "PAPER %-16s SKIP PYRAMID %-4s | no actual PAPER position",
             name, outcome,
         )
-        return False
+        return None
 
     cash = paper_cash(name)
-    available = max(0.0, cash - MIN_FREE_CASH)
+    reserved = _pair_order_reserved_cash(name) if strategy.get("pair_hedge") else 0.0
+    available = max(0.0, cash - MIN_FREE_CASH - reserved)
     fills = list(base["fills"])
     filled = base["filled"]
     theoretical_total = base["total"]
@@ -1274,10 +1841,10 @@ def paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base):
 
     if filled <= 1e-8:
         log.warning(
-            "PAPER %-16s CASH BLOCK %s %s | cash=%.2f available=%.2f",
-            name, typ, outcome, cash, available,
+            "PAPER %-16s CASH BLOCK %s %s | cash=%.2f reserved=%.2f available=%.2f",
+            name, typ, outcome, cash, reserved, available,
         )
-        return False
+        return None
 
     gross = sum(p * q for p, q in fills)
     fee = sum(fee_usdc(q, p) for p, q in fills)
@@ -1286,7 +1853,7 @@ def paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base):
     after = cash - total
 
     with db() as c:
-        c.execute(
+        cur = c.execute(
             """INSERT INTO trades(
               trade_ms,mode,strategy,condition_id,asset,outcome,signal_type,
               requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
@@ -1299,6 +1866,7 @@ def paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base):
                 jd([{"price": p, "shares": q} for p, q in fills]),
             ),
         )
+        trade_id = cur.lastrowid
         c.execute(
             "INSERT INTO state(key,value) VALUES(?,?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -1308,10 +1876,25 @@ def paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base):
 
     suffix = " CASH_LIMITED" if cash_limited else ""
     log.info(
-        "PAPER %-16s%s | %-7s %-4s | %.2fsh @ %.4f | cost=%.4f | cash %.2f -> %.2f",
-        name, suffix, typ, outcome, filled, avg, total, cash, after,
+        "PAPER %-16s%s | %-7s %-4s | %.2fsh @ %.4f | cost=%.4f | "
+        "cash %.2f -> %.2f | reserved=%.2f",
+        name, suffix, typ, outcome, filled, avg, total, cash, after, reserved,
     )
-    return True
+    return {
+        "trade_id": trade_id,
+        "asset": asset,
+        "outcome": outcome,
+        "signal_type": typ,
+        "requested": ORDER_SIZE,
+        "filled": filled,
+        "avg": avg,
+        "gross": gross,
+        "fee": fee,
+        "total": total,
+        "cash_before": cash,
+        "cash_after": after,
+        "cash_limited": cash_limited,
+    }
 
 def candidate_for_strategy(cid, strategy, elapsed, tick_books):
     """
@@ -1463,18 +2046,21 @@ def evaluate_strategy(market, strategy, elapsed, tick_books, binance_core):
         )
         return
 
-    paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base)
+    paper_trade = paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base)
+    if paper_trade and strategy.get("pair_hedge"):
+        create_pair_hedge_order(market, strategy, paper_trade, tick_books)
 
 async def strategy_loop():
     """
-    A/B/C/E fairness:
-      * one 3-second scheduler;
+    A/B/C/E/F fairness:
+      * one 3-second scheduler for the five normal strategy variants;
       * one captured Polymarket order-book snapshot per market/tick;
       * one Binance core-feature snapshot per market/tick;
-      * four independent base states;
-      * four independent CONF65 shadow states;
-      * four independent $500 PAPER accounts;
-      * E's HEDGE layer executes after the normal V5 decision on the same book tick.
+      * five independent base states;
+      * five independent CONF65 shadow states;
+      * five independent $500 PAPER accounts;
+      * E's loss-floor HEDGE executes after the normal V5 decision;
+      * F's resting pair limits are checked separately at high frequency.
     """
     while True:
         started = time.monotonic()
@@ -1519,10 +2105,10 @@ async def strategy_loop():
                 if not trading_enabled() or elapsed < 0 or elapsed > TRADE_WINDOW_SECONDS:
                     continue
 
-                # One Binance feature capture shared by all four candidates.
+                # One Binance feature capture shared by all five candidates.
                 core = binance_core_snapshot(cid, market)
 
-                # No await inside evaluations: all four use this same tick snapshot.
+                # No await inside evaluations: all five use this same tick snapshot.
                 for strategy in STRATEGIES:
                     evaluate_strategy(market, strategy, elapsed, tick_books, core)
 
@@ -1568,6 +2154,12 @@ async def settle_market(cid, win, out):
         settled = []
 
         with db() as c:
+            c.execute(
+                """UPDATE pair_hedges
+                   SET status='EXPIRED',updated_ms=?,last_note='market settled'
+                   WHERE condition_id=? AND status IN ('PENDING','PARTIAL')""",
+                (now_ms(), cid),
+            )
             for strategy in STRATEGIES:
                 name = strategy["name"]
 
@@ -1769,6 +2361,38 @@ def account_stats(strategy_name):
                 (strategy_name,),
             ).fetchone()["x"]
         )
+        pair_orders = c.execute(
+            """SELECT COUNT(*) c FROM pair_hedges WHERE strategy=?""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        pair_filled = c.execute(
+            """SELECT COUNT(*) c FROM pair_hedges
+               WHERE strategy=? AND status='FILLED'""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        pair_pending = c.execute(
+            """SELECT COUNT(*) c FROM pair_hedges
+               WHERE strategy=? AND status IN ('PENDING','PARTIAL')""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        pair_fok = c.execute(
+            """SELECT COUNT(*) c FROM pair_hedges
+               WHERE strategy=? AND status='FILLED' AND fill_mode='FOK'""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        pair_limit = c.execute(
+            """SELECT COUNT(*) c FROM pair_hedges
+               WHERE strategy=? AND status='FILLED' AND fill_mode='LIMIT'""",
+            (strategy_name,),
+        ).fetchone()["c"]
+        pair_locked = sf(
+            c.execute(
+                """SELECT COALESCE(SUM(locked_pnl),0) x
+                   FROM pair_hedges
+                   WHERE strategy=? AND status='FILLED'""",
+                (strategy_name,),
+            ).fetchone()["x"]
+        )
 
     equity_cost = cash + open_cost
     return {
@@ -1791,6 +2415,13 @@ def account_stats(strategy_name):
         "worst_loss": worst_loss,
         "hedge_trades": hedge_trades,
         "hedge_cost": hedge_cost,
+        "pair_orders": pair_orders,
+        "pair_filled": pair_filled,
+        "pair_pending": pair_pending,
+        "pair_fok": pair_fok,
+        "pair_limit": pair_limit,
+        "pair_locked": pair_locked,
+        "pair_reserved": _pair_order_reserved_cash(strategy_name),
     }
 
 def all_account_stats():
@@ -1829,6 +2460,10 @@ async def tg_send(text):
         log.exception("Telegram send failed")
 
 def format_balance_block(strategy, s):
+    reserved = (
+        f"\nReserved for pair limits: ${s['pair_reserved']:.2f}"
+        if strategy.get("pair_hedge") else ""
+    )
     return (
         f"{strategy['short']}\n"
         f"Initial: ${s['initial']:.2f}\n"
@@ -1836,6 +2471,7 @@ def format_balance_block(strategy, s):
         f"Open positions: ${s['open_cost']:.2f}\n"
         f"Equity: ${s['equity_cost']:.2f}\n"
         f"Realized PnL: ${s['realized']:+.2f}"
+        + reserved
     )
 
 def format_stats_block(strategy, s):
@@ -1850,6 +2486,12 @@ def format_stats_block(strategy, s):
         f"Avg win/loss: ${s['avg_win']:+.2f} / ${s['avg_loss']:+.2f}\n"
         f"Worst market: ${s['worst_loss']:+.2f}\n"
         + (f"Hedges: {s['hedge_trades']} | Hedge cost: ${s['hedge_cost']:.2f}\n" if strategy.get("risk_hedge") else "")
+        + (
+            f"Pair orders: {s['pair_orders']} | Filled: {s['pair_filled']} | Pending: {s['pair_pending']}\n"
+            f"Limit/FOK fills: {s['pair_limit']}/{s['pair_fok']} | "
+            f"Locked target sum: ${s['pair_locked']:+.2f}\n"
+            if strategy.get("pair_hedge") else ""
+        )
         + f"Realized PnL: ${s['realized']:+.2f}\n"
         f"Equity: ${s['equity_cost']:.2f}"
     )
@@ -1863,7 +2505,7 @@ async def send_balances():
     total_equity = sum(stats[s["name"]]["equity_cost"] for s in STRATEGIES)
     total_initial = sum(stats[s["name"]]["initial"] for s in STRATEGIES)
     await tg_send(
-        "💰 FOUR INDEPENDENT PAPER ACCOUNTS\n\n"
+        "💰 FIVE INDEPENDENT PAPER ACCOUNTS\n\n"
         + "\n\n".join(blocks)
         + f"\n\nCombined test equity: ${total_equity:.2f} / ${total_initial:.2f}"
     )
@@ -1874,7 +2516,7 @@ async def send_statistics():
         format_stats_block(strategy, stats[strategy["name"]])
         for strategy in STRATEGIES
     ]
-    await tg_send("📊 A/B/C/E STATISTICS\n\n" + "\n\n".join(blocks))
+    await tg_send("📊 A/B/C/E/F STATISTICS\n\n" + "\n\n".join(blocks))
 
 async def send_positions():
     for strategy in STRATEGIES:
@@ -1908,6 +2550,27 @@ async def send_positions():
         else:
             body = "None"
         await tg_send(f"📈 {strategy['short']} OPEN POSITIONS\n{body}")
+
+        if strategy.get("pair_hedge"):
+            with db() as c:
+                pending = c.execute(
+                    """SELECT id,base_outcome,hedge_outcome,requested_shares,
+                              filled_shares,limit_price,status
+                       FROM pair_hedges
+                       WHERE strategy=? AND status IN ('PENDING','PARTIAL')
+                       ORDER BY id DESC LIMIT 15""",
+                    (name,),
+                ).fetchall()
+            if pending:
+                pbody = "\n".join(
+                    f"#{r['id']} {r['base_outcome']} -> {r['hedge_outcome']} "
+                    f"{r['filled_shares']:.2f}/{r['requested_shares']:.2f}sh "
+                    f"LIMIT {r['limit_price']:.3f} [{r['status']}]"
+                    for r in pending
+                )
+            else:
+                pbody = "None"
+            await tg_send(f"🧷 {strategy['short']} PENDING PAIR LIMITS\n{pbody}")
 
 async def send_trades():
     # Separate Telegram message for each strategy, as requested.
@@ -1944,14 +2607,14 @@ async def handle_tg(text):
     if t in {"/START", "▶️ START", "START"}:
         state_set("trading_enabled", "1")
         await tg_send(
-            "▶️ A/B/C/E trading STARTED\n"
-            "PAPER only | 4 independent accounts | CONF65 | E hedge ON"
+            "▶️ A/B/C/E/F trading STARTED\n"
+            "PAPER only | 5 independent accounts | CONF65 | E + F hedge tests ON"
         )
 
     elif t in {"⏹ STOP", "STOP", "/STOP"}:
         state_set("trading_enabled", "0")
         await tg_send(
-            "⏹ New entries stopped for ALL 4 strategies.\n"
+            "⏹ New entries stopped for ALL 5 strategies.\n"
             "Existing PAPER positions remain until resolution."
         )
 
@@ -1960,12 +2623,12 @@ async def handle_tg(text):
         await tg_send("🚨 EMERGENCY STOP active. No new PAPER orders.")
 
     elif t in {"🟢 PAPER", "PAPER"}:
-        await tg_send("🟢 Mode = PAPER\nAll four accounts are virtual and independent.")
+        await tg_send("🟢 Mode = PAPER\nAll five accounts are virtual and independent.")
 
     elif t in {"🔴 LIVE", "LIVE"}:
         await tg_send(
-            "🔒 LIVE is disabled in this 4-way A/B/C/E build.\n"
-            "The four independent $500 accounts are for PAPER comparison only."
+            "🔒 LIVE is disabled in this 5-way A/B/C/E/F build.\n"
+            "The five independent $500 accounts are for PAPER comparison only."
         )
 
     elif t in {"💰 BALANCE", "BALANCE", "/BALANCE"}:
@@ -1982,11 +2645,11 @@ async def handle_tg(text):
 
     else:
         await tg_send(
-            "M03 FOUR-WAY + Binance CONF65 + E HEDGE\n"
+            "M03 FIVE-WAY + Binance CONF65 + E/F HEDGES\n"
             "A: M03_V3_NOSW90\n"
             "B: M03_V2_LOCK\n"
             "C: M03_V5_DYNAMIC\n"
-            "E: M03_V5_DYNAMIC_HEDGE (-$10 floor target after 20sh)\n"
+            "E: M03_V5_DYNAMIC_HEDGE (-$10 floor target after 20sh)\nF: M03_V5_DYNAMIC_PAIR_HEDGE (1:1 limit hedge per fill)\n"
             "Each has its own $500 PAPER balance."
         )
 
@@ -2000,7 +2663,7 @@ async def telegram_loop():
         f"🤖 {VERSION} online\n"
         f"Trading: {'ON' if trading_enabled() else 'OFF'}\n"
         f"CONF >= {CONF_MIN:.1f}\n"
-        "A/B/C/E each starts with an independent PAPER balance."
+        "A/B/C/E/F each starts with an independent PAPER balance."
     )
 
     while True:
@@ -2035,7 +2698,7 @@ async def health(request):
     return web.json_response({
         "ok": True,
         "version": VERSION,
-        "strategy": "M03 V3 NOSW90 / V2 LOCK / V5 DYNAMIC / V5 DYNAMIC HEDGE + Binance CONF65",
+        "strategy": "M03 V3 NOSW90 / V2 LOCK / V5 DYNAMIC / V5 DYNAMIC HEDGE / V5 PAIR HEDGE + Binance CONF65",
         "mode": "PAPER",
         "trading_enabled": trading_enabled(),
         "live_enabled": False,
@@ -2072,7 +2735,7 @@ async def main():
     init_db()
     session = aiohttp.ClientSession(
         headers={
-            "User-Agent": "M03FourWayCONF65Hedge/4.0",
+            "User-Agent": "M03FiveWayCONF65PairHedge/5.0",
             "Accept": "application/json",
         }
     )
@@ -2086,6 +2749,7 @@ async def main():
             binance_ws_loop,
             binance_watchdog_loop,
             strategy_loop,
+            pair_hedge_loop,
             resolution_loop,
             telegram_loop,
             cleanup_loop,
