@@ -1,4 +1,13 @@
-import os, io, csv, json, time, math, sqlite3, asyncio, logging
+import os
+import io
+import csv
+import json
+import time
+import math
+import zipfile
+import sqlite3
+import asyncio
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from collections import defaultdict, deque
@@ -12,269 +21,140 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# SIX-WAY A/B/C/E/F/G PAPER BOT — BINANCE CONF65 + THREE V5 RISK MODELS
-# Polymarket BTC 5m
-#
-# A: M03_V3_NOSW90 + CONF65
-# B: M03_V2_LOCK    + CONF65
-# C: M03_V5_DYNAMIC + CONF65
-# E: M03_V5_DYNAMIC_HEDGE + CONF65 + dynamic loss-floor hedge
-# F: M03_V5_DYNAMIC_PAIR_HEDGE + CONF65 + per-fill full pair hedge
-# G: M03_V5_DYNAMIC_SMART65 + CONF65 + dynamic sizing + 65% hedge + risk cap
-#
-# Every strategy has an independent $500 PAPER account.
-# All six consume the same captured Polymarket book snapshot and the same
-# Binance feature snapshot on each decision tick.
+# SINGLE-STRATEGY PAPER BOT — M03 V2 GATE64 X2
+# ============================================================
+# Derived from the user's strategy simulator that produced the hourly archives.
+# Only one strategy is kept:
+#   - M03 signal: ask momentum >= 0.03 over 2 decision ticks
+#   - FIRST qualifying M03 signal decides the market:
+#       * price 0.64..0.75 -> market may be traded
+#       * price outside 0.64..0.75 -> market is blacklisted forever
+#   - momentum cap 0.30 remains active for actual ENTRY/PYRAMID
+#   - no side switching
+#   - pyramid step 0.08
+#   - maximum 2 buys total on the chosen side
+#   - 10 shares per buy by default
+#   - PAPER only
 # ============================================================
 
-VERSION = "6.0-paper-abcefg-m03-conf65-smart65"
-HOST = "https://clob.polymarket.com"
-GAMMA = "https://gamma-api.polymarket.com"
-POLY_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
-CHAIN_ID = 137
+VERSION = "5.0-paper-m03-v2-gate64-x2"
+STRATEGY_NAME = "M03_V2_GATE64_X2"
 
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
+SYMBOL = os.getenv("SYMBOL", "BTC").upper()
+
+DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "3.0"))
+TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
+ORDER_SIZE = float(os.getenv("ORDER_SIZE", "10"))
+CRYPTO_FEE_RATE = float(os.getenv("CRYPTO_FEE_RATE", "0.07"))
+DISCOVERY_INTERVAL = float(os.getenv("DISCOVERY_INTERVAL", "10"))
+MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "1000"))
+REPORT_DELAY_SECONDS = int(os.getenv("REPORT_DELAY_SECONDS", "300"))
+REPORT_CHECK_INTERVAL = int(os.getenv("REPORT_CHECK_INTERVAL", "30"))
+
+MEMORY_CLEANUP_INTERVAL = int(os.getenv("MEMORY_CLEANUP_INTERVAL", "60"))
+MEMORY_KEEP_RESOLVED_SEC = int(os.getenv("MEMORY_KEEP_RESOLVED_SEC", "900"))
+WS_MAX_CONNECTION_AGE_SEC = int(os.getenv("WS_MAX_CONNECTION_AGE_SEC", "900"))
+MEMORY_LOG_INTERVAL = int(os.getenv("MEMORY_LOG_INTERVAL", "300"))
+
+# Strategy settings. Keep fixed while collecting out-of-sample data.
+ENTRY_MOVE = float(os.getenv("ENTRY_MOVE", "0.03"))
+PYRAMID_STEP = float(os.getenv("PYRAMID_STEP", "0.08"))
+LOOKBACK_TICKS = int(os.getenv("LOOKBACK_TICKS", "2"))
+FIRST_SIGNAL_PRICE_MIN = float(os.getenv("FIRST_SIGNAL_PRICE_MIN", "0.64"))
+FIRST_SIGNAL_PRICE_MAX = float(os.getenv("FIRST_SIGNAL_PRICE_MAX", "0.75"))
+MOMENTUM_CAP = float(os.getenv("MOMENTUM_CAP", "0.30"))
+MAX_BUYS_SIDE = int(os.getenv("MAX_BUYS_SIDE", "2"))
+MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
+MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
+
+STRATEGY = {
+    "name": STRATEGY_NAME,
+    "entry_move": ENTRY_MOVE,
+    "pyramid_step": PYRAMID_STEP,
+    "lookback": LOOKBACK_TICKS,
+    "entry_price_min": FIRST_SIGNAL_PRICE_MIN,
+    "entry_price_max": FIRST_SIGNAL_PRICE_MAX,
+    "momentum_cap": MOMENTUM_CAP,
+    "allow_switch": False,
+    "max_buys_side": MAX_BUYS_SIDE,
+}
+VARIANTS = [STRATEGY]  # compatibility with the original report/settlement shape
+
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
+MARKET_WS = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
+
 DATA_DIR = Path(os.getenv("DATA_DIR", "/var/data"))
 try:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    test = DATA_DIR / ".write_test"
-    test.write_text("ok")
-    test.unlink()
+    probe = DATA_DIR / ".write_test"
+    probe.write_text("ok")
+    probe.unlink()
 except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-# New DB: starts a clean, fair A/B/C/E/F/G comparison from the same moment.
-DB_PATH = DATA_DIR / "m03_sixway_conf65_smart65.db"
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-
-# PAPER accounts: EACH strategy gets this amount independently.
-PAPER_START_BALANCE = float(os.getenv("PAPER_START_BALANCE", "500"))
-ORDER_SIZE = float(os.getenv("ORDER_SIZE", "10"))
-MAX_BOOK_AGE_MS = int(os.getenv("MAX_BOOK_AGE_MS", "1000"))
-DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "3"))
-TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
-MIN_FREE_CASH = float(os.getenv("MIN_FREE_CASH", "5"))
-MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
-
-# E / V5 DYNAMIC HEDGE risk controls.
-# Hedge starts only after the initial PAPER side has at least 20 actual shares.
-# It buys the opposite outcome just enough to target a settlement loss floor of -$10,
-# while preserving at least +$2 PnL if the initial side ultimately wins.
-HEDGE_START_SHARES = float(os.getenv("HEDGE_START_SHARES", "20"))
-HEDGE_MAX_LOSS = float(os.getenv("HEDGE_MAX_LOSS", "10"))
-HEDGE_MIN_UPSIDE = float(os.getenv("HEDGE_MIN_UPSIDE", "2"))
-HEDGE_MIN_ORDER_SHARES = float(os.getenv("HEDGE_MIN_ORDER_SHARES", "0.05"))
-
-
-# F / V5 DYNAMIC PAIR HEDGE.
-# Every actual V5 PAPER fill creates an equal-share opposite-side hedge target.
-# The resting maker limit is calculated so the completed pair locks at least
-# PAIR_LOCKED_PROFIT after the original trade's taker fee. Makers pay zero fee.
-# If the target is already marketable when created, F first tries a full-size
-# taker FOK-style paper fill, but only when the full all-in cost still preserves
-# the same locked-profit target. Otherwise a post-only-style resting limit is
-# simulated below the current ask.
-PAIR_LOCKED_PROFIT = float(os.getenv("PAIR_LOCKED_PROFIT", "0.25"))
-PAIR_HEDGE_CHECK_INTERVAL = float(os.getenv("PAIR_HEDGE_CHECK_INTERVAL", "0.20"))
-PAIR_DEFAULT_TICK_SIZE = float(os.getenv("PAIR_DEFAULT_TICK_SIZE", "0.01"))
-PAIR_DEFAULT_MIN_ORDER_SIZE = float(os.getenv("PAIR_DEFAULT_MIN_ORDER_SIZE", "1"))
-PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE = os.getenv(
-    "PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE", "1"
-).strip().lower() not in {"0", "false", "no", "off"}
-
-
-# G / V5 SMART65.
-# Directional signals are identical to C/F, but actual PAPER order size shrinks
-# as the outcome price becomes more expensive. Each real G fill then creates a
-# 65% opposite-side hedge at the same favorable price threshold used by F.
-SMART_HEDGE_RATIO = float(os.getenv("SMART_HEDGE_RATIO", "0.65"))
-SMART_MAX_LOSS = float(os.getenv("SMART_MAX_LOSS", "6"))
-SMART_RISK_START_SHARES = float(os.getenv("SMART_RISK_START_SHARES", "16"))
-SMART_MIN_UPSIDE = float(os.getenv("SMART_MIN_UPSIDE", "1"))
-SMART_RISK_MIN_ORDER_SHARES = float(os.getenv("SMART_RISK_MIN_ORDER_SHARES", "0.05"))
-SMART_SIZE_1_MAX_PRICE = float(os.getenv("SMART_SIZE_1_MAX_PRICE", "0.62"))
-SMART_SIZE_1_SHARES = float(os.getenv("SMART_SIZE_1_SHARES", "10"))
-SMART_SIZE_2_MAX_PRICE = float(os.getenv("SMART_SIZE_2_MAX_PRICE", "0.70"))
-SMART_SIZE_2_SHARES = float(os.getenv("SMART_SIZE_2_SHARES", "8"))
-SMART_SIZE_3_MAX_PRICE = float(os.getenv("SMART_SIZE_3_MAX_PRICE", "0.78"))
-SMART_SIZE_3_SHARES = float(os.getenv("SMART_SIZE_3_SHARES", "6"))
-SMART_SIZE_4_MAX_PRICE = float(os.getenv("SMART_SIZE_4_MAX_PRICE", "0.82"))
-SMART_SIZE_4_SHARES = float(os.getenv("SMART_SIZE_4_SHARES", "4"))
-
-# Exact candidate definitions from the old research simulator.
-STRATEGIES = [
-    {
-        "name": "M03_V3_NOSW90",
-        "short": "A / V3 NOSW90",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 999.0,
-        "max_buys_side": 5,
-        "allow_switch": False,
-        "entry_cutoff_sec": 90,
-    },
-    {
-        "name": "M03_V2_LOCK",
-        "short": "B / V2 LOCK",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 999.0,
-        "max_buys_side": 6,
-        "entry_price_min": 0.55,
-        "entry_price_max": 0.75,
-        "momentum_cap": 0.30,
-        "allow_switch": False,
-    },
-    {
-        "name": "M03_V5_DYNAMIC",
-        "short": "C / V5 DYNAMIC",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 0.03,
-        "max_buys_side": 5,
-        "allow_switch": True,
-        "dynamic_switch_v5": True,
-    },
-    {
-        "name": "M03_V5_DYNAMIC_HEDGE",
-        "short": "E / V5 DYNAMIC HEDGE",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 0.03,
-        "max_buys_side": 5,
-        "allow_switch": True,
-        "dynamic_switch_v5": True,
-        "risk_hedge": True,
-    },
-    {
-        "name": "M03_V5_DYNAMIC_PAIR_HEDGE",
-        "short": "F / V5 PAIR HEDGE",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 0.03,
-        "max_buys_side": 5,
-        "allow_switch": True,
-        "dynamic_switch_v5": True,
-        "pair_hedge": True,
-        "pair_hedge_ratio": 1.0,
-    },
-    {
-        "name": "M03_V5_DYNAMIC_SMART65",
-        "short": "G / V5 SMART65",
-        "entry_move": 0.03,
-        "pyramid_step": 0.08,
-        "lookback": 2,
-        "switch_move": 0.03,
-        "max_buys_side": 5,
-        "allow_switch": True,
-        "dynamic_switch_v5": True,
-        "pair_hedge": True,
-        "pair_hedge_ratio": SMART_HEDGE_RATIO,
-        "smart_size": True,
-        "smart_risk_cap": True,
-    },
-]
-STRATEGY_BY_NAME = {x["name"]: x for x in STRATEGIES}
-
-# Binance CONF65 — exact old V2 scoring/feed, threshold changed to 65.
-BINANCE_SYMBOL = os.getenv("BINANCE_SYMBOL", "btcusdt").lower()
-BINANCE_WS = (
-    "wss://fstream.binance.com/market/stream?streams="
-    f"{BINANCE_SYMBOL}@aggTrade/"
-    f"{BINANCE_SYMBOL}@depth20@100ms"
-)
-BINANCE_LARGE_TRADE_USD = float(os.getenv("BINANCE_LARGE_TRADE_USD", "50000"))
-BINANCE_SIGNAL_MAX_AGE_MS = int(os.getenv("BINANCE_SIGNAL_MAX_AGE_MS", "1500"))
-REGIME_WINDOW_SEC = int(os.getenv("REGIME_WINDOW_SEC", "30"))
-START_PRICE_CAPTURE_WINDOW_SEC = int(os.getenv("START_PRICE_CAPTURE_WINDOW_SEC", "3"))
-CONF_MIN = float(os.getenv("CONF_MIN", "65"))
-W_IMPULSE = float(os.getenv("W_IMPULSE", "22"))
-W_FLOW = float(os.getenv("W_FLOW", "18"))
-W_BOOK = float(os.getenv("W_BOOK", "14"))
-W_LARGE = float(os.getenv("W_LARGE", "8"))
-W_TREND = float(os.getenv("W_TREND", "14"))
-W_DISTANCE = float(os.getenv("W_DISTANCE", "18"))
-W_POLY_PRICE = float(os.getenv("W_POLY_PRICE", "6"))
-
-# This build is intentionally PAPER-only. Six independent virtual accounts
-# cannot safely map to one real-money wallet without a separate execution design.
-ENABLE_LIVE = False
+# New DB prevents the old multi-strategy history from contaminating this test.
+DB_PATH = DATA_DIR / "strategy_gate64_x2.db"
+REPORT_DIR = DATA_DIR / "strategy_reports_gate64_x2"
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("m03-sixway-conf65-smart65")
+log = logging.getLogger("gate64-x2")
 
 session: Optional[aiohttp.ClientSession] = None
 
-# Shared runtime market state.
+# Shared market state.
 books = {}
 markets = {}
 subscribed_assets = set()
 ws_send_queue: asyncio.Queue = asyncio.Queue()
-price_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=120)))
-
-# Independent BASE state per (market, strategy), never gated by CONF65.
+price_history = defaultdict(lambda: defaultdict(lambda: deque(maxlen=100)))
 strategy_state = {}
-
-# Independent exact-shadow state per (market, strategy).
-shadow_accepted_sides = defaultdict(set)
-
-market_binance_start_price = {}
-
-# Binance futures state, shared by all six.
-binance_trades = deque(maxlen=50000)       # ts, price, quote, sign
-binance_tick_prices = deque(maxlen=30000)  # ts, price
-binance_second_prices = deque(maxlen=600)  # sec, price
-binance_depth_bids = []
-binance_depth_asks = []
-binance_last_event_ms = 0
-binance_last_trade_ms = 0
-binance_last_depth_ms = 0
-BINANCE_NO_TRADE_RECONNECT_MS = int(os.getenv("BINANCE_NO_TRADE_RECONNECT_MS", "5000"))
-MEMORY_KEEP_RESOLVED_SEC = int(os.getenv("MEMORY_KEEP_RESOLVED_SEC", "900"))
-
 settle_lock = asyncio.Lock()
 
+
 # ============================================================
-# Helpers / DB
+# HELPERS
 # ============================================================
 
 def now_ts():
     return int(time.time())
 
+
 def now_ms():
     return int(time.time() * 1000)
+
 
 def utc_iso(ts=None):
     if ts is None:
         ts = time.time()
     return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
 
-def sf(v, d=0.0):
+
+def sf(v, default=0.0):
     try:
         return float(v)
     except (TypeError, ValueError):
-        return d
+        return default
 
-def si(v, d=0):
+
+def si(v, default=0):
     try:
         return int(float(v))
     except (TypeError, ValueError):
-        return d
+        return default
+
 
 def jd(v):
     return json.dumps(v, ensure_ascii=False, separators=(",", ":"))
+
 
 def parse_jsonish(v):
     if isinstance(v, list):
@@ -287,671 +167,518 @@ def parse_jsonish(v):
     except Exception:
         return []
 
+
 def parse_iso(s):
+    if not s:
+        return None
     try:
-        return datetime.fromisoformat(str(s).replace("Z", "+00:00")) if s else None
+        return datetime.fromisoformat(str(s).replace("Z", "+00:00"))
     except Exception:
         return None
 
-def db():
-    c = sqlite3.connect(DB_PATH, timeout=30)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA journal_mode=WAL;")
-    c.execute("PRAGMA synchronous=NORMAL;")
-    return c
 
-def cash_key(strategy_name):
-    return f"paper_cash::{strategy_name}"
-
-def initial_key(strategy_name):
-    return f"paper_initial::{strategy_name}"
-
-def init_db():
-    with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS state(
-          key TEXT PRIMARY KEY,
-          value TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS markets(
-          condition_id TEXT PRIMARY KEY,
-          question TEXT,
-          slug TEXT,
-          start_ts INTEGER,
-          end_ts INTEGER,
-          up_asset TEXT,
-          down_asset TEXT,
-          resolved INTEGER DEFAULT 0,
-          winning_asset TEXT,
-          winning_outcome TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS signals(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          signal_ms INTEGER,
-          condition_id TEXT,
-          strategy TEXT,
-          asset TEXT,
-          outcome TEXT,
-          signal_type TEXT,
-          ask REAL,
-          reference_ask REAL,
-          momentum REAL,
-          elapsed_sec REAL,
-          confidence REAL,
-          binance_json TEXT,
-          accepted INTEGER,
-          reason TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS baseline_trades(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          trade_ms INTEGER,
-          condition_id TEXT,
-          strategy TEXT,
-          asset TEXT,
-          outcome TEXT,
-          signal_type TEXT,
-          requested_shares REAL,
-          filled_shares REAL,
-          avg_price REAL,
-          gross_cost REAL,
-          fee REAL,
-          total_cost REAL,
-          book_age_ms INTEGER,
-          fills_json TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS trades(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          trade_ms INTEGER,
-          mode TEXT,
-          strategy TEXT,
-          condition_id TEXT,
-          asset TEXT,
-          outcome TEXT,
-          signal_type TEXT,
-          requested_shares REAL,
-          filled_shares REAL,
-          avg_price REAL,
-          gross_cost REAL,
-          fee REAL,
-          total_cost REAL,
-          cash_before REAL,
-          cash_after REAL,
-          book_age_ms INTEGER,
-          fills_json TEXT
-        );
-
-        CREATE TABLE IF NOT EXISTS results(
-          condition_id TEXT,
-          strategy TEXT,
-          mode TEXT,
-          winning_asset TEXT,
-          winning_outcome TEXT,
-          total_cost REAL,
-          payout REAL,
-          pnl REAL,
-          trades INTEGER,
-          settled_ms INTEGER,
-          PRIMARY KEY(condition_id, strategy, mode)
-        );
-
-        CREATE TABLE IF NOT EXISTS pair_hedges(
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          created_ms INTEGER,
-          updated_ms INTEGER,
-          condition_id TEXT,
-          strategy TEXT,
-          base_trade_id INTEGER,
-          base_asset TEXT,
-          base_outcome TEXT,
-          base_signal_type TEXT,
-          base_shares REAL,
-          base_total_cost REAL,
-          hedge_asset TEXT,
-          hedge_outcome TEXT,
-          requested_shares REAL,
-          filled_shares REAL DEFAULT 0,
-          limit_price REAL,
-          target_profit REAL,
-          min_order_size REAL,
-          tick_size REAL,
-          status TEXT,
-          fill_mode TEXT,
-          hedge_total_cost REAL DEFAULT 0,
-          locked_pnl REAL DEFAULT 0,
-          last_note TEXT
-        );
-
-        CREATE INDEX IF NOT EXISTS idx_signals_ms ON signals(signal_ms);
-        CREATE INDEX IF NOT EXISTS idx_signals_strategy ON signals(strategy, signal_ms);
-        CREATE INDEX IF NOT EXISTS idx_baseline_trades_ms ON baseline_trades(trade_ms);
-        CREATE INDEX IF NOT EXISTS idx_baseline_strategy ON baseline_trades(strategy, trade_ms);
-        CREATE INDEX IF NOT EXISTS idx_trades_ms ON trades(trade_ms);
-        CREATE INDEX IF NOT EXISTS idx_trades_strategy ON trades(strategy, trade_ms);
-        CREATE INDEX IF NOT EXISTS idx_results_strategy ON results(strategy, settled_ms);
-        CREATE INDEX IF NOT EXISTS idx_pair_hedges_status ON pair_hedges(status, condition_id);
-        CREATE INDEX IF NOT EXISTS idx_pair_hedges_strategy ON pair_hedges(strategy, created_ms);
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_pair_hedges_base_trade
-          ON pair_hedges(strategy, base_trade_id);
-        """)
-
-        for strategy in STRATEGIES:
-            name = strategy["name"]
-            if c.execute("SELECT 1 FROM state WHERE key=?", (cash_key(name),)).fetchone() is None:
-                c.execute(
-                    "INSERT INTO state(key,value) VALUES(?,?)",
-                    (cash_key(name), str(PAPER_START_BALANCE)),
-                )
-            if c.execute("SELECT 1 FROM state WHERE key=?", (initial_key(name),)).fetchone() is None:
-                c.execute(
-                    "INSERT INTO state(key,value) VALUES(?,?)",
-                    (initial_key(name), str(PAPER_START_BALANCE)),
-                )
-
-        if c.execute("SELECT 1 FROM state WHERE key='trading_enabled'").fetchone() is None:
-            c.execute("INSERT INTO state(key,value) VALUES('trading_enabled','0')")
-        if c.execute("SELECT 1 FROM state WHERE key='mode'").fetchone() is None:
-            c.execute("INSERT INTO state(key,value) VALUES('mode','PAPER')")
-        c.commit()
-
-def state_get(k, d=None):
-    with db() as c:
-        r = c.execute("SELECT value FROM state WHERE key=?", (k,)).fetchone()
-        return r["value"] if r else d
-
-def state_set(k, v):
-    with db() as c:
-        c.execute(
-            "INSERT INTO state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (k, str(v)),
-        )
-        c.commit()
-
-def paper_cash(strategy_name):
-    return sf(state_get(cash_key(strategy_name), PAPER_START_BALANCE))
-
-def paper_initial(strategy_name):
-    return sf(state_get(initial_key(strategy_name), PAPER_START_BALANCE))
-
-def set_paper_cash(strategy_name, value):
-    state_set(cash_key(strategy_name), value)
-
-def trading_enabled():
-    return state_get("trading_enabled", "0") == "1"
-
-def current_mode():
-    return "PAPER"
-
-# Crypto 5m taker fee formula used by the research simulator.
 def fee_usdc(shares, price):
-    fee = shares * 0.07 * price * (1.0 - price)
+    fee = shares * CRYPTO_FEE_RATE * price * (1.0 - price)
     return round(fee, 5) if fee >= 0.000005 else 0.0
 
+
 # ============================================================
-# HTTP / market discovery
+# DATABASE
+# ============================================================
+
+def db():
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA synchronous=NORMAL;")
+    return conn
+
+
+def init_db():
+    with db() as conn:
+        conn.executescript("""
+        CREATE TABLE IF NOT EXISTS discovered_markets (
+            condition_id TEXT PRIMARY KEY,
+            question TEXT,
+            slug TEXT,
+            start_ts INTEGER,
+            end_ts INTEGER,
+            up_asset TEXT,
+            down_asset TEXT,
+            discovered_ms INTEGER,
+            resolved INTEGER DEFAULT 0,
+            winning_asset TEXT,
+            winning_outcome TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS gate_decisions (
+            condition_id TEXT PRIMARY KEY,
+            decision_ms INTEGER,
+            elapsed_sec REAL,
+            asset TEXT,
+            outcome TEXT,
+            ask REAL,
+            reference_ask REAL,
+            momentum REAL,
+            passed INTEGER,
+            reason TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS signals (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            signal_ms INTEGER,
+            condition_id TEXT,
+            variant TEXT,
+            asset TEXT,
+            outcome TEXT,
+            ask REAL,
+            reference_ask REAL,
+            momentum REAL,
+            signal_type TEXT,
+            elapsed_sec REAL
+        );
+
+        CREATE TABLE IF NOT EXISTS paper_trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_ms INTEGER,
+            condition_id TEXT,
+            variant TEXT,
+            asset TEXT,
+            outcome TEXT,
+            signal_type TEXT,
+            requested_shares REAL,
+            filled_shares REAL,
+            avg_price REAL,
+            gross_cost REAL,
+            fee REAL,
+            total_cost REAL,
+            book_age_ms INTEGER,
+            fills_json TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS market_results (
+            condition_id TEXT,
+            variant TEXT,
+            winning_asset TEXT,
+            winning_outcome TEXT,
+            total_cost REAL,
+            payout REAL,
+            pnl REAL,
+            trades INTEGER,
+            up_shares REAL,
+            down_shares REAL,
+            settled_ms INTEGER,
+            PRIMARY KEY(condition_id, variant)
+        );
+
+        CREATE TABLE IF NOT EXISTS state (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trades_ms ON paper_trades(trade_ms);
+        CREATE INDEX IF NOT EXISTS idx_trades_condition ON paper_trades(condition_id);
+        CREATE INDEX IF NOT EXISTS idx_signals_ms ON signals(signal_ms);
+        CREATE INDEX IF NOT EXISTS idx_results_ms ON market_results(settled_ms);
+        CREATE INDEX IF NOT EXISTS idx_gate_ms ON gate_decisions(decision_ms);
+        """)
+
+
+def state_get(key, default=None):
+    with db() as conn:
+        row = conn.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else default
+
+
+def state_set(key, value):
+    with db() as conn:
+        conn.execute(
+            "INSERT INTO state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (key, str(value)),
+        )
+        conn.commit()
+
+
+# ============================================================
+# HTTP / BOOK
 # ============================================================
 
 async def get_json(url, params=None):
-    for i in range(3):
+    for attempt in range(3):
         try:
-            async with session.get(url,params=params,timeout=aiohttp.ClientTimeout(total=12)) as r:
-                t=await r.text()
-                if r.status==200: return json.loads(t)
-                log.warning("HTTP %s %s -> %s",r.status,url,t[:160])
-        except Exception as e: log.warning("GET failed %s: %s",url,e)
-        await asyncio.sleep(.3*(i+1))
+            async with session.get(
+                url,
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=15),
+            ) as r:
+                text = await r.text()
+                if r.status == 200:
+                    return json.loads(text)
+                log.warning("HTTP %s %s %s -> %s", r.status, url, params, text[:200])
+        except Exception as e:
+            log.warning("GET %s failed: %s", url, e)
+        await asyncio.sleep(0.3 * (attempt + 1))
     return None
 
-def slot_start_from_slug(slug):
-    try: return int(str(slug).rstrip("/").split("-")[-1])
-    except Exception: return None
-
-async def fetch_event_by_slug(slug):
-    for url,params in ((f"{GAMMA}/events/slug/{slug}",None),(f"{GAMMA}/events",{"slug":slug})):
-        d=await get_json(url,params)
-        if isinstance(d,dict): return d
-        if isinstance(d,list) and d and isinstance(d[0],dict): return d[0]
-    return None
-
-def parse_market(raw,event):
-    if not isinstance(raw,dict): return None
-    cid=str(raw.get("conditionId") or raw.get("condition_id") or "")
-    if not cid: return None
-    title=str(raw.get("question") or raw.get("title") or event.get("title") or "")
-    slug=str(raw.get("slug") or event.get("slug") or "")
-    text=(title+" "+slug).lower()
-    if "bitcoin" not in text and "btc" not in text: return None
-    outcomes=[str(x).strip().upper() for x in parse_jsonish(raw.get("outcomes"))]
-    tokens=[str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
-    if len(tokens)<2: return None
-    up=down=None
-    for i,o in enumerate(outcomes):
-        if i>=len(tokens): break
-        if o in {"UP","YES"}: up=tokens[i]
-        elif o in {"DOWN","NO"}: down=tokens[i]
-    up=up or tokens[0]; down=down or tokens[1]
-    start=slot_start_from_slug(slug)
-    if not start:
-        dt=parse_iso(raw.get("startDate")) or parse_iso(event.get("startDate"))
-        start=int(dt.timestamp()) if dt else None
-    if not start: return None
-    end=start+300
-    return dict(condition_id=cid,question=title,slug=slug,start_ts=start,end_ts=end,up_asset=up,down_asset=down)
-
-async def discover_slot(slot):
-    slug=f"btc-updown-5m-{slot}"
-    ev=await fetch_event_by_slug(slug)
-    if not ev or not isinstance(ev.get("markets"),list): return None
-    for raw in ev["markets"]:
-        m=parse_market(raw,ev)
-        if m: return m
-    return None
-
-def persist_market(m):
-    with db() as c:
-        c.execute("""INSERT INTO markets(condition_id,question,slug,start_ts,end_ts,up_asset,down_asset)
-          VALUES(?,?,?,?,?,?,?) ON CONFLICT(condition_id) DO UPDATE SET
-          question=excluded.question,slug=excluded.slug,start_ts=excluded.start_ts,end_ts=excluded.end_ts,
-          up_asset=excluded.up_asset,down_asset=excluded.down_asset""",
-          (m["condition_id"],m["question"],m["slug"],m["start_ts"],m["end_ts"],m["up_asset"],m["down_asset"]))
-        c.commit()
-
-async def subscribe_asset(a):
-    if a and a not in subscribed_assets:
-        subscribed_assets.add(a)
-        await ws_send_queue.put({"operation":"subscribe","assets_ids":[a]})
-
-async def discovery_loop():
-    while True:
-        try:
-            n=now_ts(); cur=(n//300)*300
-            for slot in (cur-300,cur,cur+300):
-                m=await discover_slot(slot)
-                if m and m["condition_id"] not in markets:
-                    markets[m["condition_id"]]=m; persist_market(m)
-                    await subscribe_asset(m["up_asset"]); await subscribe_asset(m["down_asset"])
-                    log.info("MARKET %s | %s",m["slug"],utc_iso(m["start_ts"]))
-        except Exception: log.exception("Discovery failed")
-        await asyncio.sleep(10)
-
-# ============================================================
-# Polymarket book
-# ============================================================
 
 def level_map(rows):
-    out={}
+    out = {}
     for x in rows or []:
-        if isinstance(x,dict):
-            p=sf(x.get("price"),math.nan); q=sf(x.get("size"),0)
-            if not math.isnan(p) and q>0: out[p]=q
+        if not isinstance(x, dict):
+            continue
+        p = sf(x.get("price"), math.nan)
+        q = sf(x.get("size"), 0)
+        if not math.isnan(p) and q > 0:
+            out[p] = q
     return out
 
-def apply_book(asset,payload,source="ws"):
-    prev = books.get(asset) or {}
+
+def apply_book(asset, payload, source="ws"):
     books[asset] = {
         "bids": level_map(payload.get("bids")),
         "asks": level_map(payload.get("asks")),
         "received_ms": now_ms(),
         "source": source,
-        "min_order_size": sf(
-            payload.get("min_order_size") or payload.get("minOrderSize"),
-            sf(prev.get("min_order_size"), PAIR_DEFAULT_MIN_ORDER_SIZE),
-        ),
-        "tick_size": sf(
-            payload.get("tick_size") or payload.get("tickSize"),
-            sf(prev.get("tick_size"), PAIR_DEFAULT_TICK_SIZE),
-        ),
     }
 
+
 def apply_price_change(payload):
-    recv=now_ms()
-    for ch in payload.get("price_changes") or payload.get("priceChanges") or []:
-        if not isinstance(ch,dict): continue
-        a=str(ch.get("asset_id") or ch.get("token_id") or ch.get("tokenId") or "")
-        if not a: continue
-        b=books.setdefault(
-            a,
-            {
-                "bids": {},
-                "asks": {},
-                "received_ms": recv,
-                "source": "delta",
-                "min_order_size": PAIR_DEFAULT_MIN_ORDER_SIZE,
-                "tick_size": PAIR_DEFAULT_TICK_SIZE,
-            },
-        )
-        p=sf(ch.get("price"),math.nan); q=sf(ch.get("size"),0); side=str(ch.get("side","")).upper()
-        if math.isnan(p): continue
-        target=b["bids"] if side=="BUY" else b["asks"]
-        if q<=0: target.pop(p,None)
-        else: target[p]=q
-        b["received_ms"]=recv
+    changes = payload.get("price_changes") or payload.get("priceChanges") or []
+    recv = now_ms()
+    for ch in changes:
+        if not isinstance(ch, dict):
+            continue
+        asset = str(ch.get("asset_id") or ch.get("token_id") or ch.get("tokenId") or "")
+        if not asset:
+            continue
+        b = books.setdefault(asset, {
+            "bids": {}, "asks": {}, "received_ms": recv, "source": "ws-delta"
+        })
+        p = sf(ch.get("price"), math.nan)
+        q = sf(ch.get("size"), 0)
+        side = str(ch.get("side", "")).upper()
+        if math.isnan(p):
+            continue
+        target = b["bids"] if side == "BUY" else b["asks"]
+        if q <= 0:
+            target.pop(p, None)
+        else:
+            target[p] = q
+        b["received_ms"] = recv
+        b["source"] = "ws"
 
-def apply_tick_size_change(payload):
-    a = str(payload.get("asset_id") or payload.get("token_id") or payload.get("tokenId") or "")
-    if not a:
-        return
-    b = books.setdefault(
-        a,
-        {
-            "bids": {},
-            "asks": {},
-            "received_ms": now_ms(),
-            "source": "tick",
-            "min_order_size": PAIR_DEFAULT_MIN_ORDER_SIZE,
-            "tick_size": PAIR_DEFAULT_TICK_SIZE,
-        },
-    )
-    new_tick = sf(
-        payload.get("new_tick_size") or payload.get("tick_size") or payload.get("tickSize"),
-        sf(b.get("tick_size"), PAIR_DEFAULT_TICK_SIZE),
-    )
-    if new_tick > 0:
-        b["tick_size"] = new_tick
 
-def best_ask(a):
-    b=books.get(a)
-    return min(b["asks"]) if b and b["asks"] else None
+def best_ask(asset):
+    b = books.get(asset)
+    if not b or not b.get("asks"):
+        return None
+    return min(b["asks"])
 
-async def refresh_book(a):
-    d=await get_json(f"{HOST}/book",{"token_id":a})
-    if isinstance(d,dict): apply_book(a,d,"rest"); return True
+
+async def refresh_book(asset):
+    data = await get_json(f"{CLOB_API}/book", params={"token_id": asset})
+    if isinstance(data, dict):
+        apply_book(asset, data, "rest")
+        return True
     return False
 
-async def ensure_book(a):
-    b=books.get(a)
-    fresh = bool(b and b.get("asks") and now_ms()-b["received_ms"]<=MAX_BOOK_AGE_MS)
-    has_constraints = bool(
-        b
-        and sf(b.get("min_order_size"), 0) > 0
-        and sf(b.get("tick_size"), 0) > 0
-    )
-    if fresh and has_constraints:
-        return now_ms()-b["received_ms"]
-    await refresh_book(a); b=books.get(a)
-    return now_ms()-b["received_ms"] if b else None
 
-def simulate_buy(a,wanted,max_total=None):
-    b=books.get(a)
-    if not b or not b["asks"]: return [],0.0
-    rem=wanted; fills=[]; spent=0.0
+async def ensure_book(asset):
+    b = books.get(asset)
+    if b and b.get("asks"):
+        age = now_ms() - b["received_ms"]
+        if age <= MAX_BOOK_AGE_MS:
+            return age
+    await refresh_book(asset)
+    b = books.get(asset)
+    if not b:
+        return None
+    return now_ms() - b["received_ms"]
+
+
+def simulate_buy(asset, wanted):
+    b = books.get(asset)
+    if not b or not b.get("asks"):
+        return [], 0.0
+    remaining = wanted
+    fills = []
     for p in sorted(b["asks"]):
-        q=b["asks"][p]
-        take=min(q,rem)
-        if max_total is not None:
-            # Include estimated taker fee in affordability.
-            per_share=p + fee_usdc(1,p)
-            take=min(take,max(0.0,(max_total-spent)/per_share))
-        if take>1e-9:
-            fills.append((p,take)); spent += p*take + fee_usdc(take,p); rem-=take
-        if rem<=1e-9 or (max_total is not None and spent>=max_total-1e-8): break
-    return fills,wanted-rem
+        q = b["asks"][p]
+        take = min(q, remaining)
+        if take > 0:
+            fills.append((p, take))
+            remaining -= take
+        if remaining <= 1e-12:
+            break
+    return fills, wanted - remaining
+
+
+# ============================================================
+# MARKET DISCOVERY
+# ============================================================
+
+def slot_start_from_slug(slug):
+    try:
+        return int(str(slug).rstrip("/").split("-")[-1])
+    except Exception:
+        return None
+
+
+async def fetch_event_by_slug(slug):
+    for url, params in (
+        (f"{GAMMA_API}/events/slug/{slug}", None),
+        (f"{GAMMA_API}/events", {"slug": slug}),
+    ):
+        data = await get_json(url, params=params)
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return data[0]
+    return None
+
+
+def parse_market_from_event(raw, event):
+    if not isinstance(raw, dict):
+        return None
+    cid = str(raw.get("conditionId") or raw.get("condition_id") or "")
+    if not cid:
+        return None
+    title = str(raw.get("question") or raw.get("title") or event.get("title") or "Unknown")
+    slug = str(raw.get("slug") or event.get("slug") or "")
+    combined = f"{title} {slug}".lower()
+    if SYMBOL == "BTC" and "bitcoin" not in combined and "btc" not in combined:
+        return None
+    if SYMBOL == "ETH" and "ethereum" not in combined and "eth" not in combined:
+        return None
+
+    outcomes = [str(x).strip().upper() for x in parse_jsonish(raw.get("outcomes"))]
+    tokens = [str(x) for x in parse_jsonish(raw.get("clobTokenIds"))]
+    if len(tokens) < 2:
+        return None
+
+    up_asset = down_asset = None
+    for i, outcome in enumerate(outcomes):
+        if i >= len(tokens):
+            break
+        if outcome in {"UP", "YES"}:
+            up_asset = tokens[i]
+        elif outcome in {"DOWN", "NO"}:
+            down_asset = tokens[i]
+    up_asset = up_asset or tokens[0]
+    down_asset = down_asset or tokens[1]
+
+    start_ts = slot_start_from_slug(slug)
+    if not start_ts:
+        start_dt = parse_iso(raw.get("startDate")) or parse_iso(event.get("startDate"))
+        start_ts = int(start_dt.timestamp()) if start_dt else None
+    if not start_ts:
+        return None
+
+    end_ts = int(start_ts) + 300
+    return {
+        "condition_id": cid,
+        "question": title,
+        "slug": slug,
+        "start_ts": int(start_ts),
+        "end_ts": end_ts,
+        "up_asset": str(up_asset),
+        "down_asset": str(down_asset),
+        "raw": raw,
+    }
+
+
+async def discover_slot_market(prefix, slot_start):
+    slug = f"{prefix}-{slot_start}"
+    event = await fetch_event_by_slug(slug)
+    if not event or not isinstance(event.get("markets"), list):
+        return None
+    for raw in event["markets"]:
+        market = parse_market_from_event(raw, event)
+        if market:
+            return market
+    return None
+
+
+def persist_market(m):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO discovered_markets(
+                condition_id,question,slug,start_ts,end_ts,up_asset,down_asset,discovered_ms
+            ) VALUES(?,?,?,?,?,?,?,?)
+            ON CONFLICT(condition_id) DO UPDATE SET
+                question=excluded.question, slug=excluded.slug,
+                start_ts=excluded.start_ts, end_ts=excluded.end_ts,
+                up_asset=excluded.up_asset, down_asset=excluded.down_asset
+        """, (
+            m["condition_id"], m["question"], m["slug"], m["start_ts"], m["end_ts"],
+            m["up_asset"], m["down_asset"], now_ms(),
+        ))
+        conn.commit()
+
+
+async def subscribe_asset(asset):
+    if not asset or asset in subscribed_assets:
+        return
+    subscribed_assets.add(asset)
+    await ws_send_queue.put({"operation": "subscribe", "assets_ids": [asset]})
+
+
+async def discovery_loop():
+    prefix = "btc-updown-5m" if SYMBOL == "BTC" else "eth-updown-5m"
+    last_current_slot = None
+    while True:
+        try:
+            n = now_ts()
+            current = (n // 300) * 300
+            candidates = []
+            for slot_start in (current, current + 300, current - 300):
+                market = await discover_slot_market(prefix, slot_start)
+                if market:
+                    candidates.append(market)
+
+            if candidates:
+                active = [m for m in candidates if m["start_ts"] - 5 <= n <= m["end_ts"] + 5]
+                chosen = min(active or candidates, key=lambda m: abs(n - m["start_ts"]))
+                for market in candidates:
+                    cid = market["condition_id"]
+                    if cid in markets:
+                        continue
+                    markets[cid] = market
+                    persist_market(market)
+                    await subscribe_asset(market["up_asset"])
+                    await subscribe_asset(market["down_asset"])
+                    log.info(
+                        "MARKET %s | slug=%s | start=%s | end=%s",
+                        market["question"], market["slug"],
+                        utc_iso(market["start_ts"]), utc_iso(market["end_ts"]),
+                    )
+                if current != last_current_slot:
+                    log.info("CURRENT SLOT %s | selected=%s", utc_iso(current), chosen["slug"])
+                    last_current_slot = current
+            else:
+                log.info("Discovery: slug market not found for slot %s; retrying", utc_iso(current))
+        except Exception:
+            log.exception("Discovery loop failed")
+        await asyncio.sleep(DISCOVERY_INTERVAL)
+
+
+# ============================================================
+# POLYMARKET WEBSOCKET
+# ============================================================
 
 def parse_ws(raw):
-    if isinstance(raw,bytes): raw=raw.decode("utf-8","ignore")
-    if raw in ("","PING","PONG"): return []
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "ignore")
+    if raw in ("", "PING", "PONG"):
+        return []
     try:
-        x=json.loads(raw); return x if isinstance(x,list) else [x]
-    except Exception: return []
+        x = json.loads(raw)
+        return x if isinstance(x, list) else [x]
+    except Exception:
+        return []
+
 
 async def ws_sender(ws):
     while True:
-        msg=await ws_send_queue.get()
-        try: await ws.send(jd(msg))
+        msg = await ws_send_queue.get()
+        try:
+            await ws.send(jd(msg))
         except Exception:
-            await ws_send_queue.put(msg); return
+            await ws_send_queue.put(msg)
+            return
+
 
 async def ws_ping(ws):
     while True:
-        try: await ws.send("PING")
-        except Exception: return
+        try:
+            await ws.send("PING")
+        except Exception:
+            return
         await asyncio.sleep(10)
 
-async def poly_ws_loop():
+
+async def ws_loop():
     while True:
         try:
-            if not subscribed_assets: await asyncio.sleep(1); continue
-            async with websockets.connect(POLY_WS,ping_interval=None,close_timeout=5,max_size=20_000_000) as ws:
-                await ws.send(jd({"assets_ids":list(subscribed_assets),"type":"market","custom_feature_enabled":True}))
-                log.info("POLY WS connected | assets=%d",len(subscribed_assets))
-                sender=asyncio.create_task(ws_sender(ws)); ping=asyncio.create_task(ws_ping(ws))
+            if not subscribed_assets:
+                await asyncio.sleep(1)
+                continue
+
+            async with websockets.connect(
+                MARKET_WS,
+                ping_interval=None,
+                close_timeout=5,
+                max_size=20_000_000,
+            ) as ws:
+                await ws.send(jd({
+                    "assets_ids": list(subscribed_assets),
+                    "type": "market",
+                    "custom_feature_enabled": True,
+                }))
+                log.info("WS connected | assets=%d", len(subscribed_assets))
+
+                sender = asyncio.create_task(ws_sender(ws))
+                ping = asyncio.create_task(ws_ping(ws))
                 try:
+                    ws_started = time.monotonic()
                     async for raw in ws:
+                        if time.monotonic() - ws_started >= WS_MAX_CONNECTION_AGE_SEC:
+                            log.info("WS periodic reconnect | active_assets=%d", len(subscribed_assets))
+                            break
                         for ev in parse_ws(raw):
-                            if not isinstance(ev,dict): continue
-                            et=str(ev.get("event_type") or ev.get("type") or "")
-                            p=ev.get("payload") if isinstance(ev.get("payload"),dict) else ev
-                            if et=="book":
-                                a=str(p.get("asset_id") or p.get("token_id") or "")
-                                if a: apply_book(a,p)
-                            elif et=="price_change": apply_price_change(p)
-                            elif et in {"tick_size_change", "tickSizeChange"}: apply_tick_size_change(p)
-                            elif et=="market_resolved": await settle_from_ws(p)
-                finally: sender.cancel(); ping.cancel()
+                            if not isinstance(ev, dict):
+                                continue
+                            et = str(ev.get("event_type") or ev.get("type") or "")
+                            payload = ev.get("payload") if isinstance(ev.get("payload"), dict) else ev
+                            if et == "book":
+                                asset = str(payload.get("asset_id") or payload.get("token_id") or "")
+                                if asset:
+                                    apply_book(asset, payload)
+                            elif et == "price_change":
+                                apply_price_change(payload)
+                            elif et == "market_resolved":
+                                await settle_from_resolution(payload)
+                finally:
+                    sender.cancel()
+                    ping.cancel()
         except Exception as e:
-            log.warning("POLY WS reconnect: %s",e); await asyncio.sleep(1)
+            log.warning("WS reconnect: %s", e)
+            await asyncio.sleep(1)
+
 
 # ============================================================
-# Binance confidence engine - preserved from the old V2 research bot
+# MEMORY / RENDER STABILITY
 # ============================================================
 
-def _ema(values,period):
-    if not values:return None
-    alpha=2/(period+1); e=float(values[0])
-    for v in values[1:]: e=alpha*float(v)+(1-alpha)*e
-    return e
-
-def _rsi(values,period=14):
-    if len(values)<period+1:return None
-    gains=[]; losses=[]
-    for i in range(-period,0):
-        d=float(values[i])-float(values[i-1]); gains.append(max(d,0)); losses.append(max(-d,0))
-    ag=sum(gains)/period; al=sum(losses)/period
-    if al<=1e-12:return 100.0
-    rs=ag/al; return 100-100/(1+rs)
-
-def _latest_btc_price():
-    return float(binance_tick_prices[-1][1]) if binance_tick_prices else None
-
-def _price_ms_ago(msago):
-    target=now_ms()-msago
-    for ts,px in reversed(binance_tick_prices):
-        if ts<=target:return float(px)
+def current_rss_mb():
+    try:
+        with open("/proc/self/status", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return float(line.split()[1]) / 1024.0
+    except Exception:
+        pass
     return None
 
-def _ret_ms(msago):
-    a=_latest_btc_price(); b=_price_ms_ago(msago)
-    return a/b-1 if a and b else 0.0
 
-def _signed_flow(sec):
-    cutoff=now_ms()-int(sec*1000); buy=sell=0.0
-    for ts,p,q,s in reversed(binance_trades):
-        if ts<cutoff:break
-        if s>0:buy+=q
-        else:sell+=q
-    t=buy+sell; return (buy-sell)/t if t>1e-9 else 0.0
-
-def _large_delta(sec):
-    cutoff=now_ms()-int(sec*1000); buy=sell=0.0
-    for ts,p,q,s in reversed(binance_trades):
-        if ts<cutoff:break
-        if q<BINANCE_LARGE_TRADE_USD:continue
-        if s>0:buy+=q
-        else:sell+=q
-    t=buy+sell; return (buy-sell)/t if t>1e-9 else 0.0
-
-def _book_imbalance():
-    bid=sum(sf(x[1]) for x in binance_depth_bids[:10]); ask=sum(sf(x[1]) for x in binance_depth_asks[:10])
-    t=bid+ask; return (bid-ask)/t if t>1e-9 else 0.0
-
-def _regime_features(sec=30):
-    cutoff=now_ms()-sec*1000; pts=[(t,float(p)) for t,p in binance_tick_prices if t>=cutoff]
-    if len(pts)<4:return dict(path_efficiency=0,direction_changes=0,realized_move=0,regime="UNKNOWN")
-    px=[p for _,p in pts]; net=px[-1]-px[0]; path=sum(abs(px[i]-px[i-1]) for i in range(1,len(px)))
-    eff=abs(net)/path if path>1e-12 else 0
-    signs=[]
-    for i in range(1,len(px)):
-        d=px[i]-px[i-1]
-        if abs(d)>1e-12: signs.append(1 if d>0 else -1)
-    changes=sum(1 for i in range(1,len(signs)) if signs[i]!=signs[i-1])
-    move=px[-1]/px[0]-1 if px[0] else 0
-    regime="TREND" if eff>=.55 and abs(move)>=.0005 else ("CHOP" if eff<=.25 and changes>=6 else "MIXED")
-    return dict(path_efficiency=eff,direction_changes=changes,realized_move=move,regime=regime)
-
-def _ensure_start_price(cid,m):
-    if cid in market_binance_start_price:return market_binance_start_price[cid]
-    target=m["start_ts"]*1000; best=None; bestdt=None
-    for ts,px in binance_tick_prices:
-        dt=abs(ts-target)
-        if dt<=START_PRICE_CAPTURE_WINDOW_SEC*1000 and (bestdt is None or dt<bestdt): best=float(px); bestdt=dt
-    if best is None:best=_latest_btc_price()
-    if best is not None:market_binance_start_price[cid]=best
-    return best
-
-def confidence_from_features(outcome,poly_ask,f):
-    direction=1.0 if outcome.lower()=="up" else -1.0
-    impulse_raw=.35*(f["ret_250ms"]/.00020)+.30*(f["ret_500ms"]/.00030)+.20*(f["ret_1s"]/.00045)+.15*(f["ret_3s"]/.00080)
-    impulse=max(-1,min(1,direction*impulse_raw))
-    flow=max(-1,min(1,direction*(.45*f["flow_1s"]+.30*f["flow_3s"]+.25*f["flow_10s"])))
-    book=max(-1,min(1,direction*f["book_imbalance"]))
-    large=max(-1,min(1,direction*(.65*f["large_delta_10s"]+.35*f["large_delta_30s"])))
-    trend=1.0 if direction*f["ema_bias"]>0 else -1.0
-    if f["regime"]=="CHOP":trend*=.20
-    elif f["regime"]=="MIXED":trend*=.55
-    dist=max(-1,min(1,direction*(f["distance_from_start_pct"]/.0015)))
-    poly=0 if poly_ask is None else max(-1,min(1,(.72-float(poly_ask))/.22))
-    weighted=W_IMPULSE*impulse+W_FLOW*flow+W_BOOK*book+W_LARGE*large+W_TREND*trend+W_DISTANCE*dist+W_POLY_PRICE*poly
-    return max(0,min(100,50+weighted/2))
-
-def binance_snapshot(cid,m,outcome,poly_ask):
-    btc=_latest_btc_price(); start=_ensure_start_price(cid,m); dist=btc/start-1 if btc and start else 0
-    prices=[float(p) for _,p in binance_second_prices]
-    e9=_ema(prices[-60:],9) if prices else None; e21=_ema(prices[-90:],21) if prices else None
-    eb=e9/e21-1 if e9 and e21 else 0; reg=_regime_features(REGIME_WINDOW_SEC)
-    f=dict(btc_price=btc,start_price=start,distance_from_start_pct=dist,
-      ret_250ms=_ret_ms(250),ret_500ms=_ret_ms(500),ret_1s=_ret_ms(1000),ret_3s=_ret_ms(3000),ret_10s=_ret_ms(10000),
-      flow_1s=_signed_flow(1),flow_3s=_signed_flow(3),flow_10s=_signed_flow(10),flow_30s=_signed_flow(30),
-      book_imbalance=_book_imbalance(),large_delta_10s=_large_delta(10),large_delta_30s=_large_delta(30),
-      ema9=e9,ema21=e21,ema_bias=eb,rsi14=_rsi(prices,14) if prices else None,
-      data_age_ms=max(0,now_ms()-binance_last_trade_ms) if binance_last_trade_ms else 999999,**reg)
-    f["confidence"]=confidence_from_features(outcome,poly_ask,f)
-    return f
-
-async def binance_ws_loop():
-    """
-    Exact old V2 combined Binance Futures feed: aggTrade + depth20@100ms.
-
-    One intentional safety fix versus old V2: CONF freshness is measured from
-    the last valid aggTrade only. Depth messages never refresh trade freshness.
-    """
-    global binance_depth_bids, binance_depth_asks
-    global binance_last_event_ms, binance_last_trade_ms, binance_last_depth_ms
-
-    while True:
-        try:
-            async with websockets.connect(
-                BINANCE_WS,
-                ping_interval=20,
-                ping_timeout=20,
-                close_timeout=5,
-                max_size=10_000_000,
-            ) as ws:
-                log.info("BINANCE V2 WS connected | %s", BINANCE_SYMBOL.upper())
-                async for raw in ws:
-                    recv_ms = now_ms()
-                    data = json.loads(raw)
-                    payload = data.get("data", data)
-                    stream = str(data.get("stream", ""))
-                    binance_last_event_ms = recv_ms
-
-                    if "aggtrade" in stream.lower() or payload.get("e") == "aggTrade":
-                        ts = si(payload.get("T") or payload.get("E") or recv_ms)
-                        price = sf(payload.get("p"))
-                        qty = sf(payload.get("q"))
-                        if price <= 0 or qty <= 0:
-                            continue
-                        quote = price * qty
-                        sign = -1 if bool(payload.get("m")) else 1
-                        binance_trades.append((ts, price, quote, sign))
-                        binance_tick_prices.append((ts, price))
-                        binance_last_trade_ms = recv_ms
-                        sec = ts // 1000
-                        if binance_second_prices and binance_second_prices[-1][0] == sec:
-                            binance_second_prices[-1] = (sec, price)
-                        else:
-                            binance_second_prices.append((sec, price))
-
-                    elif "depth" in stream.lower():
-                        binance_depth_bids = payload.get("b") or payload.get("bids") or []
-                        binance_depth_asks = payload.get("a") or payload.get("asks") or []
-                        binance_last_depth_ms = recv_ms
-
-        except Exception as e:
-            log.warning("BINANCE V2 WS reconnect: %s", e)
-        await asyncio.sleep(1)
-
-
-async def binance_watchdog_loop():
-    """
-    Diagnostic only. It never marks Binance fresh from depth.
-    If aggTrade is missing, strategy entries remain blocked.
-    """
-    while True:
-        try:
-            await asyncio.sleep(10)
-            age = now_ms() - binance_last_trade_ms if binance_last_trade_ms else None
-            if age is None or age > BINANCE_NO_TRADE_RECONNECT_MS:
-                log.warning(
-                    "BINANCE WATCHDOG | aggTrade_age=%s | ticks=%d | trades=%d | depth_age=%s",
-                    f"{age}ms" if age is not None else "NONE",
-                    len(binance_tick_prices),
-                    len(binance_trades),
-                    (
-                        f"{now_ms() - binance_last_depth_ms}ms"
-                        if binance_last_depth_ms else "NONE"
-                    ),
-                )
-        except Exception:
-            log.exception("BINANCE watchdog failed")
-
-
-
-# ============================================================
-# Runtime cleanup
-# ============================================================
-
-def cleanup_old_runtime():
+def cleanup_resolved_market_memory():
     cutoff = now_ts() - MEMORY_KEEP_RESOLVED_SEC
-    with db() as c:
-        rows = c.execute(
-            "SELECT condition_id FROM markets WHERE resolved=1 AND end_ts<?",
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT condition_id FROM discovered_markets WHERE resolved=1 AND end_ts < ?",
             (cutoff,),
         ).fetchall()
-
-    old_cids = {
-        str(r["condition_id"])
-        for r in rows
-        if str(r["condition_id"]) in markets
-    }
+    old_cids = {str(r["condition_id"]) for r in rows}
     if not old_cids:
         return 0
 
     for cid in old_cids:
         markets.pop(cid, None)
         price_history.pop(cid, None)
-        market_binance_start_price.pop(cid, None)
-
     for key in list(strategy_state):
         if key[0] in old_cids:
             strategy_state.pop(key, None)
-
-    for key in list(shadow_accepted_sides):
-        if key[0] in old_cids:
-            shadow_accepted_sides.pop(key, None)
 
     keep_assets = set()
     for m in markets.values():
@@ -959,2025 +686,666 @@ def cleanup_old_runtime():
             keep_assets.add(str(m["up_asset"]))
         if m.get("down_asset"):
             keep_assets.add(str(m["down_asset"]))
-
     for asset in list(books):
         if asset not in keep_assets:
             books.pop(asset, None)
-
     subscribed_assets.intersection_update(keep_assets)
     return len(old_cids)
 
-async def cleanup_loop():
+
+async def memory_maintenance_loop():
+    last_mem_log = 0.0
     while True:
         try:
-            removed = cleanup_old_runtime()
-            if removed:
+            removed = cleanup_resolved_market_memory()
+            mono = time.monotonic()
+            if removed or mono - last_mem_log >= MEMORY_LOG_INTERVAL:
+                rss = current_rss_mb()
                 log.info(
-                    "CLEANUP | removed_markets=%d | markets=%d | books=%d | assets=%d",
-                    removed, len(markets), len(books), len(subscribed_assets)
+                    "MEMORY | RSS=%s | removed_markets=%d | markets=%d | books=%d | state=%d | assets=%d",
+                    f"{rss:.1f} MB" if rss is not None else "n/a",
+                    removed, len(markets), len(books), len(strategy_state), len(subscribed_assets),
                 )
+                last_mem_log = mono
         except Exception:
-            log.exception("Cleanup failed")
-        await asyncio.sleep(60)
+            log.exception("Memory maintenance failed")
+        await asyncio.sleep(MEMORY_CLEANUP_INTERVAL)
+
 
 # ============================================================
-# Six-strategy exact-shadow engine
+# SINGLE STRATEGY ENGINE
 # ============================================================
 
-def get_st(cid, strategy_name):
-    key = (cid, strategy_name)
+def get_variant_state(condition, variant=STRATEGY):
+    key = (condition, variant["name"])
     if key not in strategy_state:
         strategy_state[key] = {
             "buys": defaultdict(int),
             "last_buy": {},
             "started_sides": set(),
             "primary_asset": None,
+            "gate_decided": False,
+            "gate_passed": False,
+            "gate_asset": None,
         }
     return strategy_state[key]
 
-def momentum_for(cid, asset, lookback):
-    h = price_history[cid][asset]
+
+def momentum_for(condition, asset, lookback):
+    h = price_history[condition][asset]
     if len(h) <= lookback:
         return None, None
-    return h[-1][1] - h[-1 - lookback][1], h[-1 - lookback][1]
+    current = h[-1][1]
+    ref = h[-1 - lookback][1]
+    return current - ref, ref
 
-def snapshot_book(asset, captured_ms):
-    b = books.get(asset)
-    if not b or not b.get("asks"):
-        return None
-    return {
-        "bids": dict(b.get("bids") or {}),
-        "asks": dict(b.get("asks") or {}),
-        "received_ms": int(b.get("received_ms") or captured_ms),
-        "captured_ms": captured_ms,
-        "min_order_size": sf(b.get("min_order_size"), PAIR_DEFAULT_MIN_ORDER_SIZE),
-        "tick_size": sf(b.get("tick_size"), PAIR_DEFAULT_TICK_SIZE),
-    }
 
-def best_ask_snapshot(book_snapshot):
-    if not book_snapshot or not book_snapshot["asks"]:
-        return None
-    return min(book_snapshot["asks"])
+def store_gate_decision(condition, asset, outcome, ask, ref, mom, elapsed, passed, reason):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO gate_decisions(
+                condition_id,decision_ms,elapsed_sec,asset,outcome,ask,
+                reference_ask,momentum,passed,reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(condition_id) DO NOTHING
+        """, (
+            condition, now_ms(), elapsed, asset, outcome, ask,
+            ref, mom, 1 if passed else 0, reason,
+        ))
+        conn.commit()
 
-def simulate_buy_snapshot(book_snapshot, wanted):
-    if not book_snapshot or not book_snapshot["asks"]:
-        return [], 0.0
-    rem = float(wanted)
-    fills = []
-    for p in sorted(book_snapshot["asks"]):
-        q = sf(book_snapshot["asks"][p])
-        take = min(q, rem)
-        if take > 1e-9:
-            fills.append((float(p), take))
-            rem -= take
-        if rem <= 1e-9:
-            break
-    return fills, wanted - rem
 
-def binance_core_snapshot(cid, market):
-    # Capture Binance features once for this market decision tick.
-    # confidence itself is recalculated per strategy signal because outcome and
-    # Polymarket ask can differ.
-    f = binance_snapshot(cid, market, "Up", None)
-    f.pop("confidence", None)
-    return f
+def store_signal(condition, variant, asset, outcome, ask, ref, mom, signal_type, elapsed):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO signals(
+                signal_ms,condition_id,variant,asset,outcome,ask,
+                reference_ask,momentum,signal_type,elapsed_sec
+            ) VALUES(?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now_ms(), condition, variant["name"], asset, outcome,
+            ask, ref, mom, signal_type, elapsed,
+        ))
+        conn.commit()
 
-def features_for_signal(core, outcome, poly_ask):
-    f = dict(core)
-    f["confidence"] = confidence_from_features(outcome, poly_ask, f)
-    return f
 
-def store_signal(cid, strategy_name, asset, outcome, typ, ask, ref, mom, elapsed, f, accepted, reason):
-    with db() as c:
-        c.execute(
-            """INSERT INTO signals(
-              signal_ms,condition_id,strategy,asset,outcome,signal_type,
-              ask,reference_ask,momentum,elapsed_sec,confidence,binance_json,
-              accepted,reason
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                now_ms(), cid, strategy_name, asset, outcome, typ,
-                ask, ref, mom, elapsed, f.get("confidence"), jd(f),
-                1 if accepted else 0, reason,
-            ),
-        )
-        c.commit()
-
-def execute_baseline_from_snapshot(cid, strategy, asset, outcome, typ, book_snapshot):
-    """
-    Execute the UNFILTERED base strategy only in the internal simulator.
-
-    This advances the strategy's own buys/last_buy/started_sides even if
-    CONF65 later blocks the trade, matching the old research shadow design.
-    It never touches that strategy's $500 PAPER account.
-    """
-    fills, filled = simulate_buy_snapshot(book_snapshot, ORDER_SIZE)
-    if filled <= 1e-8:
-        return None
+async def execute_paper(condition, variant, asset, outcome, signal_type):
+    age = await ensure_book(asset)
+    fills, filled = simulate_buy(asset, ORDER_SIZE)
+    if filled <= 0:
+        return False
 
     gross = sum(p * q for p, q in fills)
     fee = sum(fee_usdc(q, p) for p, q in fills)
     avg = gross / filled
     total = gross + fee
-    trade_ms = now_ms()
-    age = max(0, int(book_snapshot["captured_ms"]) - int(book_snapshot["received_ms"]))
 
-    with db() as c:
-        c.execute(
-            """INSERT INTO baseline_trades(
-              trade_ms,condition_id,strategy,asset,outcome,signal_type,
-              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
-              book_age_ms,fills_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                trade_ms, cid, strategy["name"], asset, outcome, typ,
-                ORDER_SIZE, filled, avg, gross, fee, total, age,
-                jd([{"price": p, "shares": q} for p, q in fills]),
-            ),
-        )
-        c.commit()
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO paper_trades(
+                trade_ms,condition_id,variant,asset,outcome,signal_type,
+                requested_shares,filled_shares,avg_price,gross_cost,fee,
+                total_cost,book_age_ms,fills_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now_ms(), condition, variant["name"], asset, outcome, signal_type,
+            ORDER_SIZE, filled, avg, gross, fee, total, age,
+            jd([{"price": p, "shares": q} for p, q in fills]),
+        ))
+        conn.commit()
 
-    st = get_st(cid, strategy["name"])
+    st = get_variant_state(condition, variant)
     st["buys"][asset] += 1
     st["last_buy"][asset] = avg
     st["started_sides"].add(asset)
 
-    if typ == "ENTRY" and not bool(strategy.get("allow_switch", True)):
-        st["primary_asset"] = asset
-
     log.info(
-        "BASE %-16s | %-7s %-4s | %.2fsh @ %.4f | cost=%.4f",
-        strategy["name"], typ, outcome, filled, avg, total,
+        "%s %s %s %s %.1fsh @ %.4f fee=%.4f",
+        variant["name"], signal_type, outcome, condition[-6:], filled, avg, fee,
     )
+    return True
 
-    return {
-        "trade_ms": trade_ms,
-        "age": age,
-        "fills": fills,
-        "filled": filled,
-        "gross": gross,
-        "fee": fee,
-        "avg": avg,
-        "total": total,
-    }
 
-def exact_shadow_decision(cid, strategy_name, asset, typ, f):
-    """
-    Exact old V2 shadow logic, now CONF65:
-      ENTRY/SWITCH -> can start a shadow side only if fresh and conf>=65.
-      PYRAMID      -> requires that side to have an accepted ENTRY/SWITCH
-                      and fresh conf>=65.
-    """
-    fresh = f["data_age_ms"] <= BINANCE_SIGNAL_MAX_AGE_MS
-    conf_ok = fresh and f["confidence"] >= CONF_MIN
-    sides = shadow_accepted_sides[(cid, strategy_name)]
-
-    if typ in {"ENTRY", "SWITCH"}:
-        accepted = conf_ok
-        if accepted:
-            sides.add(asset)
-        if accepted:
-            reason = f"conf={f['confidence']:.1f};fresh=True"
-        else:
-            reason = f"blocked_conf={f['confidence']:.1f};fresh={fresh}"
-        return accepted, reason
-
-    if typ == "PYRAMID":
-        if asset not in sides:
-            return False, "no_shadow_position"
-        accepted = conf_ok
-        if accepted:
-            reason = f"conf={f['confidence']:.1f};fresh=True"
-        else:
-            reason = f"blocked_conf={f['confidence']:.1f};fresh={fresh}"
-        return accepted, reason
-
-    return False, "unknown_signal"
-
-def _trim_baseline_fills_to_budget(fills, max_total):
-    if max_total <= 0:
-        return [], 0.0
+def _raw_first_signal_candidates(market, variant):
+    cid = market["condition_id"]
     out = []
-    spent = 0.0
-    shares = 0.0
-    for p, q in fills:
-        per_share = p + fee_usdc(1, p)
-        affordable = max(0.0, (max_total - spent) / per_share)
-        take = min(q, affordable)
-        if take <= 1e-9:
-            break
-        out.append((p, take))
-        spent += p * take + fee_usdc(take, p)
-        shares += take
-        if spent >= max_total - 1e-8:
-            break
-    return out, shares
-
-def paper_has_asset_position(strategy_name, cid, asset):
-    with db() as c:
-        row = c.execute(
-            """SELECT COALESCE(SUM(filled_shares),0) AS sh
-               FROM trades
-               WHERE mode='PAPER' AND strategy=? AND condition_id=? AND asset=?
-                 AND signal_type NOT LIKE '%HEDGE%'""",
-            (strategy_name, cid, asset),
-        ).fetchone()
-    return sf(row["sh"] if row else 0) > 1e-8
-
-def paper_market_exposure(strategy_name, cid):
-    """Return actual PAPER exposure for one strategy/market.
-
-    For the hedge variant the protected/primary side is the asset of the first
-    actual non-HEDGE PAPER fill. HEDGE fills never alter the V5 base/shadow state.
-    """
-    with db() as c:
-        rows = c.execute(
-            """SELECT id,asset,outcome,signal_type,filled_shares,total_cost
-               FROM trades
-               WHERE mode='PAPER' AND strategy=? AND condition_id=?
-               ORDER BY id""",
-            (strategy_name, cid),
-        ).fetchall()
-
-    total_cost = sum(sf(r["total_cost"]) for r in rows)
-    shares = defaultdict(float)
-    outcomes = {}
-    primary_asset = None
-    primary_outcome = None
-
-    for r in rows:
-        asset = str(r["asset"])
-        shares[asset] += sf(r["filled_shares"])
-        outcomes[asset] = str(r["outcome"])
-        if primary_asset is None and "HEDGE" not in str(r["signal_type"]).upper():
-            primary_asset = asset
-            primary_outcome = str(r["outcome"])
-
-    return {
-        "rows": rows,
-        "total_cost": total_cost,
-        "shares": shares,
-        "outcomes": outcomes,
-        "primary_asset": primary_asset,
-        "primary_outcome": primary_outcome,
-    }
-
-
-def _hedge_plan_from_snapshot(book_snapshot, needed_improvement, max_total):
-    """Build the smallest opposite-side taker fill that improves settlement PnL.
-
-    Each hedge share pays $1 if the protected side loses, but costs ask + fee now.
-    Therefore the loss-floor improvement per share is 1 - all-in cost/share.
-    The plan walks real ask levels and respects the upside/cash spending cap.
-    """
-    if not book_snapshot or not book_snapshot.get("asks"):
-        return [], 0.0, 0.0
-    if needed_improvement <= 1e-9 or max_total <= 1e-9:
-        return [], 0.0, 0.0
-
-    fills = []
-    spent = 0.0
-    improved = 0.0
-
-    for p in sorted(book_snapshot["asks"]):
-        q = sf(book_snapshot["asks"][p])
-        p = sf(p)
-        if q <= 1e-9 or p <= 0 or p >= 1:
-            continue
-
-        fee_per_share = 0.07 * p * (1.0 - p)
-        all_in = p + fee_per_share
-        improvement_per_share = 1.0 - all_in
-        if improvement_per_share <= 1e-9:
-            continue
-
-        remaining_gap = max(0.0, needed_improvement - improved)
-        need_shares = remaining_gap / improvement_per_share
-        affordable = max(0.0, (max_total - spent) / all_in)
-        take = min(q, need_shares, affordable)
-        if take <= 1e-9:
-            break
-
-        fills.append((p, take))
-        # Use the bot's own fee function for the recorded all-in cost.
-        level_cost = p * take + fee_usdc(take, p)
-        spent += level_cost
-        improved += take - level_cost
-
-        if improved >= needed_improvement - 1e-6:
-            break
-        if spent >= max_total - 1e-8:
-            break
-
-    return fills, spent, improved
-
-
-def maybe_execute_hedge(market, strategy, tick_books):
-    """Risk-manager for E / V5 DYNAMIC HEDGE.
-
-    Trigger: >= HEDGE_START_SHARES actual shares on the first actual V5 side.
-    Goal: if that primary side loses at settlement, target PnL >= -HEDGE_MAX_LOSS.
-    Constraint: preserve at least HEDGE_MIN_UPSIDE if the primary side wins.
-
-    Existing opposite-side V5 SWITCH/PYRAMID shares count as protection, so the
-    hedge only buys the missing amount. It does not use CONF65 and does not touch
-    V5 baseline/shadow state because this is risk management, not a direction signal.
-    """
-    if not strategy.get("risk_hedge"):
-        return None
-
-    name = strategy["name"]
-    cid = market["condition_id"]
-    ex = paper_market_exposure(name, cid)
-    primary = ex["primary_asset"]
-    if not primary:
-        return None
-
-    primary_shares = sf(ex["shares"].get(primary, 0.0))
-    if primary_shares + 1e-8 < HEDGE_START_SHARES:
-        return None
-
-    if primary == str(market["up_asset"]):
-        hedge_asset = str(market["down_asset"])
-        hedge_outcome = "Down"
-    elif primary == str(market["down_asset"]):
-        hedge_asset = str(market["up_asset"])
-        hedge_outcome = "Up"
-    else:
-        return None
-
-    total_cost = sf(ex["total_cost"])
-    hedge_shares = sf(ex["shares"].get(hedge_asset, 0.0))
-
-    # Settlement PnL of the two possible outcomes using actual shares/cost paid.
-    pnl_if_primary_wins = primary_shares - total_cost
-    pnl_if_primary_loses = hedge_shares - total_cost
-    target_floor = -abs(HEDGE_MAX_LOSS)
-
-    if pnl_if_primary_loses >= target_floor - 1e-6:
-        return None
-
-    # Do not buy protection that would reduce a primary-side win below +$2.
-    upside_budget = pnl_if_primary_wins - HEDGE_MIN_UPSIDE
-    cash = paper_cash(name)
-    cash_budget = max(0.0, cash - MIN_FREE_CASH)
-    max_total = min(max(0.0, upside_budget), cash_budget)
-    if max_total <= 1e-8:
-        log.info(
-            "HEDGE %-16s BLOCK | primary=%s %.2fsh | lose=%+.2f | win=%+.2f | no upside budget",
-            name, ex["primary_outcome"], primary_shares,
-            pnl_if_primary_loses, pnl_if_primary_wins,
-        )
-        return None
-
-    book_snapshot = tick_books["books"].get(hedge_asset)
-    if not book_snapshot:
-        return None
-
-    needed = target_floor - pnl_if_primary_loses
-    fills, _planned_cost, _improved = _hedge_plan_from_snapshot(
-        book_snapshot, needed, max_total
-    )
-    filled = sum(q for _p, q in fills)
-    if filled + 1e-9 < HEDGE_MIN_ORDER_SHARES:
-        return None
-
-    gross = sum(p * q for p, q in fills)
-    fee = sum(fee_usdc(q, p) for p, q in fills)
-    total = gross + fee
-    avg = gross / filled
-    after = cash - total
-    age = max(
-        0,
-        int(book_snapshot.get("captured_ms") or now_ms())
-        - int(book_snapshot.get("received_ms") or now_ms()),
-    )
-
-    with db() as c:
-        c.execute(
-            """INSERT INTO trades(
-              trade_ms,mode,strategy,condition_id,asset,outcome,signal_type,
-              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
-              cash_before,cash_after,book_age_ms,fills_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                now_ms(), "PAPER", name, cid, hedge_asset, hedge_outcome, "HEDGE",
-                filled, filled, avg, gross, fee, total,
-                cash, after, age,
-                jd([{"price": p, "shares": q} for p, q in fills]),
-            ),
-        )
-        c.execute(
-            "INSERT INTO state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (cash_key(name), str(after)),
-        )
-        c.commit()
-
-    new_cost = total_cost + total
-    new_hedge_shares = hedge_shares + filled
-    new_loss_pnl = new_hedge_shares - new_cost
-    new_win_pnl = primary_shares - new_cost
-
-    log.info(
-        "HEDGE %-16s | protect %s %.2fsh | buy %s %.2fsh @ %.4f | "
-        "lose %+.2f -> %+.2f | win %+.2f -> %+.2f | cost=%.4f",
-        name, ex["primary_outcome"], primary_shares,
-        hedge_outcome, filled, avg,
-        pnl_if_primary_loses, new_loss_pnl,
-        pnl_if_primary_wins, new_win_pnl, total,
-    )
-    return {
-        "primary_asset": primary,
-        "hedge_asset": hedge_asset,
-        "filled": filled,
-        "avg": avg,
-        "total": total,
-        "pnl_if_primary_loses_before": pnl_if_primary_loses,
-        "pnl_if_primary_loses_after": new_loss_pnl,
-        "pnl_if_primary_wins_before": pnl_if_primary_wins,
-        "pnl_if_primary_wins_after": new_win_pnl,
-    }
-
-
-def _floor_to_tick(price, tick):
-    tick = sf(tick, PAIR_DEFAULT_TICK_SIZE)
-    if tick <= 0:
-        tick = PAIR_DEFAULT_TICK_SIZE
-    if price <= 0:
-        return 0.0
-    steps = math.floor((float(price) + 1e-12) / tick)
-    value = steps * tick
-    # Avoid floating noise such as 0.33999999999999997 in logs/DB.
-    return float(f"{value:.8f}")
-
-
-def _pair_order_reserved_cash(strategy_name, exclude_order_id=None):
-    sql = """SELECT COALESCE(SUM((requested_shares-filled_shares)*limit_price),0) x
-             FROM pair_hedges
-             WHERE strategy=? AND status IN ('PENDING','PARTIAL')"""
-    params = [strategy_name]
-    if exclude_order_id is not None:
-        sql += " AND id<>?"
-        params.append(int(exclude_order_id))
-    with db() as c:
-        row = c.execute(sql, tuple(params)).fetchone()
-    return sf(row["x"] if row else 0.0)
-
-
-def _pair_visible_fok_plan(book_snapshot, wanted, max_total):
-    """Paper proxy for a full-size taker FOK hedge.
-
-    It walks current asks, includes the crypto taker fee, and succeeds only if
-    all requested shares fit inside max_total. Otherwise it returns no fill.
-    """
-    if not book_snapshot or not book_snapshot.get("asks") or wanted <= 1e-9:
-        return [], 0.0
-    rem = float(wanted)
-    fills = []
-    total = 0.0
-    for p in sorted(book_snapshot["asks"]):
-        q = sf(book_snapshot["asks"][p])
-        p = sf(p)
-        if p <= 0 or p >= 1 or q <= 1e-9:
-            continue
-        take = min(q, rem)
-        if take <= 1e-9:
-            continue
-        level_total = p * take + fee_usdc(take, p)
-        if total + level_total > max_total + 1e-9:
-            # A FOK hedge must fit the whole requested size and the profit budget.
-            return [], 0.0
-        fills.append((p, take))
-        total += level_total
-        rem -= take
-        if rem <= 1e-9:
-            break
-    if rem > 1e-8:
-        return [], 0.0
-    return fills, total
-
-
-def _insert_pair_hedge_trade(
-    strategy_name, cid, asset, outcome, signal_type, requested,
-    fills, maker, source_note="", reserved_after=0.0
-):
-    filled = sum(sf(q) for _p, q in fills)
-    if filled <= 1e-9:
-        return None
-    cash = paper_cash(strategy_name)
-    gross = sum(sf(p) * sf(q) for p, q in fills)
-    fee = 0.0 if maker else sum(fee_usdc(sf(q), sf(p)) for p, q in fills)
-    total = gross + fee
-    # Keep enough cash for other already-resting pair limits after this fill.
-    if cash - total - max(0.0, sf(reserved_after)) < MIN_FREE_CASH - 1e-8:
-        return None
-    after = cash - total
-    avg = gross / filled
-    with db() as c:
-        cur = c.execute(
-            """INSERT INTO trades(
-              trade_ms,mode,strategy,condition_id,asset,outcome,signal_type,
-              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
-              cash_before,cash_after,book_age_ms,fills_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                now_ms(), "PAPER", strategy_name, cid, asset, outcome, signal_type,
-                requested, filled, avg, gross, fee, total,
-                cash, after, 0,
-                jd([
-                    {"price": sf(p), "shares": sf(q), "maker": bool(maker)}
-                    for p, q in fills
-                ]),
-            ),
-        )
-        trade_id = cur.lastrowid
-        c.execute(
-            "INSERT INTO state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (cash_key(strategy_name), str(after)),
-        )
-        c.commit()
-    log.info(
-        "%-18s %-16s | %s %.2fsh @ %.4f | fee=%.4f | cash %.2f -> %.2f | %s",
-        signal_type, strategy_name, outcome, filled, avg, fee, cash, after, source_note,
-    )
-    return {
-        "trade_id": trade_id,
-        "filled": filled,
-        "avg": avg,
-        "gross": gross,
-        "fee": fee,
-        "total": total,
-        "cash_after": after,
-    }
-
-
-def create_pair_hedge_order(market, strategy, base_trade, tick_books):
-    """Create a resting opposite-side hedge after each actual F/G V5 fill.
-
-    F requests 100% of the base shares. G requests SMART_HEDGE_RATIO (65% by
-    default), but deliberately waits for the SAME favorable price threshold that
-    would have made a full F-style pair lock PAIR_LOCKED_PROFIT. That means G
-    gives up less upside while still harvesting favorable opposite-side prices.
-    """
-    if not strategy.get("pair_hedge") or not base_trade:
-        return None
-
-    name = strategy["name"]
-    cid = market["condition_id"]
-    base_asset = str(base_trade["asset"])
-    base_outcome = str(base_trade["outcome"])
-    base_shares = sf(base_trade["filled"])
-    base_total = sf(base_trade["total"])
-    if base_shares <= 1e-9:
-        return None
-
-    ratio = max(0.0, min(1.0, sf(strategy.get("pair_hedge_ratio"), 1.0)))
-    requested = base_shares * ratio
-    if requested <= 1e-9:
-        return None
-
-    if base_asset == str(market["up_asset"]):
-        hedge_asset, hedge_outcome = str(market["down_asset"]), "Down"
-    elif base_asset == str(market["down_asset"]):
-        hedge_asset, hedge_outcome = str(market["up_asset"]), "Up"
-    else:
-        return None
-
-    snap = tick_books["books"].get(hedge_asset)
-    if not snap or not snap.get("asks"):
-        return None
-
-    min_size = max(0.0, sf(snap.get("min_order_size"), PAIR_DEFAULT_MIN_ORDER_SIZE))
-    tick = max(1e-8, sf(snap.get("tick_size"), PAIR_DEFAULT_TICK_SIZE))
-
-    # Price threshold stays identical to F: where a hypothetical FULL equal-size
-    # pair would lock PAIR_LOCKED_PROFIT. G simply requests fewer hedge shares.
-    full_pair_budget = base_shares - base_total - PAIR_LOCKED_PROFIT
-    if full_pair_budget <= 1e-9:
-        log.info(
-            "PAIR %-16s SKIP | no favorable threshold base=%.2f cost=%.4f",
-            name, base_shares, base_total,
-        )
-        return None
-    max_maker_price = full_pair_budget / base_shares
-    maker_limit = _floor_to_tick(max_maker_price, tick)
-    if maker_limit <= 0 or maker_limit >= 1:
-        return None
-
-    if requested + 1e-9 < min_size:
-        log.info(
-            "PAIR %-16s SKIP MIN_SIZE | hedge %.2fsh < %.2fsh | base %.2fsh %s",
-            name, requested, min_size, base_shares, base_outcome,
-        )
-        with db() as c:
-            c.execute(
-                """INSERT INTO pair_hedges(
-                  created_ms,updated_ms,condition_id,strategy,base_trade_id,
-                  base_asset,base_outcome,base_signal_type,base_shares,base_total_cost,
-                  hedge_asset,hedge_outcome,requested_shares,filled_shares,
-                  limit_price,target_profit,min_order_size,tick_size,status,fill_mode,last_note
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (
-                    now_ms(), now_ms(), cid, name, base_trade["trade_id"],
-                    base_asset, base_outcome, base_trade["signal_type"], base_shares, base_total,
-                    hedge_asset, hedge_outcome, requested, 0.0,
-                    maker_limit, PAIR_LOCKED_PROFIT, min_size, tick,
-                    "SKIPPED_MIN_SIZE", "", f"ratio={ratio:.3f}",
-                ),
-            )
-            c.commit()
-        return None
-
-    cash = paper_cash(name)
-    other_reserved = _pair_order_reserved_cash(name)
-    reserved = requested * maker_limit
-    if cash - other_reserved - reserved < MIN_FREE_CASH - 1e-8:
-        log.info(
-            "PAIR %-16s SKIP CASH | reserve=%.2f new=%.2f cash=%.2f",
-            name, other_reserved, reserved, cash,
-        )
-        return None
-
-    best = best_ask_snapshot(snap)
-    created = now_ms()
-
-    # If the target is already marketable, only take it when a full requested
-    # FOK-style fill including taker fee still costs no more than maker_limit/share.
-    if best is not None and best <= maker_limit + 1e-12:
-        fok_budget = full_pair_budget if ratio >= 0.999999 else requested * maker_limit
-        fok_fills, _fok_total = _pair_visible_fok_plan(snap, requested, fok_budget)
-        if fok_fills:
-            trade = _insert_pair_hedge_trade(
-                name, cid, hedge_asset, hedge_outcome, "PAIR_HEDGE_FOK",
-                requested, fok_fills, maker=False,
-                source_note=(
-                    f"base_trade={base_trade['trade_id']} ratio={ratio:.2f} "
-                    f"ref_target=+{PAIR_LOCKED_PROFIT:.2f}"
-                ),
-                reserved_after=other_reserved,
-            )
-            if trade:
-                total_cost = base_total + trade["total"]
-                pnl_base = base_shares - total_cost
-                pnl_hedge = trade["filled"] - total_cost
-                worst_pnl = min(pnl_base, pnl_hedge)
-                with db() as c:
-                    c.execute(
-                        """INSERT INTO pair_hedges(
-                          created_ms,updated_ms,condition_id,strategy,base_trade_id,
-                          base_asset,base_outcome,base_signal_type,base_shares,base_total_cost,
-                          hedge_asset,hedge_outcome,requested_shares,filled_shares,
-                          limit_price,target_profit,min_order_size,tick_size,status,fill_mode,
-                          hedge_total_cost,locked_pnl,last_note
-                        ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                        (
-                            created, now_ms(), cid, name, base_trade["trade_id"],
-                            base_asset, base_outcome, base_trade["signal_type"], base_shares, base_total,
-                            hedge_asset, hedge_outcome, requested, trade["filled"],
-                            maker_limit, PAIR_LOCKED_PROFIT, min_size, tick,
-                            "FILLED", "FOK", trade["total"], worst_pnl,
-                            f"ratio={ratio:.3f}; base_pnl={pnl_base:+.4f}; hedge_pnl={pnl_hedge:+.4f}",
-                        ),
-                    )
-                    c.commit()
-                log.info(
-                    "PAIR FILLED %-16s | %.2f %s + %.2f %s | FOK | pnl=%+.2f/%+.2f",
-                    name, base_shares, base_outcome, trade["filled"], hedge_outcome,
-                    pnl_base, pnl_hedge,
-                )
-                return {
-                    "status": "FILLED", "mode": "FOK",
-                    "pnl_base": pnl_base, "pnl_hedge": pnl_hedge,
-                    "worst_pnl": worst_pnl,
-                }
-
-        post_only_cap = _floor_to_tick(sf(best) - tick, tick)
-        maker_limit = min(maker_limit, post_only_cap)
-
-    if maker_limit <= 0:
-        return None
-    reserved = requested * maker_limit
-    if cash - other_reserved - reserved < MIN_FREE_CASH - 1e-8:
-        return None
-
-    expected_total = base_total + reserved
-    pnl_base_if_filled = base_shares - expected_total
-    pnl_hedge_if_filled = requested - expected_total
-    worst_if_filled = min(pnl_base_if_filled, pnl_hedge_if_filled)
-    with db() as c:
-        cur = c.execute(
-            """INSERT INTO pair_hedges(
-              created_ms,updated_ms,condition_id,strategy,base_trade_id,
-              base_asset,base_outcome,base_signal_type,base_shares,base_total_cost,
-              hedge_asset,hedge_outcome,requested_shares,filled_shares,
-              limit_price,target_profit,min_order_size,tick_size,status,fill_mode,last_note
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                created, created, cid, name, base_trade["trade_id"],
-                base_asset, base_outcome, base_trade["signal_type"], base_shares, base_total,
-                hedge_asset, hedge_outcome, requested, 0.0,
-                maker_limit, PAIR_LOCKED_PROFIT, min_size, tick,
-                "PENDING", "LIMIT",
-                (
-                    f"ratio={ratio:.3f}; base_pnl={pnl_base_if_filled:+.4f}; "
-                    f"hedge_pnl={pnl_hedge_if_filled:+.4f}"
-                ),
-            ),
-        )
-        order_id = cur.lastrowid
-        c.commit()
-
-    log.info(
-        "PAIR ORDER %-16s | base #%d %.2fsh %s -> %.2fsh %s LIMIT %.4f | "
-        "pnl_if_full=%+.2f/%+.2f",
-        name, base_trade["trade_id"], base_shares, base_outcome,
-        requested, hedge_outcome, maker_limit,
-        pnl_base_if_filled, pnl_hedge_if_filled,
-    )
-    return {
-        "status": "PENDING", "order_id": order_id,
-        "limit_price": maker_limit, "requested_shares": requested,
-        "pnl_base_if_filled": pnl_base_if_filled,
-        "pnl_hedge_if_filled": pnl_hedge_if_filled,
-        "worst_if_filled": worst_if_filled,
-    }
-
-def _pair_limit_fill(order, available_asks):
-    """Consume a paper proxy of sell liquidity at/below a resting buy limit.
-
-    A real maker fill depends on queue position. This simulator deliberately
-    requires visible crossing size when PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE=1.
-    The fill is recorded at the resting limit price with zero maker fee.
-    """
-    remaining = max(0.0, sf(order["requested_shares"]) - sf(order["filled_shares"]))
-    if remaining <= 1e-9:
-        return 0.0
-
-    limit_price = sf(order["limit_price"])
-    eligible = [
-        p for p in sorted(available_asks)
-        if p <= limit_price + 1e-12 and sf(available_asks.get(p)) > 1e-9
-    ]
-    if not eligible:
-        return 0.0
-
-    if not PAIR_LIMIT_FILL_REQUIRE_VISIBLE_SIZE:
-        return remaining
-
-    fillable = sum(sf(available_asks[p]) for p in eligible)
-    return min(remaining, fillable)
-
-
-def process_pair_hedges_for_market(market, strategy_name):
-    """Fast PAPER fill engine for one strategy's resting pair hedge limits."""
-    cid = market["condition_id"]
-
-    if now_ts() >= int(market["end_ts"]):
-        with db() as c:
-            c.execute(
-                """UPDATE pair_hedges
-                   SET status='EXPIRED',updated_ms=?,last_note='market ended'
-                   WHERE condition_id=? AND strategy=? AND status IN ('PENDING','PARTIAL')""",
-                (now_ms(), cid, strategy_name),
-            )
-            c.commit()
-        return 0
-
-    with db() as c:
-        orders = c.execute(
-            """SELECT * FROM pair_hedges
-               WHERE condition_id=? AND strategy=?
-                 AND status IN ('PENDING','PARTIAL')
-               ORDER BY hedge_asset,limit_price DESC,created_ms,id""",
-            (cid, strategy_name),
-        ).fetchall()
-    if not orders:
-        return 0
-
-    # Each PAPER strategy is an alternative experiment, so F and G each get
-    # their own copy of displayed liquidity. Orders within ONE strategy cannot
-    # double-claim the same displayed size in the same pass.
-    liquidity = {}
-    for asset in {str(r["hedge_asset"]) for r in orders}:
-        b = books.get(asset)
-        if not b or not b.get("asks"):
-            continue
-        if now_ms() - int(b.get("received_ms") or 0) > MAX_BOOK_AGE_MS:
-            continue
-        liquidity[asset] = {sf(pp): sf(qq) for pp, qq in b["asks"].items() if sf(qq) > 1e-9}
-
-    fills_done = 0
-    for order in orders:
-        asset = str(order["hedge_asset"])
-        available = liquidity.get(asset)
-        if not available:
-            continue
-        fill_qty = _pair_limit_fill(order, available)
-        if fill_qty <= 1e-9:
-            continue
-
-        left = fill_qty
-        for pp in sorted(available):
-            if pp > sf(order["limit_price"]) + 1e-12 or left <= 1e-9:
-                break
-            take = min(sf(available[pp]), left)
-            available[pp] = max(0.0, sf(available[pp]) - take)
-            left -= take
-
-        limit_price = sf(order["limit_price"])
-        other_reserved = _pair_order_reserved_cash(strategy_name, exclude_order_id=order["id"])
-        remaining_after = max(
-            0.0,
-            sf(order["requested_shares"]) - sf(order["filled_shares"]) - fill_qty,
-        )
-        reserved_after = other_reserved + remaining_after * limit_price
-        trade = _insert_pair_hedge_trade(
-            strategy_name, cid, asset, str(order["hedge_outcome"]),
-            "PAIR_HEDGE_LIMIT", fill_qty, [(limit_price, fill_qty)], maker=True,
-            source_note=f"pair_order={order['id']} base_trade={order['base_trade_id']}",
-            reserved_after=reserved_after,
-        )
-        if not trade:
-            continue
-
-        new_filled = sf(order["filled_shares"]) + trade["filled"]
-        status = "FILLED" if new_filled >= sf(order["requested_shares"]) - 1e-8 else "PARTIAL"
-        new_hedge_total_cost = sf(order["hedge_total_cost"]) + trade["total"]
-        total_cost = sf(order["base_total_cost"]) + new_hedge_total_cost
-        pnl_base = sf(order["base_shares"]) - total_cost
-        pnl_hedge = new_filled - total_cost
-        worst_pnl = min(pnl_base, pnl_hedge)
-
-        with db() as c:
-            c.execute(
-                """UPDATE pair_hedges
-                   SET filled_shares=?,status=?,updated_ms=?,fill_mode='LIMIT',
-                       hedge_total_cost=?,locked_pnl=?,last_note=?
-                   WHERE id=?""",
-                (
-                    new_filled, status, now_ms(), new_hedge_total_cost, worst_pnl,
-                    f"base_pnl={pnl_base:+.4f}; hedge_pnl={pnl_hedge:+.4f}", order["id"],
-                ),
-            )
-            c.commit()
-        fills_done += 1
-        log.info(
-            "PAIR %s %-16s | order=%d %.2f/%.2fsh %s @ %.4f | pnl=%+.2f/%+.2f",
-            status, strategy_name, order["id"], new_filled,
-            sf(order["requested_shares"]), order["hedge_outcome"], limit_price,
-            pnl_base, pnl_hedge,
-        )
-    return fills_done
-
-
-async def pair_hedge_loop():
-    """Fast checker for F/G resting limits plus G emergency market risk cap."""
-    while True:
-        try:
-            pair_strategies = [s for s in STRATEGIES if s.get("pair_hedge")]
-            smart_strategies = [s for s in STRATEGIES if s.get("smart_risk_cap")]
-            for market in list(markets.values()):
-                if market.get("resolved"):
-                    continue
-                for strategy in pair_strategies:
-                    process_pair_hedges_for_market(market, strategy["name"])
-                for strategy in smart_strategies:
-                    maybe_execute_smart_risk_cap(market, strategy)
-        except Exception:
-            log.exception("Pair/smart hedge loop failed")
-        await asyncio.sleep(max(0.05, PAIR_HEDGE_CHECK_INTERVAL))
-
-
-def smart_order_size(strategy, price):
-    """Actual PAPER order size for G; all other strategies keep ORDER_SIZE."""
-    if not strategy.get("smart_size"):
-        return ORDER_SIZE
-    p = sf(price)
-    if p <= SMART_SIZE_1_MAX_PRICE:
-        return SMART_SIZE_1_SHARES
-    if p <= SMART_SIZE_2_MAX_PRICE:
-        return SMART_SIZE_2_SHARES
-    if p <= SMART_SIZE_3_MAX_PRICE:
-        return SMART_SIZE_3_SHARES
-    if p <= SMART_SIZE_4_MAX_PRICE:
-        return SMART_SIZE_4_SHARES
-    return 0.0
-
-
-def _trim_fills_to_shares(fills, wanted):
-    rem = max(0.0, sf(wanted))
-    out = []
-    for p, q in fills:
-        if rem <= 1e-9:
-            break
-        take = min(sf(q), rem)
-        if take > 1e-9:
-            out.append((sf(p), take))
-            rem -= take
-    return out, max(0.0, sf(wanted) - rem)
-
-
-def _smart_market_pnls(strategy_name, market):
-    ex = paper_market_exposure(strategy_name, market["condition_id"])
-    total_cost = sf(ex["total_cost"])
-    up = sf(ex["shares"].get(str(market["up_asset"]), 0.0))
-    down = sf(ex["shares"].get(str(market["down_asset"]), 0.0))
-    return ex, up - total_cost, down - total_cost
-
-
-def _smart_normal_shares(strategy_name, cid):
-    with db() as c:
-        row = c.execute(
-            """SELECT COALESCE(SUM(filled_shares),0) sh
-               FROM trades
-               WHERE mode='PAPER' AND strategy=? AND condition_id=?
-                 AND signal_type NOT LIKE '%HEDGE%'""",
-            (strategy_name, cid),
-        ).fetchone()
-    return sf(row["sh"] if row else 0.0)
-
-
-def _reduce_pending_pair_orders(strategy_name, cid, hedge_asset, qty):
-    """Replace future resting hedge quantity with already executed risk-cap shares."""
-    left = max(0.0, sf(qty))
-    if left <= 1e-9:
-        return 0.0
-    reduced = 0.0
-    with db() as c:
-        rows = c.execute(
-            """SELECT * FROM pair_hedges
-               WHERE strategy=? AND condition_id=? AND hedge_asset=?
-                 AND status IN ('PENDING','PARTIAL')
-               ORDER BY limit_price DESC,created_ms,id""",
-            (strategy_name, cid, hedge_asset),
-        ).fetchall()
-        for r in rows:
-            if left <= 1e-9:
-                break
-            remaining = max(0.0, sf(r["requested_shares"]) - sf(r["filled_shares"]))
-            if remaining <= 1e-9:
-                continue
-            cut = min(remaining, left)
-            new_requested = sf(r["requested_shares"]) - cut
-            remaining_after = max(0.0, new_requested - sf(r["filled_shares"]))
-            min_size = max(0.0, sf(r["min_order_size"], 0.0))
-            if remaining_after <= 1e-8 or (min_size > 0 and remaining_after < min_size - 1e-8):
-                # A live cancel/replace cannot leave an invalid sub-minimum remainder.
-                new_requested = sf(r["filled_shares"])
-                status = "CANCELLED_RISK_CAP"
-            else:
-                status = str(r["status"])
-            c.execute(
-                """UPDATE pair_hedges
-                   SET requested_shares=?,status=?,updated_ms=?,
-                       last_note=COALESCE(last_note,'') || ?
-                   WHERE id=?""",
-                (
-                    new_requested, status, now_ms(),
-                    f"; risk_cap_replaced={cut:.4f}", r["id"],
-                ),
-            )
-            left -= cut
-            reduced += cut
-        c.commit()
-    return reduced
-
-
-def maybe_execute_smart_risk_cap(market, strategy):
-    """G emergency market-level risk cap toward -SMART_MAX_LOSS."""
-    if not strategy.get("smart_risk_cap"):
-        return None
-    name = strategy["name"]
-    cid = market["condition_id"]
-    if _smart_normal_shares(name, cid) + 1e-8 < SMART_RISK_START_SHARES:
-        return None
-
-    _ex, pnl_up, pnl_down = _smart_market_pnls(name, market)
-    target = -abs(SMART_MAX_LOSS)
-    worst = min(pnl_up, pnl_down)
-    best = max(pnl_up, pnl_down)
-    if worst >= target - 1e-6:
-        return None
-
-    if pnl_up <= pnl_down:
-        hedge_asset, hedge_outcome = str(market["up_asset"]), "Up"
-    else:
-        hedge_asset, hedge_outcome = str(market["down_asset"]), "Down"
-
-    b = books.get(hedge_asset)
-    if not b or not b.get("asks"):
-        return None
-    if now_ms() - int(b.get("received_ms") or 0) > MAX_BOOK_AGE_MS:
-        return None
-    snap = {
-        "asks": dict(b.get("asks") or {}),
-        "bids": dict(b.get("bids") or {}),
-        "received_ms": int(b.get("received_ms") or now_ms()),
-        "captured_ms": now_ms(),
-        "min_order_size": sf(b.get("min_order_size"), PAIR_DEFAULT_MIN_ORDER_SIZE),
-        "tick_size": sf(b.get("tick_size"), PAIR_DEFAULT_TICK_SIZE),
-    }
-
-    needed = target - worst
-    reserved = _pair_order_reserved_cash(name)
-    cash = paper_cash(name)
-    upside_budget = max(0.0, best - SMART_MIN_UPSIDE)
-    cash_budget = max(0.0, cash - MIN_FREE_CASH - reserved)
-    max_total = min(upside_budget, cash_budget)
-    if max_total <= 1e-9:
-        return None
-
-    fills, _spent, _improved = _hedge_plan_from_snapshot(snap, needed, max_total)
-    planned = sum(sf(q) for _p, q in fills)
-    market_min = max(
-        SMART_RISK_MIN_ORDER_SHARES,
-        sf(snap.get("min_order_size"), PAIR_DEFAULT_MIN_ORDER_SIZE),
-    )
-    if planned + 1e-9 < market_min:
-        return None
-
-    gross = sum(sf(pp) * sf(qq) for pp, qq in fills)
-    fee = sum(fee_usdc(sf(qq), sf(pp)) for pp, qq in fills)
-    total = gross + fee
-    filled = sum(sf(qq) for _pp, qq in fills)
-    if filled <= 1e-9 or total > max_total + 1e-8:
-        return None
-
-    after = cash - total
-    avg = gross / filled
-    with db() as c:
-        c.execute(
-            """INSERT INTO trades(
-              trade_ms,mode,strategy,condition_id,asset,outcome,signal_type,
-              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
-              cash_before,cash_after,book_age_ms,fills_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                now_ms(), "PAPER", name, cid, hedge_asset, hedge_outcome,
-                "SMART_RISK_HEDGE", filled, filled, avg, gross, fee, total,
-                cash, after, max(0, now_ms() - int(snap["received_ms"])),
-                jd([{"price": sf(pp), "shares": sf(qq)} for pp, qq in fills]),
-            ),
-        )
-        c.execute(
-            "INSERT INTO state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (cash_key(name), str(after)),
-        )
-        c.commit()
-
-    replaced = _reduce_pending_pair_orders(name, cid, hedge_asset, filled)
-    _ex2, new_up, new_down = _smart_market_pnls(name, market)
-    log.info(
-        "SMART RISK %-16s | buy %s %.2fsh @ %.4f | worst %+.2f -> %+.2f | "
-        "best %+.2f -> %+.2f | replaced_pending=%.2f",
-        name, hedge_outcome, filled, avg, worst, min(new_up, new_down),
-        best, max(new_up, new_down), replaced,
-    )
-    return {
-        "filled": filled, "avg": avg, "total": total,
-        "worst_before": worst, "worst_after": min(new_up, new_down),
-        "best_before": best, "best_after": max(new_up, new_down),
-        "replaced_pending": replaced,
-    }
-
-def paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base):
-    name = strategy["name"]
-
-    if typ == "PYRAMID" and not paper_has_asset_position(name, cid, asset):
-        log.warning(
-            "PAPER %-16s SKIP PYRAMID %-4s | no actual PAPER position",
-            name, outcome,
-        )
-        return None
-
-    desired = smart_order_size(strategy, base["avg"])
-    if desired <= 1e-9:
-        log.info(
-            "PAPER %-16s SMART SKIP | %-7s %-4s | base_avg=%.4f > max %.2f",
-            name, typ, outcome, base["avg"], SMART_SIZE_4_MAX_PRICE,
-        )
-        return None
-
-    fills, filled = _trim_fills_to_shares(base["fills"], min(desired, base["filled"]))
-    if filled <= 1e-9:
-        return None
-    theoretical_total = sum(pp * qq for pp, qq in fills) + sum(fee_usdc(qq, pp) for pp, qq in fills)
-
-    cash = paper_cash(name)
-    reserved = _pair_order_reserved_cash(name) if strategy.get("pair_hedge") else 0.0
-    available = max(0.0, cash - MIN_FREE_CASH - reserved)
-    cash_limited = theoretical_total > available + 1e-8
-    if cash_limited:
-        fills, filled = _trim_baseline_fills_to_budget(fills, available)
-    if filled <= 1e-8:
-        log.warning(
-            "PAPER %-16s CASH BLOCK %s %s | cash=%.2f reserved=%.2f available=%.2f",
-            name, typ, outcome, cash, reserved, available,
-        )
-        return None
-
-    gross = sum(pp * qq for pp, qq in fills)
-    fee = sum(fee_usdc(qq, pp) for pp, qq in fills)
-    total = gross + fee
-    avg = gross / filled
-    after = cash - total
-
-    with db() as c:
-        cur = c.execute(
-            """INSERT INTO trades(
-              trade_ms,mode,strategy,condition_id,asset,outcome,signal_type,
-              requested_shares,filled_shares,avg_price,gross_cost,fee,total_cost,
-              cash_before,cash_after,book_age_ms,fills_json
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (
-                now_ms(), "PAPER", name, cid, asset, outcome, typ,
-                desired, filled, avg, gross, fee, total,
-                cash, after, base["age"],
-                jd([{"price": pp, "shares": qq} for pp, qq in fills]),
-            ),
-        )
-        trade_id = cur.lastrowid
-        c.execute(
-            "INSERT INTO state(key,value) VALUES(?,?) "
-            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            (cash_key(name), str(after)),
-        )
-        c.commit()
-
-    suffix = " CASH_LIMITED" if cash_limited else ""
-    size_note = f" target={desired:.2f}sh" if strategy.get("smart_size") else ""
-    log.info(
-        "PAPER %-16s%s | %-7s %-4s | %.2fsh @ %.4f | cost=%.4f | "
-        "cash %.2f -> %.2f | reserved=%.2f%s",
-        name, suffix, typ, outcome, filled, avg, total, cash, after, reserved, size_note,
-    )
-    return {
-        "trade_id": trade_id, "asset": asset, "outcome": outcome,
-        "signal_type": typ, "requested": desired, "filled": filled,
-        "avg": avg, "gross": gross, "fee": fee, "total": total,
-        "cash_before": cash, "cash_after": after, "cash_limited": cash_limited,
-    }
-
-def candidate_for_strategy(cid, strategy, elapsed, tick_books):
-    """
-    Pure signal-selection step. It mirrors the old research evaluate_variant:
-    one strongest-momentum candidate per strategy per decision tick.
-    """
-    entry_cutoff_sec = strategy.get("entry_cutoff_sec")
-    if entry_cutoff_sec is not None and elapsed > float(entry_cutoff_sec):
-        return None
-
-    st = get_st(cid, strategy["name"])
-    allow_switch = bool(strategy.get("allow_switch", True))
-    entry_price_min = strategy.get("entry_price_min")
-    entry_price_max = strategy.get("entry_price_max")
-    momentum_cap = strategy.get("momentum_cap")
-    primary_asset = st.get("primary_asset")
-
-    candidates = []
-
-    for asset, outcome in tick_books["sides"]:
-        snap = tick_books["books"].get(asset)
-        ask = best_ask_snapshot(snap)
+    for asset, outcome in ((market["up_asset"], "Up"), (market["down_asset"], "Down")):
+        ask = best_ask(asset)
         if ask is None or ask < MIN_PRICE or ask > MAX_PRICE:
             continue
-
-        mom, ref = momentum_for(cid, asset, strategy["lookback"])
+        mom, ref = momentum_for(cid, asset, variant["lookback"])
         if mom is None:
             continue
+        if mom >= variant["entry_move"]:
+            out.append((mom, asset, outcome, ask, ref))
+    out.sort(reverse=True, key=lambda x: x[0])
+    return out
 
-        buys = st["buys"][asset]
-        signal = None
 
-        if buys == 0:
-            if not st["started_sides"]:
-                if entry_price_min is not None and ask < float(entry_price_min):
-                    continue
-                if entry_price_max is not None and ask > float(entry_price_max):
-                    continue
-                if momentum_cap is not None and mom > float(momentum_cap):
-                    continue
-
-                if mom >= strategy["entry_move"]:
-                    signal = "ENTRY"
-
-            else:
-                if not allow_switch:
-                    continue
-
-                switch_price_max = strategy.get("switch_price_max")
-                if switch_price_max is not None and ask > float(switch_price_max):
-                    continue
-
-                if strategy.get("dynamic_switch_v5"):
-                    if elapsed <= 60.0 and ask > 0.45:
-                        continue
-                    if elapsed > 60.0:
-                        if 0.45 < ask <= 0.50 and mom >= 0.10:
-                            continue
-                        if 0.50 < ask <= 0.70:
-                            continue
-
-                if mom >= strategy["switch_move"]:
-                    signal = "SWITCH"
-
-        else:
-            if not allow_switch and primary_asset is not None and asset != primary_asset:
-                continue
-
-            if momentum_cap is not None and mom > float(momentum_cap):
-                continue
-
-            last_buy = st["last_buy"].get(asset)
-            if (
-                last_buy is not None
-                and ask >= last_buy + strategy["pyramid_step"]
-                and mom > 0
-                and buys < strategy["max_buys_side"]
-            ):
-                signal = "PYRAMID"
-
-        if signal:
-            candidates.append((mom, asset, outcome, ask, ref, signal))
-
-    if not candidates:
-        return None
-
-    candidates.sort(reverse=True, key=lambda x: x[0])
-    mom, asset, outcome, ask, ref, signal = candidates[0]
-    return {
-        "mom": mom,
-        "asset": asset,
-        "outcome": outcome,
-        "ask": ask,
-        "ref": ref,
-        "signal": signal,
-    }
-
-def evaluate_strategy(market, strategy, elapsed, tick_books, binance_core):
+async def evaluate_variant(market, variant, elapsed):
     cid = market["condition_id"]
-    candidate = candidate_for_strategy(cid, strategy, elapsed, tick_books)
-    if not candidate:
-        return
+    st = get_variant_state(cid, variant)
 
-    asset = candidate["asset"]
-    outcome = candidate["outcome"]
-    typ = candidate["signal"]
+    # ---------------- FIRST-SIGNAL GATE ----------------
+    # The FIRST qualifying raw M03 signal decides whether this market is allowed.
+    # A low-price first signal is NOT allowed to "wait" until price later rises
+    # into the good band. That was the key rule from the archive analysis.
+    if not st["gate_decided"] and not st["started_sides"]:
+        raw = _raw_first_signal_candidates(market, variant)
+        if not raw:
+            return
 
-    # Base strategy advances first, independently of CONF65.
-    base = execute_baseline_from_snapshot(
-        cid,
-        strategy,
-        asset,
-        outcome,
-        typ,
-        tick_books["books"][asset],
-    )
-    if not base:
-        return
+        mom, asset, outcome, ask, ref = raw[0]
+        price_ok = variant["entry_price_min"] <= ask <= variant["entry_price_max"]
+        st["gate_decided"] = True
+        st["gate_passed"] = bool(price_ok)
+        st["gate_asset"] = asset if price_ok else None
 
-    # Every strategy sees the same Binance core snapshot for this market tick.
-    f = features_for_signal(binance_core, outcome, candidate["ask"])
-    accepted, shadow_reason = exact_shadow_decision(
-        cid, strategy["name"], asset, typ, f
-    )
-    reason = (
-        f"{shadow_reason};regime={f['regime']};age={f['data_age_ms']}ms;"
-        f"base_avg={base['avg']:.4f}"
-    )
+        if ask < variant["entry_price_min"]:
+            reason = "FIRST_SIGNAL_PRICE_LOW"
+        elif ask > variant["entry_price_max"]:
+            reason = "FIRST_SIGNAL_PRICE_HIGH"
+        else:
+            reason = "FIRST_SIGNAL_PRICE_OK"
 
-    store_signal(
-        cid,
-        strategy["name"],
-        asset,
-        outcome,
-        typ,
-        candidate["ask"],
-        candidate["ref"],
-        candidate["mom"],
-        elapsed,
-        f,
-        accepted,
-        reason,
-    )
-
-    if not accepted:
+        store_gate_decision(cid, asset, outcome, ask, ref, mom, elapsed, price_ok, reason)
         log.info(
-            "BLOCK %-16s | %-7s %-4s | %s",
-            strategy["name"], typ, outcome, reason,
+            "GATE %s | %s %.3f mom=%+.3f | %s",
+            cid[-6:], outcome, ask, mom, "PASS" if price_ok else f"SKIP {reason}",
         )
+
+        if not price_ok:
+            return
+
+    # Once rejected, the market remains blacklisted forever.
+    if st["gate_decided"] and not st["gate_passed"]:
         return
 
-    paper_trade = paper_execute_from_baseline(strategy, cid, asset, outcome, typ, base)
-    if paper_trade and strategy.get("pair_hedge"):
-        create_pair_hedge_order(market, strategy, paper_trade, tick_books)
+    # ---------------- ENTRY ----------------
+    if not st["started_sides"]:
+        # Gate passed based on the first signal's side. Do not switch to the other
+        # side before the initial fill.
+        asset = st.get("gate_asset")
+        if not asset:
+            return
+        outcome = "Up" if asset == market["up_asset"] else "Down"
+        ask = best_ask(asset)
+        if ask is None or not (variant["entry_price_min"] <= ask <= variant["entry_price_max"]):
+            return
+        mom, ref = momentum_for(cid, asset, variant["lookback"])
+        if mom is None or mom < variant["entry_move"]:
+            return
+        if variant.get("momentum_cap") is not None and mom > variant["momentum_cap"]:
+            return
+
+        store_signal(cid, variant, asset, outcome, ask, ref, mom, "ENTRY", elapsed)
+        filled = await execute_paper(cid, variant, asset, outcome, "ENTRY")
+        if filled:
+            st["primary_asset"] = asset
+        return
+
+    # ---------------- PYRAMID ----------------
+    # Locked direction: only the original side may be added, and total buys are
+    # capped at 2 (ENTRY + one PYRAMID).
+    asset = st.get("primary_asset")
+    if not asset:
+        return
+    buys = st["buys"][asset]
+    if buys >= variant["max_buys_side"]:
+        return
+
+    ask = best_ask(asset)
+    if ask is None or ask < MIN_PRICE or ask > MAX_PRICE:
+        return
+    mom, ref = momentum_for(cid, asset, variant["lookback"])
+    if mom is None or mom <= 0:
+        return
+    if variant.get("momentum_cap") is not None and mom > variant["momentum_cap"]:
+        return
+
+    last_buy = st["last_buy"].get(asset)
+    if last_buy is None or ask < last_buy + variant["pyramid_step"]:
+        return
+
+    outcome = "Up" if asset == market["up_asset"] else "Down"
+    store_signal(cid, variant, asset, outcome, ask, ref, mom, "PYRAMID", elapsed)
+    await execute_paper(cid, variant, asset, outcome, "PYRAMID")
+
 
 async def strategy_loop():
-    """
-    A/B/C/E/F/G fairness:
-      * one 3-second scheduler for the six normal strategy variants;
-      * one captured Polymarket order-book snapshot per market/tick;
-      * one Binance core-feature snapshot per market/tick;
-      * six independent base states;
-      * six independent CONF65 shadow states;
-      * six independent $500 PAPER accounts;
-      * E's loss-floor HEDGE executes after the normal V5 decision;
-      * F/G resting pair limits and G risk cap are checked separately at high frequency.
-    """
     while True:
         started = time.monotonic()
         n = time.time()
-
         try:
             for cid, market in list(markets.items()):
                 elapsed = n - market["start_ts"]
 
-                if not (-30 <= elapsed <= 310):
+                if -30 <= elapsed <= 310:
+                    for asset in (market["up_asset"], market["down_asset"]):
+                        ask = best_ask(asset)
+                        if ask is not None:
+                            price_history[cid][asset].append((now_ms(), ask))
+
+                if elapsed < 0 or elapsed > TRADE_WINDOW_SECONDS:
+                    continue
+                if best_ask(market["up_asset"]) is None or best_ask(market["down_asset"]) is None:
                     continue
 
-                # Refresh both books before capturing the common tick snapshot.
-                for asset in (market["up_asset"], market["down_asset"]):
-                    await ensure_book(asset)
-
-                captured_ms = now_ms()
-                up_snap = snapshot_book(market["up_asset"], captured_ms)
-                down_snap = snapshot_book(market["down_asset"], captured_ms)
-                if not up_snap or not down_snap:
-                    continue
-
-                sides = [
-                    (market["up_asset"], "Up"),
-                    (market["down_asset"], "Down"),
-                ]
-                tick_books = {
-                    "captured_ms": captured_ms,
-                    "sides": sides,
-                    "books": {
-                        market["up_asset"]: up_snap,
-                        market["down_asset"]: down_snap,
-                    },
-                }
-
-                # One price-history observation shared by all strategies.
-                for asset, _outcome in sides:
-                    ask = best_ask_snapshot(tick_books["books"][asset])
-                    if ask is not None:
-                        price_history[cid][asset].append((captured_ms, ask))
-
-                if not trading_enabled() or elapsed < 0 or elapsed > TRADE_WINDOW_SECONDS:
-                    continue
-
-                # One Binance feature capture shared by all six candidates.
-                core = binance_core_snapshot(cid, market)
-
-                # No await inside evaluations: all six use this same tick snapshot.
-                for strategy in STRATEGIES:
-                    evaluate_strategy(market, strategy, elapsed, tick_books, core)
-
-                # E risk management is deliberately separate from V5 signal state.
-                # It can also top up a previously partial hedge when the book improves.
-                for strategy in STRATEGIES:
-                    if strategy.get("risk_hedge"):
-                        maybe_execute_hedge(market, strategy, tick_books)
-
+                await evaluate_variant(market, STRATEGY, elapsed)
         except Exception:
             log.exception("Strategy loop failed")
 
-        await asyncio.sleep(max(0.05, DECISION_INTERVAL - (time.monotonic() - started)))
+        spent = time.monotonic() - started
+        await asyncio.sleep(max(0.05, DECISION_INTERVAL - spent))
+
 
 # ============================================================
-# Settlement / independent balances
+# RESOLUTION
 # ============================================================
 
-def resolve_winner(row):
-    outcomes = [str(x) for x in parse_jsonish(row.get("outcomes"))]
-    tokens = [str(x) for x in parse_jsonish(row.get("clobTokenIds"))]
-    prices = [sf(x, -1) for x in parse_jsonish(row.get("outcomePrices"))]
-    if len(outcomes) >= 2 and len(tokens) >= 2 and len(prices) >= 2:
-        i = max(range(len(prices)), key=lambda j: prices[j])
-        others = [prices[j] for j in range(len(prices)) if j != i]
-        if (
-            prices[i] >= .999
-            and max(others or [-1]) <= .001
-            and bool(row.get("closed", False) or row.get("resolved", False) or prices[i] >= .9999)
-        ):
-            return tokens[i], outcomes[i]
+async def settle_from_resolution(ev):
+    cid = str(ev.get("market") or ev.get("condition_id") or "")
+    winning_asset = str(ev.get("winning_asset_id") or ev.get("winning_asset") or "")
+    winning_outcome = str(ev.get("winning_outcome") or "")
+    if cid and winning_asset:
+        await settle_market(cid, winning_asset, winning_outcome)
+
+
+async def settle_market(cid, winning_asset, winning_outcome):
+    async with settle_lock:
+        market = markets.get(cid)
+        if not market:
+            with db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM discovered_markets WHERE condition_id=?", (cid,)
+                ).fetchone()
+                if not row:
+                    return
+                market = dict(row)
+
+        with db() as conn:
+            exists = conn.execute(
+                "SELECT 1 FROM market_results WHERE condition_id=? AND variant=?",
+                (cid, STRATEGY_NAME),
+            ).fetchone()
+            if exists:
+                return
+
+            rows = conn.execute(
+                "SELECT * FROM paper_trades WHERE condition_id=? AND variant=?",
+                (cid, STRATEGY_NAME),
+            ).fetchall()
+            total_cost = sum(sf(r["total_cost"]) for r in rows)
+            payout = sum(sf(r["filled_shares"]) for r in rows if str(r["asset"]) == winning_asset)
+            pnl = payout - total_cost
+            up_shares = sum(sf(r["filled_shares"]) for r in rows if str(r["asset"]) == market["up_asset"])
+            down_shares = sum(sf(r["filled_shares"]) for r in rows if str(r["asset"]) == market["down_asset"])
+
+            conn.execute("""
+                INSERT INTO market_results(
+                    condition_id,variant,winning_asset,winning_outcome,total_cost,
+                    payout,pnl,trades,up_shares,down_shares,settled_ms
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            """, (
+                cid, STRATEGY_NAME, winning_asset, winning_outcome,
+                total_cost, payout, pnl, len(rows), up_shares, down_shares, now_ms(),
+            ))
+            conn.execute("""
+                UPDATE discovered_markets
+                SET resolved=1,winning_asset=?,winning_outcome=?
+                WHERE condition_id=?
+            """, (winning_asset, winning_outcome, cid))
+            conn.commit()
+
+        log.info(
+            "RESOLVED %s | winner=%s | trades=%d | pnl=%+.2f",
+            market.get("question", cid), winning_outcome or winning_asset[-8:], len(rows), pnl,
+        )
+
+
+def resolve_winner_from_market(market_row):
+    if not isinstance(market_row, dict):
+        return None, None
+    outcomes = [str(x) for x in parse_jsonish(market_row.get("outcomes"))]
+    tokens = [str(x) for x in parse_jsonish(market_row.get("clobTokenIds"))]
+    prices_raw = parse_jsonish(market_row.get("outcomePrices"))
+
+    if len(outcomes) >= 2 and len(tokens) >= 2 and len(prices_raw) >= 2:
+        prices = [sf(x, -1) for x in prices_raw]
+        best_idx = max(range(len(prices)), key=lambda i: prices[i])
+        best = prices[best_idx]
+        others = [prices[i] for i in range(len(prices)) if i != best_idx]
+        second = max(others) if others else -1
+        closed = bool(market_row.get("closed", False))
+        resolved_flag = bool(
+            market_row.get("resolved", False)
+            or market_row.get("umaResolutionStatus") == "resolved"
+        )
+        if best >= 0.999 and second <= 0.001 and (closed or resolved_flag or best >= 0.9999):
+            return tokens[best_idx], outcomes[best_idx]
+
+    token_objs = market_row.get("tokens")
+    if isinstance(token_objs, list):
+        for tok in token_objs:
+            if isinstance(tok, dict) and bool(tok.get("winner", False)):
+                asset = str(tok.get("token_id") or tok.get("tokenId") or tok.get("id") or "")
+                outcome = str(tok.get("outcome") or tok.get("name") or "")
+                if asset:
+                    return asset, outcome
     return None, None
 
-async def settle_from_ws(ev):
-    cid = str(ev.get("market") or ev.get("condition_id") or "")
-    win = str(ev.get("winning_asset_id") or ev.get("winning_asset") or "")
-    out = str(ev.get("winning_outcome") or "")
-    if cid and win:
-        await settle_market(cid, win, out)
 
-async def settle_market(cid, win, out):
-    async with settle_lock:
-        settled = []
+async def fetch_resolved_market_by_slug(slug, condition_id):
+    event = await fetch_event_by_slug(slug)
+    if not isinstance(event, dict) or not isinstance(event.get("markets"), list):
+        return None
+    embedded = event["markets"]
+    for m in embedded:
+        if isinstance(m, dict):
+            cid = str(m.get("conditionId") or m.get("condition_id") or "")
+            if cid == str(condition_id):
+                return m
+    if len(embedded) == 1 and isinstance(embedded[0], dict):
+        return embedded[0]
+    return None
 
-        with db() as c:
-            c.execute(
-                """UPDATE pair_hedges
-                   SET status='EXPIRED',updated_ms=?,last_note='market settled'
-                   WHERE condition_id=? AND status IN ('PENDING','PARTIAL')""",
-                (now_ms(), cid),
-            )
-            for strategy in STRATEGIES:
-                name = strategy["name"]
 
-                existing = c.execute(
-                    "SELECT 1 FROM results WHERE condition_id=? AND strategy=? AND mode='PAPER'",
-                    (cid, name),
-                ).fetchone()
-                if existing:
-                    continue
-
-                rows = c.execute(
-                    """SELECT * FROM trades
-                       WHERE condition_id=? AND strategy=? AND mode='PAPER'""",
-                    (cid, name),
-                ).fetchall()
-
-                cost = sum(sf(r["total_cost"]) for r in rows)
-                payout = sum(
-                    sf(r["filled_shares"])
-                    for r in rows
-                    if str(r["asset"]) == win
-                )
-                pnl = payout - cost
-                cash = paper_cash(name)
-                after = cash + payout
-
-                c.execute(
-                    """INSERT INTO results(
-                      condition_id,strategy,mode,winning_asset,winning_outcome,
-                      total_cost,payout,pnl,trades,settled_ms
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?)""",
-                    (
-                        cid, name, "PAPER", win, out,
-                        cost, payout, pnl, len(rows), now_ms(),
-                    ),
-                )
-                c.execute(
-                    "INSERT INTO state(key,value) VALUES(?,?) "
-                    "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                    (cash_key(name), str(after)),
-                )
-                settled.append((strategy, pnl, after, len(rows)))
-
-            c.execute(
-                """UPDATE markets
-                   SET resolved=1,winning_asset=?,winning_outcome=?
-                   WHERE condition_id=?""",
-                (win, out, cid),
-            )
-            c.commit()
-
-        if settled:
-            for strategy, pnl, after, trades_n in settled:
-                log.info(
-                    "SETTLED %-16s | winner=%s | trades=%d | pnl=%+.2f | cash=%.2f",
-                    strategy["name"], out, trades_n, pnl, after,
-                )
-
-            if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-                lines = [f"✅ MARKET SETTLED | Winner: {out}", ""]
-                for strategy, pnl, after, trades_n in settled:
-                    lines.extend([
-                        f"{strategy['short']}",
-                        f"PnL: ${pnl:+.2f} | Cash: ${after:.2f} | Trades: {trades_n}",
-                        "",
-                    ])
-                await tg_send("\n".join(lines).strip())
-
-async def resolution_loop():
+async def resolution_fallback_loop():
     while True:
         try:
             cutoff = now_ts() - 10
-            with db() as c:
-                rows = c.execute(
-                    """SELECT * FROM markets
-                       WHERE resolved=0 AND end_ts<?
-                       ORDER BY end_ts LIMIT 50""",
-                    (cutoff,),
-                ).fetchall()
+            with db() as conn:
+                rows = conn.execute("""
+                    SELECT condition_id,slug,question,end_ts
+                    FROM discovered_markets
+                    WHERE resolved=0 AND end_ts<?
+                    ORDER BY end_ts LIMIT 50
+                """, (cutoff,)).fetchall()
 
-            for r in rows:
-                ev = await fetch_event_by_slug(r["slug"])
-                if not ev or not isinstance(ev.get("markets"), list):
+            for row in rows:
+                cid = str(row["condition_id"])
+                slug = str(row["slug"] or "")
+                if not slug:
                     continue
-                raw = next(
-                    (
-                        x for x in ev["markets"]
-                        if str(x.get("conditionId") or "") == r["condition_id"]
-                    ),
-                    None,
-                )
-                if raw is None and len(ev["markets"]) == 1:
-                    raw = ev["markets"][0]
-                if not raw:
+                m = await fetch_resolved_market_by_slug(slug, cid)
+                if not m:
                     continue
-                win, out = resolve_winner(raw)
-                if win:
-                    await settle_market(r["condition_id"], win, out)
-
+                winning_asset, winning_outcome = resolve_winner_from_market(m)
+                if winning_asset:
+                    log.info("RESOLUTION FALLBACK %s | winner=%s", slug, winning_outcome or winning_asset[-8:])
+                    await settle_market(cid, winning_asset, winning_outcome)
         except Exception:
             log.exception("Resolution fallback failed")
-
         await asyncio.sleep(10)
 
-def account_stats(strategy_name):
-    cash = paper_cash(strategy_name)
-    initial = paper_initial(strategy_name)
-
-    with db() as c:
-        realized = sf(
-            c.execute(
-                """SELECT COALESCE(SUM(pnl),0) p
-                   FROM results
-                   WHERE mode='PAPER' AND strategy=?""",
-                (strategy_name,),
-            ).fetchone()["p"]
-        )
-        settled_markets = c.execute(
-            """SELECT COUNT(*) c FROM results
-               WHERE mode='PAPER' AND strategy=?""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        traded_markets = c.execute(
-            """SELECT COUNT(*) c FROM results
-               WHERE mode='PAPER' AND strategy=? AND trades>0""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        wins = c.execute(
-            """SELECT COUNT(*) c FROM results
-               WHERE mode='PAPER' AND strategy=? AND trades>0 AND pnl>0""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        losses = c.execute(
-            """SELECT COUNT(*) c FROM results
-               WHERE mode='PAPER' AND strategy=? AND trades>0 AND pnl<0""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        breakeven = c.execute(
-            """SELECT COUNT(*) c FROM results
-               WHERE mode='PAPER' AND strategy=? AND trades>0 AND ABS(pnl)<0.0000001""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        trades = c.execute(
-            """SELECT COUNT(*) c FROM trades
-               WHERE mode='PAPER' AND strategy=?""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        fees = sf(
-            c.execute(
-                """SELECT COALESCE(SUM(fee),0) f FROM trades
-                   WHERE mode='PAPER' AND strategy=?""",
-                (strategy_name,),
-            ).fetchone()["f"]
-        )
-        open_cost = sf(
-            c.execute(
-                """SELECT COALESCE(SUM(t.total_cost),0) x
-                   FROM trades t
-                   LEFT JOIN results r
-                     ON r.condition_id=t.condition_id
-                    AND r.strategy=t.strategy
-                    AND r.mode=t.mode
-                   WHERE t.mode='PAPER'
-                     AND t.strategy=?
-                     AND r.condition_id IS NULL""",
-                (strategy_name,),
-            ).fetchone()["x"]
-        )
-        avg_win = sf(
-            c.execute(
-                """SELECT COALESCE(AVG(pnl),0) x FROM results
-                   WHERE mode='PAPER' AND strategy=? AND trades>0 AND pnl>0""",
-                (strategy_name,),
-            ).fetchone()["x"]
-        )
-        avg_loss = sf(
-            c.execute(
-                """SELECT COALESCE(AVG(pnl),0) x FROM results
-                   WHERE mode='PAPER' AND strategy=? AND trades>0 AND pnl<0""",
-                (strategy_name,),
-            ).fetchone()["x"]
-        )
-        worst_loss = sf(
-            c.execute(
-                """SELECT COALESCE(MIN(pnl),0) x FROM results
-                   WHERE mode='PAPER' AND strategy=? AND trades>0""",
-                (strategy_name,),
-            ).fetchone()["x"]
-        )
-        hedge_trades = c.execute(
-            """SELECT COUNT(*) c FROM trades
-               WHERE mode='PAPER' AND strategy=? AND signal_type='HEDGE'""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        hedge_cost = sf(
-            c.execute(
-                """SELECT COALESCE(SUM(total_cost),0) x FROM trades
-                   WHERE mode='PAPER' AND strategy=? AND signal_type='HEDGE'""",
-                (strategy_name,),
-            ).fetchone()["x"]
-        )
-        pair_orders = c.execute(
-            """SELECT COUNT(*) c FROM pair_hedges WHERE strategy=?""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        pair_filled = c.execute(
-            """SELECT COUNT(*) c FROM pair_hedges
-               WHERE strategy=? AND status='FILLED'""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        pair_pending = c.execute(
-            """SELECT COUNT(*) c FROM pair_hedges
-               WHERE strategy=? AND status IN ('PENDING','PARTIAL')""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        pair_fok = c.execute(
-            """SELECT COUNT(*) c FROM pair_hedges
-               WHERE strategy=? AND status='FILLED' AND fill_mode='FOK'""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        pair_limit = c.execute(
-            """SELECT COUNT(*) c FROM pair_hedges
-               WHERE strategy=? AND status='FILLED' AND fill_mode='LIMIT'""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        pair_locked = sf(
-            c.execute(
-                """SELECT COALESCE(SUM(locked_pnl),0) x
-                   FROM pair_hedges
-                   WHERE strategy=? AND status='FILLED'""",
-                (strategy_name,),
-            ).fetchone()["x"]
-        )
-        smart_risk_hedges = c.execute(
-            """SELECT COUNT(*) c FROM trades
-               WHERE mode='PAPER' AND strategy=? AND signal_type='SMART_RISK_HEDGE'""",
-            (strategy_name,),
-        ).fetchone()["c"]
-        smart_risk_cost = sf(
-            c.execute(
-                """SELECT COALESCE(SUM(total_cost),0) x FROM trades
-                   WHERE mode='PAPER' AND strategy=? AND signal_type='SMART_RISK_HEDGE'""",
-                (strategy_name,),
-            ).fetchone()["x"]
-        )
-        normal_avg_lot = sf(
-            c.execute(
-                """SELECT COALESCE(AVG(filled_shares),0) x FROM trades
-                   WHERE mode='PAPER' AND strategy=? AND signal_type NOT LIKE '%HEDGE%'""",
-                (strategy_name,),
-            ).fetchone()["x"]
-        )
-
-    equity_cost = cash + open_cost
-    return {
-        "strategy": strategy_name,
-        "initial": initial,
-        "cash": cash,
-        "equity_cost": equity_cost,
-        "realized": realized,
-        "total_return": equity_cost - initial,
-        "settled_markets": settled_markets,
-        "traded_markets": traded_markets,
-        "wins": wins,
-        "losses": losses,
-        "breakeven": breakeven,
-        "trades": trades,
-        "fees": fees,
-        "open_cost": open_cost,
-        "avg_win": avg_win,
-        "avg_loss": avg_loss,
-        "worst_loss": worst_loss,
-        "hedge_trades": hedge_trades,
-        "hedge_cost": hedge_cost,
-        "pair_orders": pair_orders,
-        "pair_filled": pair_filled,
-        "pair_pending": pair_pending,
-        "pair_fok": pair_fok,
-        "pair_limit": pair_limit,
-        "pair_locked": pair_locked,
-        "pair_reserved": _pair_order_reserved_cash(strategy_name),
-        "smart_risk_hedges": smart_risk_hedges,
-        "smart_risk_cost": smart_risk_cost,
-        "normal_avg_lot": normal_avg_lot,
-    }
-
-def all_account_stats():
-    return {s["name"]: account_stats(s["name"]) for s in STRATEGIES}
 
 # ============================================================
-# Telegram control / separate reports
+# HOURLY REPORT
 # ============================================================
 
-def keyboard():
+def csv_bytes(rows, columns=None):
+    s = io.StringIO()
+    if rows:
+        if columns is None:
+            columns = list(rows[0].keys())
+        w = csv.DictWriter(s, fieldnames=columns, extrasaction="ignore")
+        w.writeheader()
+        for r in rows:
+            w.writerow(dict(r))
+    elif columns:
+        w = csv.DictWriter(s, fieldnames=columns)
+        w.writeheader()
+    return s.getvalue().encode("utf-8-sig")
+
+
+def strategy_summary(start_ms, end_ms):
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT mr.*
+            FROM market_results mr
+            JOIN discovered_markets dm ON dm.condition_id=mr.condition_id
+            WHERE mr.variant=?
+              AND (dm.end_ts*1000)>=? AND (dm.end_ts*1000)<?
+        """, (STRATEGY_NAME, start_ms, end_ms)).fetchall()
+
+        traded = [r for r in rows if si(r["trades"]) > 0]
+        pnl = sum(sf(r["pnl"]) for r in traded)
+        cost = sum(sf(r["total_cost"]) for r in traded)
+        wins = [r for r in traded if sf(r["pnl"]) > 0]
+        losses = [r for r in traded if sf(r["pnl"]) < 0]
+        fees = sf(conn.execute("""
+            SELECT COALESCE(SUM(fee),0) f FROM paper_trades
+            WHERE variant=? AND trade_ms>=? AND trade_ms<?
+        """, (STRATEGY_NAME, start_ms, end_ms)).fetchone()["f"])
+        trades = si(conn.execute("""
+            SELECT COUNT(*) c FROM paper_trades
+            WHERE variant=? AND trade_ms>=? AND trade_ms<?
+        """, (STRATEGY_NAME, start_ms, end_ms)).fetchone()["c"])
+        gates_pass = si(conn.execute("""
+            SELECT COUNT(*) c FROM gate_decisions
+            WHERE decision_ms>=? AND decision_ms<? AND passed=1
+        """, (start_ms, end_ms)).fetchone()["c"])
+        gates_skip = si(conn.execute("""
+            SELECT COUNT(*) c FROM gate_decisions
+            WHERE decision_ms>=? AND decision_ms<? AND passed=0
+        """, (start_ms, end_ms)).fetchone()["c"])
+
+    winrate = 100.0 * len(wins) / (len(wins) + len(losses)) if wins or losses else 0.0
+    avg_win = sum(sf(r["pnl"]) for r in wins) / len(wins) if wins else 0.0
+    avg_loss = sum(sf(r["pnl"]) for r in losses) / len(losses) if losses else 0.0
+    worst = min((sf(r["pnl"]) for r in traded), default=0.0)
+    best = max((sf(r["pnl"]) for r in traded), default=0.0)
+
     return {
-        "keyboard": [
-            [{"text": "▶️ START"}, {"text": "⏹ STOP"}],
-            [{"text": "💰 BALANCE"}, {"text": "📊 STATISTICS"}],
-            [{"text": "📈 POSITIONS"}, {"text": "📜 TRADES"}],
-            [{"text": "🟢 PAPER"}, {"text": "🔴 LIVE"}],
-            [{"text": "🚨 EMERGENCY STOP"}],
-        ],
-        "resize_keyboard": True,
+        "variant": STRATEGY_NAME,
+        "entry_move": ENTRY_MOVE,
+        "pyramid_step": PYRAMID_STEP,
+        "lookback_ticks": LOOKBACK_TICKS,
+        "first_signal_price_min": FIRST_SIGNAL_PRICE_MIN,
+        "first_signal_price_max": FIRST_SIGNAL_PRICE_MAX,
+        "momentum_cap": MOMENTUM_CAP,
+        "max_buys_side": MAX_BUYS_SIDE,
+        "order_size": ORDER_SIZE,
+        "markets_settled": len(rows),
+        "traded_markets": len(traded),
+        "winning_markets": len(wins),
+        "losing_markets": len(losses),
+        "winrate_pct": round(winrate, 3),
+        "gate_passed": gates_pass,
+        "gate_skipped": gates_skip,
+        "paper_trades": trades,
+        "fees": round(fees, 5),
+        "cost": round(cost, 5),
+        "pnl": round(pnl, 5),
+        "roi_pct": round((pnl / cost * 100.0) if cost > 0 else 0.0, 4),
+        "avg_win": round(avg_win, 5),
+        "avg_loss": round(avg_loss, 5),
+        "best_market": round(best, 5),
+        "worst_market": round(worst, 5),
     }
 
-async def tg_send(text):
+
+def make_report(start_ts, end_ts):
+    sm = start_ts * 1000
+    em = end_ts * 1000
+    with db() as conn:
+        trades = conn.execute(
+            "SELECT * FROM paper_trades WHERE trade_ms>=? AND trade_ms<? ORDER BY trade_ms",
+            (sm, em),
+        ).fetchall()
+        signals = conn.execute(
+            "SELECT * FROM signals WHERE signal_ms>=? AND signal_ms<? ORDER BY signal_ms",
+            (sm, em),
+        ).fetchall()
+        gates = conn.execute(
+            "SELECT * FROM gate_decisions WHERE decision_ms>=? AND decision_ms<? ORDER BY decision_ms",
+            (sm, em),
+        ).fetchall()
+        results = conn.execute("""
+            SELECT mr.*,dm.slug,dm.start_ts,dm.end_ts
+            FROM market_results mr
+            JOIN discovered_markets dm ON dm.condition_id=mr.condition_id
+            WHERE (dm.end_ts*1000)>=? AND (dm.end_ts*1000)<?
+            ORDER BY dm.end_ts
+        """, (sm, em)).fetchall()
+        markets_rows = conn.execute("""
+            SELECT * FROM discovered_markets
+            WHERE discovered_ms<? AND end_ts>=?
+            ORDER BY start_ts
+        """, (em, start_ts - 300)).fetchall()
+
+    summary = strategy_summary(sm, em)
+    lines = [
+        "M03 V2 GATE64 X2 — SINGLE PAPER STRATEGY",
+        "=" * 72,
+        f"Version: {VERSION}",
+        f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
+        f"Symbol: {SYMBOL}",
+        "",
+        "FIXED RULES",
+        f"First raw M03 signal: momentum >= {ENTRY_MOVE:.2f} over {LOOKBACK_TICKS} ticks",
+        f"Gate: first signal price must be {FIRST_SIGNAL_PRICE_MIN:.2f}..{FIRST_SIGNAL_PRICE_MAX:.2f}",
+        "If first signal is outside the gate, that market is skipped forever.",
+        f"Actual ENTRY/PYRAMID momentum cap: {MOMENTUM_CAP:.2f}",
+        f"Pyramid step: +{PYRAMID_STEP:.2f}",
+        f"Max buys: {MAX_BUYS_SIDE} total on one side",
+        "Switching: disabled",
+        f"Order size: {ORDER_SIZE:.1f} shares",
+        f"Trade window: first {TRADE_WINDOW_SECONDS}s",
+        "",
+        "RESULT",
+        f"Settled markets: {summary['markets_settled']}",
+        f"Traded markets: {summary['traded_markets']}",
+        f"Gate pass/skip: {summary['gate_passed']}/{summary['gate_skipped']}",
+        f"W/L: {summary['winning_markets']}/{summary['losing_markets']} ({summary['winrate_pct']:.1f}% wins)",
+        f"Trades: {summary['paper_trades']}",
+        f"Fees: ${summary['fees']:.2f}",
+        f"Cost: ${summary['cost']:.2f}",
+        f"PnL: ${summary['pnl']:+.2f}",
+        f"ROI: {summary['roi_pct']:+.2f}%",
+        f"Avg win/loss: ${summary['avg_win']:+.2f} / ${summary['avg_loss']:+.2f}",
+        f"Best/worst market: ${summary['best_market']:+.2f} / ${summary['worst_market']:+.2f}",
+        "",
+        "PAPER ONLY — no real orders are placed.",
+    ]
+
+    d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
+    d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
+    path = REPORT_DIR / f"strategy_sim_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
+
+    summary_cols = list(summary.keys())
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        z.writestr("strategy_summary.csv", csv_bytes([summary], summary_cols))
+        # Compatibility alias: old analysis expected variants_summary.csv.
+        z.writestr("variants_summary.csv", csv_bytes([summary], summary_cols))
+        z.writestr("gate_decisions.csv", csv_bytes(gates))
+        z.writestr("paper_trades.csv", csv_bytes(trades))
+        z.writestr("signals.csv", csv_bytes(signals))
+        z.writestr("market_results.csv", csv_bytes(results))
+        z.writestr("markets.csv", csv_bytes(markets_rows))
+        z.writestr("report.txt", "\n".join(lines).encode("utf-8"))
+
+    return path, summary
+
+
+async def tg_file(path, caption):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        return
+        log.warning("Telegram not configured: %s", path)
+        return False
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument"
     try:
-        await session.post(
-            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": text[:4096],
-                "reply_markup": keyboard(),
-            },
-            timeout=aiohttp.ClientTimeout(total=15),
+        form = aiohttp.FormData()
+        form.add_field("chat_id", TELEGRAM_CHAT_ID)
+        form.add_field("caption", caption[:1024])
+        form.add_field(
+            "document", path.read_bytes(), filename=path.name, content_type="application/zip"
         )
+        async with session.post(url, data=form, timeout=aiohttp.ClientTimeout(total=120)) as r:
+            if r.status != 200:
+                log.warning("Telegram: %s", await r.text())
+                return False
+            return True
     except Exception:
         log.exception("Telegram send failed")
+        return False
 
-def format_balance_block(strategy, s):
-    reserved = (
-        f"\nReserved for pair limits: ${s['pair_reserved']:.2f}"
-        if strategy.get("pair_hedge") else ""
-    )
-    return (
-        f"{strategy['short']}\n"
-        f"Initial: ${s['initial']:.2f}\n"
-        f"Cash: ${s['cash']:.2f}\n"
-        f"Open positions: ${s['open_cost']:.2f}\n"
-        f"Equity: ${s['equity_cost']:.2f}\n"
-        f"Realized PnL: ${s['realized']:+.2f}"
-        + reserved
-    )
 
-def format_stats_block(strategy, s):
-    denom = s["wins"] + s["losses"]
-    wr = (s["wins"] / denom * 100.0) if denom else 0.0
-    return (
-        f"{strategy['short']}\n"
-        f"Traded markets: {s['traded_markets']}\n"
-        f"W/L: {s['wins']}/{s['losses']} ({wr:.1f}% wins)\n"
-        f"Trades: {s['trades']}\n"
-        f"Fees: ${s['fees']:.2f}\n"
-        f"Avg win/loss: ${s['avg_win']:+.2f} / ${s['avg_loss']:+.2f}\n"
-        f"Worst market: ${s['worst_loss']:+.2f}\n"
-        + (f"Hedges: {s['hedge_trades']} | Hedge cost: ${s['hedge_cost']:.2f}\n" if strategy.get("risk_hedge") else "")
-        + (
-            f"Pair orders: {s['pair_orders']} | Filled: {s['pair_filled']} | Pending: {s['pair_pending']}\n"
-            f"Limit/FOK fills: {s['pair_limit']}/{s['pair_fok']} | "
-            + (
-                f"Pair worst-PnL sum: ${s['pair_locked']:+.2f}\n"
-                if strategy.get("smart_size")
-                else f"Locked target sum: ${s['pair_locked']:+.2f}\n"
-            )
-            if strategy.get("pair_hedge") else ""
-        )
-        + (
-            f"Avg normal lot: {s['normal_avg_lot']:.2f}sh | "
-            f"Risk hedges: {s['smart_risk_hedges']} (${s['smart_risk_cost']:.2f})\n"
-            if strategy.get("smart_size") else ""
-        )
-        + f"Realized PnL: ${s['realized']:+.2f}\n"
-        f"Equity: ${s['equity_cost']:.2f}"
-    )
+async def report_loop():
+    saved = si(state_get("last_report_end", "0"))
+    if saved <= 0:
+        d = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+        saved = int(d.timestamp())
+        state_set("last_report_end", saved)
 
-async def send_balances():
-    stats = all_account_stats()
-    blocks = [
-        format_balance_block(strategy, stats[strategy["name"]])
-        for strategy in STRATEGIES
-    ]
-    total_equity = sum(stats[s["name"]]["equity_cost"] for s in STRATEGIES)
-    total_initial = sum(stats[s["name"]]["initial"] for s in STRATEGIES)
-    await tg_send(
-        "💰 SIX INDEPENDENT PAPER ACCOUNTS\n\n"
-        + "\n\n".join(blocks)
-        + f"\n\nCombined test equity: ${total_equity:.2f} / ${total_initial:.2f}"
-    )
-
-async def send_statistics():
-    stats = all_account_stats()
-    blocks = [
-        format_stats_block(strategy, stats[strategy["name"]])
-        for strategy in STRATEGIES
-    ]
-    await tg_send("📊 A/B/C/E/F/G STATISTICS\n\n" + "\n\n".join(blocks))
-
-async def send_positions():
-    for strategy in STRATEGIES:
-        name = strategy["name"]
-        with db() as c:
-            rows = c.execute(
-                """SELECT t.condition_id,t.outcome,
-                          SUM(t.filled_shares) shares,
-                          SUM(t.total_cost) cost,
-                          MAX(t.trade_ms) last_ms
-                   FROM trades t
-                   LEFT JOIN results r
-                     ON r.condition_id=t.condition_id
-                    AND r.strategy=t.strategy
-                    AND r.mode=t.mode
-                   WHERE t.mode='PAPER'
-                     AND t.strategy=?
-                     AND r.condition_id IS NULL
-                   GROUP BY t.condition_id,t.outcome
-                   ORDER BY last_ms DESC
-                   LIMIT 15""",
-                (name,),
-            ).fetchall()
-
-        if rows:
-            body = "\n".join(
-                f"{r['condition_id'][-6:]} {r['outcome']}: "
-                f"{r['shares']:.2f} sh | ${r['cost']:.2f}"
-                for r in rows
-            )
-        else:
-            body = "None"
-        await tg_send(f"📈 {strategy['short']} OPEN POSITIONS\n{body}")
-
-        if strategy.get("pair_hedge"):
-            with db() as c:
-                pending = c.execute(
-                    """SELECT id,base_outcome,hedge_outcome,requested_shares,
-                              filled_shares,limit_price,status
-                       FROM pair_hedges
-                       WHERE strategy=? AND status IN ('PENDING','PARTIAL')
-                       ORDER BY id DESC LIMIT 15""",
-                    (name,),
-                ).fetchall()
-            if pending:
-                pbody = "\n".join(
-                    f"#{r['id']} {r['base_outcome']} -> {r['hedge_outcome']} "
-                    f"{r['filled_shares']:.2f}/{r['requested_shares']:.2f}sh "
-                    f"LIMIT {r['limit_price']:.3f} [{r['status']}]"
-                    for r in pending
-                )
-            else:
-                pbody = "None"
-            await tg_send(f"🧷 {strategy['short']} PENDING PAIR LIMITS\n{pbody}")
-
-async def send_trades():
-    # Separate Telegram message for each strategy, as requested.
-    for strategy in STRATEGIES:
-        name = strategy["name"]
-        with db() as c:
-            rows = c.execute(
-                """SELECT * FROM trades
-                   WHERE mode='PAPER' AND strategy=?
-                   ORDER BY id DESC LIMIT 10""",
-                (name,),
-            ).fetchall()
-
-        if rows:
-            lines = []
-            for r in rows:
-                dt = datetime.fromtimestamp(
-                    sf(r["trade_ms"]) / 1000.0, tz=timezone.utc
-                ).strftime("%H:%M:%S")
-                lines.append(
-                    f"{dt} {r['outcome']} {r['signal_type']} "
-                    f"{r['filled_shares']:.2f}sh @ {r['avg_price']:.3f} | "
-                    f"${r['total_cost']:.2f}"
-                )
-            body = "\n".join(lines)
-        else:
-            body = "No trades yet."
-
-        await tg_send(f"📜 {strategy['short']} LAST TRADES\n{body}")
-
-async def handle_tg(text):
-    t = text.strip().upper()
-
-    if t in {"/START", "▶️ START", "START"}:
-        state_set("trading_enabled", "1")
-        await tg_send(
-            "▶️ A/B/C/E/F/G trading STARTED\n"
-            "PAPER only | 6 independent accounts | CONF65 | E/F/G risk tests ON"
-        )
-
-    elif t in {"⏹ STOP", "STOP", "/STOP"}:
-        state_set("trading_enabled", "0")
-        await tg_send(
-            "⏹ New entries stopped for ALL 6 strategies.\n"
-            "Existing PAPER positions remain until resolution."
-        )
-
-    elif t in {"🚨 EMERGENCY STOP", "EMERGENCY STOP"}:
-        state_set("trading_enabled", "0")
-        await tg_send("🚨 EMERGENCY STOP active. No new PAPER orders.")
-
-    elif t in {"🟢 PAPER", "PAPER"}:
-        await tg_send("🟢 Mode = PAPER\nAll six accounts are virtual and independent.")
-
-    elif t in {"🔴 LIVE", "LIVE"}:
-        await tg_send(
-            "🔒 LIVE is disabled in this 6-way A/B/C/E/F/G build.\n"
-            "The six independent $500 accounts are for PAPER comparison only."
-        )
-
-    elif t in {"💰 BALANCE", "BALANCE", "/BALANCE"}:
-        await send_balances()
-
-    elif t in {"📊 STATISTICS", "STATISTICS", "/STATS"}:
-        await send_statistics()
-
-    elif t in {"📈 POSITIONS", "POSITIONS"}:
-        await send_positions()
-
-    elif t in {"📜 TRADES", "TRADES"}:
-        await send_trades()
-
-    else:
-        await tg_send(
-            "M03 SIX-WAY + Binance CONF65 + E/F/G RISK\n"
-            "A: M03_V3_NOSW90\n"
-            "B: M03_V2_LOCK\n"
-            "C: M03_V5_DYNAMIC\n"
-            "E: M03_V5_DYNAMIC_HEDGE (-$10 floor target after 20sh)\n"
-            "F: M03_V5_DYNAMIC_PAIR_HEDGE (1:1 limit hedge per fill)\n"
-            "G: M03_V5_DYNAMIC_SMART65 (dynamic lot + 65% hedge + -$6 cap)\n"
-            "Each has its own $500 PAPER balance."
-        )
-
-async def telegram_loop():
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        log.warning("Telegram not configured")
-        return
-
-    offset = 0
-    await tg_send(
-        f"🤖 {VERSION} online\n"
-        f"Trading: {'ON' if trading_enabled() else 'OFF'}\n"
-        f"CONF >= {CONF_MIN:.1f}\n"
-        "A/B/C/E/F/G each starts with an independent PAPER balance."
-    )
-
+    last_end = saved
     while True:
         try:
-            async with session.get(
-                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
-                params={"timeout": 25, "offset": offset},
-                timeout=aiohttp.ClientTimeout(total=35),
-            ) as r:
-                d = await r.json()
+            eligible = ((now_ts() - REPORT_DELAY_SECONDS) // 3600) * 3600
+            while last_end < eligible:
+                start = last_end
+                end = start + 3600
+                path, s = make_report(start, end)
+                extra = (
+                    f"PnL ${s['pnl']:+.2f} | W/L {s['winning_markets']}/{s['losing_markets']} | "
+                    f"Gate {s['gate_passed']}/{s['gate_skipped']}"
+                )
+                ok = await tg_file(
+                    path,
+                    "🧪 M03 V2 GATE64 X2\n"
+                    f"{utc_iso(start)} → {utc_iso(end)}\n{extra}",
+                )
+                if not ok:
+                    break
+                last_end = end
+                state_set("last_report_end", last_end)
+        except Exception:
+            log.exception("Report loop failed")
+        await asyncio.sleep(REPORT_CHECK_INTERVAL)
 
-            for u in d.get("result", []):
-                offset = max(offset, si(u.get("update_id")) + 1)
-                msg = u.get("message") or {}
-                chat = str((msg.get("chat") or {}).get("id", ""))
-                if chat != str(TELEGRAM_CHAT_ID):
-                    continue
-                text = msg.get("text")
-                if text:
-                    await handle_tg(text)
-
-        except Exception as e:
-            log.warning("Telegram polling: %s", e)
-            await asyncio.sleep(2)
 
 # ============================================================
-# Health
+# HEALTH / MAIN
 # ============================================================
 
 async def health(request):
-    stats = all_account_stats()
+    with db() as conn:
+        t = si(conn.execute("SELECT COUNT(*) c FROM paper_trades").fetchone()["c"])
+        traded = si(conn.execute(
+            "SELECT COUNT(*) c FROM market_results WHERE variant=? AND trades>0",
+            (STRATEGY_NAME,),
+        ).fetchone()["c"])
+        p = sf(conn.execute(
+            "SELECT COALESCE(SUM(pnl),0) p FROM market_results WHERE variant=? AND trades>0",
+            (STRATEGY_NAME,),
+        ).fetchone()["p"])
+        gp = si(conn.execute("SELECT COUNT(*) c FROM gate_decisions WHERE passed=1").fetchone()["c"])
+        gs = si(conn.execute("SELECT COUNT(*) c FROM gate_decisions WHERE passed=0").fetchone()["c"])
+
     return web.json_response({
         "ok": True,
         "version": VERSION,
-        "strategy": "M03 V3 NOSW90 / V2 LOCK / V5 DYNAMIC / V5 DYNAMIC HEDGE / V5 PAIR HEDGE / V5 SMART65 + Binance CONF65",
-        "mode": "PAPER",
-        "trading_enabled": trading_enabled(),
-        "live_enabled": False,
-        "paper": stats,
+        "strategy": STRATEGY_NAME,
+        "symbol": SYMBOL,
+        "paper_only": True,
+        "decision_interval": DECISION_INTERVAL,
+        "trade_window_seconds": TRADE_WINDOW_SECONDS,
+        "order_size": ORDER_SIZE,
+        "first_signal_gate": [FIRST_SIGNAL_PRICE_MIN, FIRST_SIGNAL_PRICE_MAX],
+        "momentum_cap": MOMENTUM_CAP,
+        "max_buys_side": MAX_BUYS_SIDE,
         "markets_tracked": len(markets),
+        "assets_subscribed": len(subscribed_assets),
         "books": len(books),
-        "binance_trade_age_ms": (
-            max(0, now_ms() - binance_last_trade_ms)
-            if binance_last_trade_ms else None
-        ),
-        "binance_ticks": len(binance_tick_prices),
-        "binance_trades": len(binance_trades),
-        "binance_depth_age_ms": (
-            max(0, now_ms() - binance_last_depth_ms)
-            if binance_last_depth_ms else None
-        ),
-        "binance_regime": _regime_features(REGIME_WINDOW_SEC).get("regime"),
-        "base_states": len(strategy_state),
-        "shadow_states": len(shadow_accepted_sides),
+        "paper_trades": t,
+        "traded_markets": traded,
+        "realized_pnl": p,
+        "gate_passed": gp,
+        "gate_skipped": gs,
+        "memory_rss_mb": current_rss_mb(),
+        "strategy_state_size": len(strategy_state),
         "time_utc": utc_iso(),
     })
+
 
 async def web_server():
     app = web.Application()
@@ -2986,49 +1354,39 @@ async def web_server():
     runner = web.AppRunner(app)
     await runner.setup()
     await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log.info("Health server :%d", PORT)
+    log.info("Health server on :%d", PORT)
+
 
 async def main():
     global session
     init_db()
-    session = aiohttp.ClientSession(
-        headers={
-            "User-Agent": "M03SixWayCONF65Smart65/6.0",
-            "Accept": "application/json",
-        }
-    )
+    session = aiohttp.ClientSession(headers={
+        "User-Agent": f"M03V2Gate64X2/{VERSION}",
+        "Accept": "application/json",
+    })
 
     tasks = [
-        asyncio.create_task(x())
-        for x in (
-            web_server,
-            discovery_loop,
-            poly_ws_loop,
-            binance_ws_loop,
-            binance_watchdog_loop,
-            strategy_loop,
-            pair_hedge_loop,
-            resolution_loop,
-            telegram_loop,
-            cleanup_loop,
-        )
+        asyncio.create_task(web_server()),
+        asyncio.create_task(discovery_loop()),
+        asyncio.create_task(ws_loop()),
+        asyncio.create_task(strategy_loop()),
+        asyncio.create_task(resolution_fallback_loop()),
+        asyncio.create_task(report_loop()),
+        asyncio.create_task(memory_maintenance_loop()),
     ]
 
-    balances = ", ".join(
-        f"{s['name']}=${paper_cash(s['name']):.2f}"
-        for s in STRATEGIES
-    )
     log.info(
-        "%s started | PAPER ONLY | CONF>=%.1f | lot=%.1f | %s",
-        VERSION, CONF_MIN, ORDER_SIZE, balances,
+        "%s started | PAPER ONLY | gate=%.2f..%.2f | max_buys=%d | lot=%.1f",
+        VERSION, FIRST_SIGNAL_PRICE_MIN, FIRST_SIGNAL_PRICE_MAX, MAX_BUYS_SIDE, ORDER_SIZE,
     )
-
     try:
         await asyncio.gather(*tasks)
     finally:
-        for t in tasks:
-            t.cancel()
-        await session.close()
+        for task in tasks:
+            task.cancel()
+        if session:
+            await session.close()
+
 
 if __name__ == "__main__":
     try:
