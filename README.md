@@ -1,44 +1,73 @@
-# M03 V2 GATE64 X2 — single PAPER strategy
+# M03 V2 GATE64 X2 — Single-Strategy PAPER Trading Bot
 
-This package is a stripped-down version of the strategy simulator that produced the user's hourly ZIP archives. All losing comparison variants and the unused Binance shadow experiment were removed. It stays PAPER-only.
+Эта версия собрана как один торговый PAPER-бот: все старые A/B/C/E/F/G и Binance shadow-фильтры удалены.
 
-## Fixed strategy
+## Единственная стратегия
 
-- BTC 5-minute Up/Down markets.
-- Decision interval: ~3 seconds.
-- Raw M03 first signal: ask momentum >= `0.03` over 2 decision ticks.
-- **The first qualifying raw M03 signal decides the market.**
-- If that first signal price is below `0.64` or above `0.75`, the entire market is permanently skipped. The bot does not wait for price to enter the band later.
-- If the first signal price is `0.64..0.75`, the market passes the gate.
-- Actual ENTRY still requires momentum <= `0.30`.
-- No opposite-side switching.
-- Pyramid step: `+0.08` from the previous actual buy price.
-- Pyramid momentum must be positive and <= `0.30`.
-- Maximum buys on the chosen side: **2 total** (`ENTRY + at most one PYRAMID`).
-- Order size: 10 shares by default.
-- Taker fee model is the same as the source simulator.
+`M03_V2_GATE64_X2`
 
-## Why `gate_decisions.csv` was added
+Правила зафиксированы для нового out-of-sample теста:
 
-Every first qualifying M03 signal is stored with:
+- Polymarket BTC 5-minute Up/Down.
+- Проверка примерно каждые 3 секунды.
+- Сырой M03 сигнал: рост ask минимум `+0.03` за 2 тика.
+- Самый первый такой сигнал решает судьбу рынка.
+- Если цена первого сигнала `0.64–0.75` — GATE PASS.
+- Если первый сигнал дешевле `0.64` или дороже `0.75` — рынок пропускается навсегда.
+- Не ждём, пока плохой первый сигнал позже войдёт в диапазон.
+- `momentum_cap = 0.30`.
+- Направление после ENTRY заблокировано: SWITCH запрещён.
+- Первая покупка: 10 shares.
+- Один PYRAMID после роста ещё на `+0.08`.
+- Максимум 2 покупки = максимум 20 обычных shares на один рынок.
+- Новые входы только первые 180 секунд рынка.
+- Taker fee учитывается в PAPER PnL.
 
-- price;
-- momentum;
-- side;
-- elapsed seconds;
-- PASS/SKIP;
-- reason (`FIRST_SIGNAL_PRICE_LOW`, `FIRST_SIGNAL_PRICE_HIGH`, `FIRST_SIGNAL_PRICE_OK`).
+## PAPER-счёт
 
-This makes the next batch of hourly reports much easier to analyze without guessing which markets were rejected by the new filter.
+По умолчанию:
 
-## Hourly Telegram ZIP
+```text
+PAPER_START_BALANCE=500
+MIN_FREE_CASH=5
+```
 
-The bot keeps the same hourly reporting idea and sends the completed hour about 5 minutes later.
+При покупке стоимость и комиссия списываются с виртуального cash. После settlement выигрышные shares возвращают payout в cash.
 
-Each ZIP contains:
+База новая:
+
+```text
+/var/data/gate64_x2_trading_bot.db
+```
+
+Старая статистика других ботов не смешивается с этим тестом.
+
+## Telegram
+
+Сохранены кнопки торгового бота:
+
+- `START`
+- `STOP`
+- `BALANCE`
+- `STATISTICS`
+- `POSITIONS`
+- `TRADES`
+- `PAPER`
+- `LIVE`
+- `EMERGENCY STOP`
+
+После первого запуска торговля стоит `OFF`. Нажми `START`.
+
+`LIVE` намеренно заблокирован: эта сборка PAPER-only.
+
+## Часовой ZIP-отчёт
+
+Отчёт сохранён. Через 5 минут после завершения каждого UTC-часа бот отправляет ZIP в тот же Telegram.
+
+Внутри:
 
 - `strategy_summary.csv`
-- `variants_summary.csv` — compatibility alias for older analysis
+- `variants_summary.csv` — совместимое имя для старого анализа
 - `gate_decisions.csv`
 - `paper_trades.csv`
 - `signals.csv`
@@ -46,36 +75,49 @@ Each ZIP contains:
 - `markets.csv`
 - `report.txt`
 
-## Clean database
-
-The test uses a new DB:
-
-`/var/data/strategy_gate64_x2.db`
-
-Old multi-strategy history will not contaminate this run.
+Особенно важен `gate_decisions.csv`: там видно, какой первый сигнал получил рынок и почему он был разрешён или пропущен.
 
 ## Render
 
 Build command:
 
-`pip install -r requirements.txt`
+```text
+pip install -r requirements.txt
+```
 
 Start command:
 
-`python main.py`
+```text
+python main.py
+```
 
 Persistent disk:
 
-`/var/data`
+```text
+/var/data
+```
 
-Keep your existing `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID`. All strategy defaults are already built in; no new environment variables are required unless you intentionally want to change the test.
+Оставь существующие:
 
-## Test
+```text
+TELEGRAM_BOT_TOKEN
+TELEGRAM_CHAT_ID
+```
 
-Run:
+Остальные переменные можно не добавлять — defaults уже есть в коде.
 
-`python test_gate64.py`
+## Проверка
 
-Expected final line:
+```text
+python test_gate64_trader.py
+```
 
-`M03_V2_GATE64_X2 regression: OK`
+Ожидается:
+
+```text
+GATE64 X2 single-strategy trading bot regression: OK
+```
+
+## Важно
+
+Это именно тест новой стратегии. Параметры `0.64–0.75`, `+0.08`, `max 2 buys` лучше сейчас не менять, чтобы следующие отчёты были настоящим out-of-sample тестом, а не новой подгонкой под уже просмотренные данные.
