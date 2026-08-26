@@ -1,1 +1,0 @@
-GATE64 X2 single-strategy trading bot regression: OK
