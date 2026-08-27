@@ -21,25 +21,25 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# A/B PAPER TRADING BOT — M03 V2 GATE64 SAFE vs STOP 0.30
+# A/B PAPER TRADING BOT — M03 V2 SAFE67 vs POST-PYRAMID STOP 0.40
 # ============================================================
-# A: exact GATE64 SAFE strategy, no stop-loss.
-# B: exact same entries/pyramids, but a stop-market PAPER exit is triggered
-#    when the held contract's executable best bid reaches <= 0.30.
+# A: SAFE67 strategy, no stop-loss.
+# B: exact same entries/pyramids, but the stop is ARMED only after an actual
+#    PYRAMID fill; after that, a stop-market PAPER exit triggers at best bid <= 0.40.
 #
 # Both variants:
 #   * first V2-eligible signal: price 0.55..0.75, momentum 0.03..0.30
-#   * SAFE PASS only: price 0.64..0.75 AND momentum 0.05..0.10
+#   * SAFE67 PASS only: price 0.67..0.75 AND momentum 0.05..0.10
 #   * ENTRY 5 shares
 #   * one PYRAMID 10 shares after +0.08
 #   * no switching
 #   * independent $500 PAPER accounts
 #   * same WebSocket-maintained Polymarket books / same 3-second signal history
 #   * NO pre-decision ensure_book(): signal sampling matches original SAFE
-#   * ensure_book() remains only at PAPER execution and B stop execution
+#   * ensure_book() remains only at PAPER execution and B post-pyramid stop execution
 # ============================================================
 
-VERSION = "10.0-paper-ab-gate64-safe-stop30-cleanloop"
+VERSION = "11.0-paper-ab-safe67-postpyr-stop40-cleanloop"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -72,7 +72,7 @@ V2_ELIGIBLE_PRICE_MAX = float(os.getenv("V2_ELIGIBLE_PRICE_MAX", "0.75"))
 V2_ELIGIBLE_MOM_MIN = float(os.getenv("V2_ELIGIBLE_MOM_MIN", "0.03"))
 V2_ELIGIBLE_MOM_MAX = float(os.getenv("V2_ELIGIBLE_MOM_MAX", "0.30"))
 
-SAFE_ENTRY_PRICE_MIN = float(os.getenv("SAFE_ENTRY_PRICE_MIN", "0.64"))
+SAFE_ENTRY_PRICE_MIN = float(os.getenv("SAFE_ENTRY_PRICE_MIN", "0.67"))
 SAFE_ENTRY_PRICE_MAX = float(os.getenv("SAFE_ENTRY_PRICE_MAX", "0.75"))
 SAFE_ENTRY_MOM_MIN = float(os.getenv("SAFE_ENTRY_MOM_MIN", "0.05"))
 SAFE_ENTRY_MOM_MAX = float(os.getenv("SAFE_ENTRY_MOM_MAX", "0.10"))
@@ -82,13 +82,13 @@ MAX_BUYS_SIDE = int(os.getenv("MAX_BUYS_SIDE", "2"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
 
-STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.30"))
+STOP_LOSS_PRICE = float(os.getenv("STOP_LOSS_PRICE", "0.40"))
 STOP_CHECK_INTERVAL = float(os.getenv("STOP_CHECK_INTERVAL", "0.20"))
 
 STRATEGIES = [
     {
-        "name": "A_GATE64_SAFE",
-        "short": "A / SAFE NO STOP",
+        "name": "A_SAFE67",
+        "short": "A / SAFE67 NO STOP",
         "entry_move": ENTRY_MOVE,
         "pyramid_step": PYRAMID_STEP,
         "lookback": LOOKBACK_TICKS,
@@ -103,10 +103,11 @@ STRATEGIES = [
         "pyramid_momentum_cap": PYRAMID_MOMENTUM_CAP,
         "max_buys_side": MAX_BUYS_SIDE,
         "stop_loss_price": None,
+        "stop_after_pyramid": False,
     },
     {
-        "name": "B_GATE64_SAFE_SL30",
-        "short": "B / SAFE STOP 0.30",
+        "name": "B_SAFE67_POSTPYR_SL40",
+        "short": "B / SAFE67 POST-PYR STOP 0.40",
         "entry_move": ENTRY_MOVE,
         "pyramid_step": PYRAMID_STEP,
         "lookback": LOOKBACK_TICKS,
@@ -121,6 +122,7 @@ STRATEGIES = [
         "pyramid_momentum_cap": PYRAMID_MOMENTUM_CAP,
         "max_buys_side": MAX_BUYS_SIDE,
         "stop_loss_price": STOP_LOSS_PRICE,
+        "stop_after_pyramid": True,
     },
 ]
 STRATEGY_BY_NAME = {x["name"]: x for x in STRATEGIES}
@@ -139,15 +141,15 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "gate64_safe_ab_stop30_cleanloop.db"
-REPORT_DIR = DATA_DIR / "gate64_safe_ab_stop30_cleanloop_reports"
+DB_PATH = DATA_DIR / "safe67_ab_postpyr_stop40_cleanloop.db"
+REPORT_DIR = DATA_DIR / "safe67_ab_postpyr_stop40_cleanloop_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("gate64-safe-ab-stop30-cleanloop")
+log = logging.getLogger("gate64-safe-ab-postpyr_stop40-cleanloop")
 
 session: Optional[aiohttp.ClientSession] = None
 
@@ -1015,6 +1017,7 @@ def position_totals(condition, variant_name):
     exit_net = sum(sf(r["net_proceeds"]) for r in exits)
     primary_asset = str(buys[0]["asset"]) if buys else None
     primary_outcome = str(buys[0]["outcome"]) if buys else None
+    pyramid_trades = sum(1 for r in buys if str(r["signal_type"]).upper() == "PYRAMID")
     return {
         "buys": buys,
         "exits": exits,
@@ -1025,6 +1028,8 @@ def position_totals(condition, variant_name):
         "exit_net": exit_net,
         "primary_asset": primary_asset,
         "primary_outcome": primary_outcome,
+        "pyramid_trades": pyramid_trades,
+        "has_pyramid": pyramid_trades > 0,
     }
 
 
@@ -1210,6 +1215,13 @@ def process_stop_loss(market, variant):
     if not pos["buys"] or pos["remaining"] <= 1e-8:
         return None
 
+    # B risk rule: the stop does not exist while only the 5-share ENTRY is held.
+    # It becomes active only after an actual PYRAMID fill has increased the
+    # position. This preserves small-entry winners that can dip deeply before
+    # recovering, while cutting the larger 15-share risk after confirmation.
+    if variant.get("stop_after_pyramid") and not pos["has_pyramid"]:
+        return None
+
     asset = pos["primary_asset"]
     bid = best_bid(asset)
     triggered = stop_triggered(cid, variant["name"])
@@ -1284,7 +1296,7 @@ def process_stop_loss(market, variant):
 
 
 async def stop_loss_loop():
-    variant = STRATEGY_BY_NAME["B_GATE64_SAFE_SL30"]
+    variant = STRATEGY_BY_NAME["B_SAFE67_POSTPYR_SL40"]
     while True:
         try:
             now = now_ts()
@@ -1293,7 +1305,8 @@ async def stop_loss_loop():
                     continue
                 if market["start_ts"] <= now < market["end_ts"]:
                     pos = position_totals(market["condition_id"], variant["name"])
-                    if pos["remaining"] > 1e-8 and pos["primary_asset"]:
+                    stop_armed = (not variant.get("stop_after_pyramid")) or pos["has_pyramid"]
+                    if pos["remaining"] > 1e-8 and pos["primary_asset"] and stop_armed:
                         await ensure_book(pos["primary_asset"])
                         process_stop_loss(market, variant)
         except Exception:
@@ -1379,7 +1392,7 @@ async def strategy_loop():
                     continue
 
                 # IMPORTANT: this is intentionally identical to the original
-                # single GATE64 SAFE decision loop. Do NOT REST-refresh the books
+                # single SAFE67 decision loop. Do NOT REST-refresh the books
                 # before the signal sample. Use the current WebSocket-maintained
                 # best ask exactly as SAFE did.
                 for asset in (market["up_asset"], market["down_asset"]):
@@ -1726,7 +1739,7 @@ def format_balance(strategy, s):
 
 async def send_balance():
     blocks = [format_balance(v, account_stats(v["name"])) for v in STRATEGIES]
-    await tg_send("💰 GATE64 SAFE A/B\n\n" + "\n\n".join(blocks) + f"\n\nTrading: {'ON' if trading_enabled() else 'OFF'}")
+    await tg_send("💰 SAFE67 A/B\n\n" + "\n\n".join(blocks) + f"\n\nTrading: {'ON' if trading_enabled() else 'OFF'}")
 
 
 def format_stats(strategy, s):
@@ -1748,7 +1761,7 @@ def format_stats(strategy, s):
 
 
 async def send_statistics():
-    await tg_send("📊 GATE64 SAFE A/B STATISTICS\n\n" + "\n\n".join(format_stats(v, account_stats(v["name"])) for v in STRATEGIES))
+    await tg_send("📊 SAFE67 A/B STATISTICS\n\n" + "\n\n".join(format_stats(v, account_stats(v["name"])) for v in STRATEGIES))
 
 
 async def send_positions():
@@ -1795,13 +1808,13 @@ async def handle_tg(text):
     cmd = str(text or "").strip().upper()
     if cmd in {"/START", "▶️ START", "START"}:
         state_set("trading_enabled", "1")
-        await tg_send("▶️ A/B STARTED\nA = SAFE no stop\nB = SAFE + stop-market at best bid <= 0.30\nPAPER only")
+        await tg_send("▶️ A/B STARTED\nA = SAFE67 no stop\nB = SAFE67 + stop 0.40 only after PYRAMID\nPAPER only")
     elif cmd in {"⏹ STOP", "STOP", "/STOP"}:
         state_set("trading_enabled", "0")
-        await tg_send("⏹ New entries stopped for A and B. B stop protection keeps monitoring existing positions.")
+        await tg_send("⏹ New entries stopped for A and B. B post-pyramid stop keeps monitoring armed positions.")
     elif cmd in {"🚨 EMERGENCY STOP", "EMERGENCY STOP"}:
         state_set("trading_enabled", "0")
-        await tg_send("🚨 EMERGENCY STOP: no new entries. B stop monitor stays active for existing PAPER positions.")
+        await tg_send("🚨 EMERGENCY STOP: no new entries. B post-pyramid stop monitor stays active for armed PAPER positions.")
     elif cmd in {"💰 BALANCE", "BALANCE", "/BALANCE"}:
         await send_balance()
     elif cmd in {"📊 STATISTICS", "STATISTICS", "/STATS"}:
@@ -1816,9 +1829,9 @@ async def handle_tg(text):
         await tg_send("🔒 LIVE is disabled. This A/B build is for out-of-sample PAPER comparison.")
     else:
         await tg_send(
-            "GATE64 SAFE A/B\n"
+            "SAFE67 A/B\n"
             "A: no stop.\n"
-            "B: same strategy, stop triggers when held best bid <= 0.30 and liquidates at visible bids.\n"
+            "B: same SAFE67; after PYRAMID, stop triggers when best bid <= 0.40 and liquidates at visible bids.\n"
             "ENTRY 5sh | PYRAMID 10sh @ +0.08 | no switch."
         )
 
@@ -1830,8 +1843,8 @@ async def telegram_loop():
     offset = 0
     await tg_send(
         f"🤖 {VERSION} online\n"
-        f"A cash: ${paper_cash('A_GATE64_SAFE'):.2f}\n"
-        f"B cash: ${paper_cash('B_GATE64_SAFE_SL30'):.2f}\n"
+        f"A cash: ${paper_cash('A_SAFE67'):.2f}\n"
+        f"B cash: ${paper_cash('B_SAFE67_POSTPYR_SL40'):.2f}\n"
         f"Trading: {'ON' if trading_enabled() else 'OFF'}\n"
         "Hourly A/B ZIP reports enabled."
     )
@@ -1924,6 +1937,7 @@ def strategy_summary(strategy, start_ms, end_ms):
         "variant": name,
         "short": strategy["short"],
         "stop_loss_price": "" if strategy.get("stop_loss_price") is None else strategy["stop_loss_price"],
+        "stop_after_pyramid": bool(strategy.get("stop_after_pyramid", False)),
         "entry_order_size": ENTRY_ORDER_SIZE,
         "pyramid_order_size": PYRAMID_ORDER_SIZE,
         "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
@@ -1954,7 +1968,12 @@ def strategy_summary(strategy, start_ms, end_ms):
 
 
 def variant_report_text(strategy, summary, start_ts, end_ts, traj_count):
-    stop_desc = "none" if strategy.get("stop_loss_price") is None else f"best bid <= {strategy['stop_loss_price']:.2f} -> market sell"
+    if strategy.get("stop_loss_price") is None:
+        stop_desc = "none"
+    elif strategy.get("stop_after_pyramid"):
+        stop_desc = f"armed only after PYRAMID; best bid <= {strategy['stop_loss_price']:.2f} -> market sell"
+    else:
+        stop_desc = f"best bid <= {strategy['stop_loss_price']:.2f} -> market sell"
     return "\n".join([
         strategy["short"],
         "=" * 68,
@@ -2000,11 +2019,11 @@ def make_report(start_ts, end_ts):
     path = REPORT_DIR / f"strategy_sim_AB_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
 
     overview = [
-        "M03 V2 GATE64 SAFE — A/B STOP 0.30",
+        "M03 V2 SAFE67 — A/B POST-PYRAMID STOP 0.40",
         "="*72,
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
-        "A = no stop",
-        f"B = stop-market when held best bid <= {STOP_LOSS_PRICE:.2f}",
+        "A = SAFE67, no stop",
+        f"B = same SAFE67; stop armed only after PYRAMID, then best bid <= {STOP_LOSS_PRICE:.2f}",
         "",
     ]
     for s in summaries:
@@ -2019,7 +2038,7 @@ def make_report(start_ts, end_ts):
 
         for idx, strategy in enumerate(STRATEGIES):
             name = strategy["name"]
-            folder = "A_no_stop" if idx == 0 else "B_stop_030"
+            folder = "A_safe67_no_stop" if idx == 0 else "B_safe67_postpyr_stop_040"
             with db() as conn:
                 gates = conn.execute(
                     "SELECT * FROM gate_decisions WHERE variant=? AND decision_ms>=? AND decision_ms<? ORDER BY decision_ms",
@@ -2104,10 +2123,10 @@ async def report_loop():
                 path, summaries = make_report(start, end)
                 a, b = summaries
                 caption = (
-                    "🧪 GATE64 SAFE A/B\n"
+                    "🧪 SAFE67 A/B\n"
                     f"{utc_iso(start)} → {utc_iso(end)}\n"
-                    f"A no stop: ${a['pnl']:+.2f} | W/L {a['winning_markets']}/{a['losing_markets']}\n"
-                    f"B stop .30: ${b['pnl']:+.2f} | W/L {b['winning_markets']}/{b['losing_markets']} | stops {b['stop_outs']}"
+                    f"A SAFE67: ${a['pnl']:+.2f} | W/L {a['winning_markets']}/{a['losing_markets']}\n"
+                    f"B post-PYR SL .40: ${b['pnl']:+.2f} | W/L {b['winning_markets']}/{b['losing_markets']} | stops {b['stop_outs']}"
                 )
                 if not await tg_file(path, caption):
                     break
@@ -2165,7 +2184,7 @@ async def main():
     global session
     init_db()
     session = aiohttp.ClientSession(headers={
-        "User-Agent": f"M03Gate64SafeABStop30CleanLoop/{VERSION}",
+        "User-Agent": f"M03Safe67ABPostPyrStop40CleanLoop/{VERSION}",
         "Accept": "application/json",
     })
     tasks = [
@@ -2180,7 +2199,7 @@ async def main():
         asyncio.create_task(memory_maintenance_loop()),
     ]
     log.info(
-        "%s started | A=no stop | B=stop %.2f | ENTRY %.1f + PYR %.1f | trading=%s",
+        "%s started | A=SAFE67 no stop | B=post-PYR stop %.2f | ENTRY %.1f + PYR %.1f | trading=%s",
         VERSION, STOP_LOSS_PRICE, ENTRY_ORDER_SIZE, PYRAMID_ORDER_SIZE,
         "ON" if trading_enabled() else "OFF",
     )
