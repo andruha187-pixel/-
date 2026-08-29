@@ -1,16 +1,26 @@
-SAFE67 source-bot parity check
+MULTI7 strategy parity check
 ========================================================================
-_first_v2_eligible_candidates exact: True
-candidate SHA256 source: 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
-candidate SHA256 new:    0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
+_first_v2_eligible_candidates: EXACT
+SHA256: 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
 
-SAFE67 gate + first ENTRY block exact: True
-entry-core SHA256 source: e28f95112fee70cc33e6fcb878a7c958cb3706b86d59c7646e1b105e61932979
-entry-core SHA256 new:    e28f95112fee70cc33e6fcb878a7c958cb3706b86d59c7646e1b105e61932979
+evaluate_variant: EXACT
+SHA256: fd11e838695f97d0c9ed5e6457c041696c9d382e8131cb6eb518b33bb6befdbe
 
-Intentional changes AFTER first ENTRY:
-A_SAFE67_BASE: no second buy.
-B_SAFE67_REVERSAL_DCA: arm at ask<=0.50; no buy on arm tick;
-on a later tick momentum>=+0.05 and ask<=0.60 -> one 5-share DCA;
-DCA allowed only through elapsed<=120 sec.
-Stop-loss removed from both variants.
+multi-asset market_symbol: EXACT vs previous MULTI6 collector
+SHA256: 94685f8c2df27b941e307b68534cc8e797783994b02ad0f0f3f4511448b87341
+
+multi-asset strategies_for_market: EXACT vs previous MULTI6 collector
+SHA256: 22ac964d43b52443e34156954fe0440884044b544747f9a10f744317c9743d24
+
+multi-asset parse_market_from_event: EXACT vs previous MULTI6 collector
+SHA256: 08e0ef18fd1a6b4648469f2d14103c51d0e26ea83ea95c417886a3868f7b3000
+
+multi-asset discover_slot_market: EXACT vs previous MULTI6 collector
+SHA256: d55de22613c31f1135d87c2e783a8809035357d076f75805ce30a92f77000347
+
+multi-asset persist_market: EXACT vs previous MULTI6 collector
+SHA256: 2425fee19ec274b538c4d0bfe666827e407137a134c73027d9ab0baffc97afc0
+
+Configured default assets: BTC,XRP,BNB,SOL,ETH,DOGE,HYPE
+Each asset gets A_SAFE67_BASE and B_SAFE67_REVERSAL_DCA.
+No stop-loss engine is started.

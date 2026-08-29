@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# BTC A/B PAPER BOT — SAFE67 BASE vs REVERSAL DCA
+# MULTI7 A/B PAPER BOT — SAFE67 BASE vs REVERSAL DCA
 # ============================================================
 # Both variants preserve the same SAFE67 first-entry logic:
 #   * first V2-eligible signal: price 0.55..0.75, momentum 0.03..0.30
@@ -46,12 +46,34 @@ load_dotenv()
 #   * no stop-loss
 # ============================================================
 
-VERSION = "13.0-paper-btc-safe67-base-vs-reversal-dca"
+VERSION = "14.0-paper-multi7-safe67-base-vs-reversal-dca"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
-SYMBOL = os.getenv("SYMBOL", "BTC").upper()
+
+# BTC plus our six additional Polymarket 5-minute crypto chains.
+# Hyperliquid uses the HYPE ticker/slug.
+ASSET_CONFIG = {
+    "BTC":  {"prefix": "btc-updown-5m",  "label": "Bitcoin"},
+    "XRP":  {"prefix": "xrp-updown-5m",  "label": "XRP"},
+    "BNB":  {"prefix": "bnb-updown-5m",  "label": "BNB"},
+    "SOL":  {"prefix": "sol-updown-5m",  "label": "Solana"},
+    "ETH":  {"prefix": "eth-updown-5m",  "label": "Ethereum"},
+    "DOGE": {"prefix": "doge-updown-5m", "label": "Dogecoin"},
+    "HYPE": {"prefix": "hype-updown-5m", "label": "Hyperliquid"},
+}
+
+def _configured_symbols():
+    raw = os.getenv("SYMBOLS", "BTC,XRP,BNB,SOL,ETH,DOGE,HYPE")
+    out = []
+    for item in raw.split(","):
+        sym = item.strip().upper()
+        if sym in ASSET_CONFIG and sym not in out:
+            out.append(sym)
+    return out or ["BTC", "XRP", "BNB", "SOL", "ETH", "DOGE", "HYPE"]
+
+SYMBOLS = _configured_symbols()
 
 DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "3.0"))
 TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
@@ -86,16 +108,16 @@ SAFE_ENTRY_MOM_MAX = float(os.getenv("SAFE_ENTRY_MOM_MAX", "0.10"))
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
 
-# New reversal-DCA experiment.
+# Reversal-DCA experiment — same settings for every token.
 DCA_ARM_PRICE = float(os.getenv("DCA_ARM_PRICE", "0.50"))
 DCA_MAX_BUY_PRICE = float(os.getenv("DCA_MAX_BUY_PRICE", "0.60"))
 DCA_REBOUND_MOM = float(os.getenv("DCA_REBOUND_MOM", "0.05"))
 DCA_DEADLINE_SEC = float(os.getenv("DCA_DEADLINE_SEC", "120"))
 
-STRATEGIES = [
-    {
-        "name": "A_SAFE67_BASE",
-        "short": "A / SAFE67 BASE 5SH",
+
+def _strategy_pair(symbol):
+    common = {
+        "symbol": symbol,
         "entry_move": ENTRY_MOVE,
         "lookback": LOOKBACK_TICKS,
         "v2_price_min": V2_ELIGIBLE_PRICE_MIN,
@@ -106,32 +128,34 @@ STRATEGIES = [
         "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
         "safe_entry_mom_min": SAFE_ENTRY_MOM_MIN,
         "safe_entry_mom_max": SAFE_ENTRY_MOM_MAX,
+        "stop_loss_price": None,
+    }
+    a = dict(common)
+    a.update({
+        "name": f"{symbol}_A_SAFE67_BASE",
+        "short": f"{symbol} / A SAFE67 BASE 5SH",
         "max_buys_side": 1,
         "dca_enabled": False,
-        "stop_loss_price": None,
-    },
-    {
-        "name": "B_SAFE67_REVERSAL_DCA",
-        "short": "B / SAFE67 REVERSAL DCA 5+5",
-        "entry_move": ENTRY_MOVE,
-        "lookback": LOOKBACK_TICKS,
-        "v2_price_min": V2_ELIGIBLE_PRICE_MIN,
-        "v2_price_max": V2_ELIGIBLE_PRICE_MAX,
-        "v2_mom_min": V2_ELIGIBLE_MOM_MIN,
-        "v2_mom_max": V2_ELIGIBLE_MOM_MAX,
-        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
-        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
-        "safe_entry_mom_min": SAFE_ENTRY_MOM_MIN,
-        "safe_entry_mom_max": SAFE_ENTRY_MOM_MAX,
+    })
+    b = dict(common)
+    b.update({
+        "name": f"{symbol}_B_SAFE67_REVERSAL_DCA",
+        "short": f"{symbol} / B SAFE67 REVERSAL DCA 5+5",
         "max_buys_side": 2,
         "dca_enabled": True,
         "dca_arm_price": DCA_ARM_PRICE,
         "dca_max_buy_price": DCA_MAX_BUY_PRICE,
         "dca_rebound_mom": DCA_REBOUND_MOM,
         "dca_deadline_sec": DCA_DEADLINE_SEC,
-        "stop_loss_price": None,
-    },
-]
+    })
+    return [a, b]
+
+
+STRATEGIES = [s for symbol in SYMBOLS for s in _strategy_pair(symbol)]
+STRATEGIES_BY_SYMBOL = {
+    symbol: [s for s in STRATEGIES if s["symbol"] == symbol]
+    for symbol in SYMBOLS
+}
 STRATEGY_BY_NAME = {x["name"]: x for x in STRATEGIES}
 
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -148,15 +172,15 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "safe67_base_vs_reversal_dca.db"
-REPORT_DIR = DATA_DIR / "safe67_base_vs_reversal_dca_reports"
+DB_PATH = DATA_DIR / "safe67_multi7_base_vs_reversal_dca.db"
+REPORT_DIR = DATA_DIR / "safe67_multi7_base_vs_reversal_dca_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("safe67-base-vs-reversal-dca")
+log = logging.getLogger("safe67-multi7-base-vs-reversal-dca")
 
 session: Optional[aiohttp.ClientSession] = None
 
@@ -249,6 +273,7 @@ def init_db():
         conn.executescript("""
         CREATE TABLE IF NOT EXISTS discovered_markets (
             condition_id TEXT PRIMARY KEY,
+            symbol TEXT,
             question TEXT,
             slug TEXT,
             start_ts INTEGER,
@@ -605,6 +630,21 @@ def simulate_sell(asset, wanted):
 # MARKET DISCOVERY
 # ============================================================
 
+def market_symbol(market):
+    sym = str((market or {}).get("symbol") or "").upper()
+    if sym in ASSET_CONFIG:
+        return sym
+    slug = str((market or {}).get("slug") or "").lower()
+    for candidate, cfg in ASSET_CONFIG.items():
+        if slug.startswith(cfg["prefix"] + "-"):
+            return candidate
+    return None
+
+
+def strategies_for_market(market):
+    return STRATEGIES_BY_SYMBOL.get(market_symbol(market), [])
+
+
 def slot_start_from_slug(slug):
     try:
         return int(str(slug).rstrip("/").split("-")[-1])
@@ -625,18 +665,16 @@ async def fetch_event_by_slug(slug):
     return None
 
 
-def parse_market_from_event(raw, event):
-    if not isinstance(raw, dict):
+def parse_market_from_event(raw, event, symbol):
+    if not isinstance(raw, dict) or symbol not in ASSET_CONFIG:
         return None
     cid = str(raw.get("conditionId") or raw.get("condition_id") or "")
     if not cid:
         return None
     title = str(raw.get("question") or raw.get("title") or event.get("title") or "Unknown")
     slug = str(raw.get("slug") or event.get("slug") or "")
-    combined = f"{title} {slug}".lower()
-    if SYMBOL == "BTC" and "bitcoin" not in combined and "btc" not in combined:
-        return None
-    if SYMBOL == "ETH" and "ethereum" not in combined and "eth" not in combined:
+    expected_prefix = ASSET_CONFIG[symbol]["prefix"] + "-"
+    if slug and not slug.lower().startswith(expected_prefix):
         return None
 
     outcomes = [str(x).strip().upper() for x in parse_jsonish(raw.get("outcomes"))]
@@ -662,26 +700,29 @@ def parse_market_from_event(raw, event):
     if not start_ts:
         return None
 
-    end_ts = int(start_ts) + 300
     return {
         "condition_id": cid,
+        "symbol": symbol,
         "question": title,
         "slug": slug,
         "start_ts": int(start_ts),
-        "end_ts": end_ts,
+        "end_ts": int(start_ts) + 300,
         "up_asset": str(up_asset),
         "down_asset": str(down_asset),
         "raw": raw,
     }
 
 
-async def discover_slot_market(prefix, slot_start):
-    slug = f"{prefix}-{slot_start}"
+async def discover_slot_market(symbol, slot_start):
+    cfg = ASSET_CONFIG.get(symbol)
+    if not cfg:
+        return None
+    slug = f"{cfg['prefix']}-{slot_start}"
     event = await fetch_event_by_slug(slug)
     if not event or not isinstance(event.get("markets"), list):
         return None
     for raw in event["markets"]:
-        market = parse_market_from_event(raw, event)
+        market = parse_market_from_event(raw, event, symbol)
         if market:
             return market
     return None
@@ -691,15 +732,15 @@ def persist_market(m):
     with db() as conn:
         conn.execute("""
             INSERT INTO discovered_markets(
-                condition_id,question,slug,start_ts,end_ts,up_asset,down_asset,discovered_ms
-            ) VALUES(?,?,?,?,?,?,?,?)
+                condition_id,symbol,question,slug,start_ts,end_ts,up_asset,down_asset,discovered_ms
+            ) VALUES(?,?,?,?,?,?,?,?,?)
             ON CONFLICT(condition_id) DO UPDATE SET
-                question=excluded.question, slug=excluded.slug,
+                symbol=excluded.symbol, question=excluded.question, slug=excluded.slug,
                 start_ts=excluded.start_ts, end_ts=excluded.end_ts,
                 up_asset=excluded.up_asset, down_asset=excluded.down_asset
         """, (
-            m["condition_id"], m["question"], m["slug"], m["start_ts"], m["end_ts"],
-            m["up_asset"], m["down_asset"], now_ms(),
+            m["condition_id"], market_symbol(m), m["question"], m["slug"],
+            m["start_ts"], m["end_ts"], m["up_asset"], m["down_asset"], now_ms(),
         ))
         conn.commit()
 
@@ -712,19 +753,22 @@ async def subscribe_asset(asset):
 
 
 async def discovery_loop():
-    prefix = "btc-updown-5m" if SYMBOL == "BTC" else "eth-updown-5m"
-    last_current_slot = None
+    last_current_slot = {}
     while True:
         try:
             n = now_ts()
             current = (n // 300) * 300
-            candidates = []
-            for slot_start in (current, current + 300, current - 300):
-                market = await discover_slot_market(prefix, slot_start)
-                if market:
-                    candidates.append(market)
+            for symbol in SYMBOLS:
+                candidates = []
+                for slot_start in (current, current + 300, current - 300):
+                    market = await discover_slot_market(symbol, slot_start)
+                    if market:
+                        candidates.append(market)
 
-            if candidates:
+                if not candidates:
+                    log.info("Discovery %s: market not found for slot %s", symbol, utc_iso(current))
+                    continue
+
                 active = [m for m in candidates if m["start_ts"] - 5 <= n <= m["end_ts"] + 5]
                 chosen = min(active or candidates, key=lambda m: abs(n - m["start_ts"]))
                 for market in candidates:
@@ -736,19 +780,15 @@ async def discovery_loop():
                     await subscribe_asset(market["up_asset"])
                     await subscribe_asset(market["down_asset"])
                     log.info(
-                        "MARKET %s | slug=%s | start=%s | end=%s",
-                        market["question"], market["slug"],
-                        utc_iso(market["start_ts"]), utc_iso(market["end_ts"]),
+                        "MARKET %s | %s | slug=%s | start=%s",
+                        symbol, market["question"], market["slug"], utc_iso(market["start_ts"]),
                     )
-                if current != last_current_slot:
-                    log.info("CURRENT SLOT %s | selected=%s", utc_iso(current), chosen["slug"])
-                    last_current_slot = current
-            else:
-                log.info("Discovery: slug market not found for slot %s; retrying", utc_iso(current))
+                if last_current_slot.get(symbol) != current:
+                    log.info("CURRENT %s %s | selected=%s", symbol, utc_iso(current), chosen["slug"])
+                    last_current_slot[symbol] = current
         except Exception:
             log.exception("Discovery loop failed")
         await asyncio.sleep(DISCOVERY_INTERVAL)
-
 
 # ============================================================
 # POLYMARKET WEBSOCKET
@@ -1382,8 +1422,9 @@ async def strategy_loop():
                     if ask is not None:
                         price_history[cid][asset].append((now_ms(), ask))
 
+                pair = strategies_for_market(market)
                 if 0 <= elapsed <= 305:
-                    for variant in STRATEGIES:
+                    for variant in pair:
                         record_position_trajectory(market, variant, elapsed)
 
                 if elapsed < 0 or elapsed > TRADE_WINDOW_SECONDS or not trading_enabled():
@@ -1391,7 +1432,7 @@ async def strategy_loop():
                 if best_ask(market["up_asset"]) is None or best_ask(market["down_asset"]) is None:
                     continue
 
-                for variant in STRATEGIES:
+                for variant in pair:
                     await evaluate_variant(market, variant, elapsed)
         except Exception:
             log.exception("Strategy loop failed")
@@ -1422,9 +1463,11 @@ async def settle_market(cid, winning_asset, winning_outcome):
                     return
                 market = dict(row)
 
+        symbol = market_symbol(market)
+        pair = STRATEGIES_BY_SYMBOL.get(symbol, [])
         messages = []
         with db() as conn:
-            for variant in STRATEGIES:
+            for variant in pair:
                 name = variant["name"]
                 if conn.execute(
                     "SELECT 1 FROM market_results WHERE condition_id=? AND variant=?",
@@ -1494,10 +1537,10 @@ async def settle_market(cid, winning_asset, winning_outcome):
             conn.commit()
 
         if messages:
-            log.info("RESOLVED %s | %s", cid[-6:], " | ".join(messages))
+            log.info("RESOLVED %s %s | %s", symbol, cid[-6:], " | ".join(messages))
             if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
                 await tg_send(
-                    f"✅ MARKET SETTLED | {winning_outcome or winning_asset[-8:]}\n" + "\n".join(messages)
+                    f"✅ {symbol} MARKET SETTLED | {winning_outcome or winning_asset[-8:]}\n" + "\n".join(messages)
                 )
 
 
@@ -1717,21 +1760,19 @@ async def tg_send(text):
 def format_balance(strategy, s):
     return (
         f"{strategy['short']}\n"
-        f"Initial: ${s['initial']:.2f}\n"
-        f"Cash: ${s['cash']:.2f}\n"
-        f"Open cost basis: ${s['open_cost']:.2f}\n"
-        f"Equity (cost basis): ${s['equity_cost']:.2f}\n"
-        f"Realized PnL: ${s['realized']:+.2f}"
+        f"Cash: ${s['cash']:.2f} | Realized: ${s['realized']:+.2f}\n"
+        f"Open cost: ${s['open_cost']:.2f} | Equity: ${s['equity_cost']:.2f}"
     )
 
 
 async def send_balance():
-    blocks = [format_balance(v, account_stats(v["name"])) for v in STRATEGIES]
-    await tg_send(
-        "💰 SAFE67 BASE vs DCA\n\n"
-        + "\n\n".join(blocks)
-        + f"\n\nTrading: {'ON' if trading_enabled() else 'OFF'}"
-    )
+    for symbol in SYMBOLS:
+        pair = STRATEGIES_BY_SYMBOL[symbol]
+        await tg_send(
+            f"💰 {symbol} SAFE67 BASE vs DCA\n\n"
+            + "\n\n".join(format_balance(v, account_stats(v["name"])) for v in pair)
+            + f"\n\nGlobal trading: {'ON' if trading_enabled() else 'OFF'}"
+        )
 
 
 def format_stats(strategy, s):
@@ -1742,73 +1783,75 @@ def format_stats(strategy, s):
         dca_line = f"\nDCA armed/filled: {s['dca_armed']}/{s['dca_filled']}"
     return (
         f"{strategy['short']}\n"
-        f"Traded markets: {s['traded_markets']}\n"
-        f"W/L: {s['wins']}/{s['losses']} ({wr:.1f}% wins)\n"
-        f"Gate pass/skip: {s['gate_pass']}/{s['gate_skip']}\n"
-        f"Buys: {s['buy_trades']}\n"
-        f"Fees: ${s['fees']:.2f}\n"
-        f"Avg win/loss: ${s['avg_win']:+.2f} / ${s['avg_loss']:+.2f}\n"
-        f"Worst market: ${s['worst']:+.2f}\n"
-        f"Realized PnL: ${s['realized']:+.2f}\n"
-        f"Equity: ${s['equity_cost']:.2f}"
+        f"Markets: {s['traded_markets']} | W/L {s['wins']}/{s['losses']} ({wr:.1f}%)\n"
+        f"Gate pass/skip: {s['gate_pass']}/{s['gate_skip']} | Buys: {s['buy_trades']}\n"
+        f"Fees: ${s['fees']:.2f} | Avg W/L: ${s['avg_win']:+.2f}/${s['avg_loss']:+.2f}\n"
+        f"Worst: ${s['worst']:+.2f} | PnL: ${s['realized']:+.2f}"
         + dca_line
     )
 
 
 async def send_statistics():
-    await tg_send(
-        "📊 SAFE67 BASE vs REVERSAL DCA\n\n"
-        + "\n\n".join(format_stats(v, account_stats(v["name"])) for v in STRATEGIES)
-    )
+    for symbol in SYMBOLS:
+        pair = STRATEGIES_BY_SYMBOL[symbol]
+        await tg_send(
+            f"📊 {symbol} SAFE67 BASE vs REVERSAL DCA\n\n"
+            + "\n\n".join(format_stats(v, account_stats(v["name"])) for v in pair)
+        )
 
 
 async def send_positions():
-    for variant in STRATEGIES:
-        name = variant["name"]
-        with db() as conn:
-            markets_open = conn.execute("""
-                SELECT DISTINCT t.condition_id,t.outcome,MAX(t.trade_ms) last_ms
-                FROM paper_trades t
-                LEFT JOIN market_results r ON r.condition_id=t.condition_id AND r.variant=t.variant
-                WHERE t.variant=? AND r.condition_id IS NULL
-                GROUP BY t.condition_id,t.outcome ORDER BY last_ms DESC LIMIT 20
-            """, (name,)).fetchall()
+    any_open = False
+    for symbol in SYMBOLS:
         lines = []
-        for r in markets_open:
-            pos = position_totals(r["condition_id"], name)
-            if pos["remaining"] > 1e-8:
+        for variant in STRATEGIES_BY_SYMBOL[symbol]:
+            name = variant["name"]
+            with db() as conn:
+                markets_open = conn.execute("""
+                    SELECT DISTINCT t.condition_id,t.outcome,MAX(t.trade_ms) last_ms
+                    FROM paper_trades t
+                    LEFT JOIN market_results r
+                      ON r.condition_id=t.condition_id AND r.variant=t.variant
+                    WHERE t.variant=? AND r.condition_id IS NULL
+                    GROUP BY t.condition_id,t.outcome ORDER BY last_ms DESC LIMIT 20
+                """, (name,)).fetchall()
+            for r in markets_open:
+                pos = position_totals(r["condition_id"], name)
+                if pos["remaining"] <= 1e-8:
+                    continue
+                any_open = True
                 st = get_variant_state(r["condition_id"], variant)
-                extra = " | DCA ARMED" if variant.get("dca_enabled") and st.get("dca_armed") and not pos.get("has_dca") else ""
+                extra = ""
+                if variant.get("dca_enabled") and st.get("dca_armed") and not pos.get("has_dca"):
+                    extra = " | DCA ARMED"
                 lines.append(
-                    f"{r['condition_id'][-6:]} {r['outcome']}: {pos['remaining']:.2f}sh | "
-                    f"buy cost ${pos['buy_cost']:.2f}{extra}"
+                    f"{'A' if not variant.get('dca_enabled') else 'B'} "
+                    f"{r['outcome']} {pos['remaining']:.2f}sh | cost ${pos['buy_cost']:.2f}{extra}"
                 )
-        await tg_send(
-            f"📈 {variant['short']} OPEN POSITIONS\n"
-            + ("\n".join(lines) if lines else "None")
-        )
+        if lines:
+            await tg_send(f"📈 {symbol} OPEN POSITIONS\n" + "\n".join(lines))
+    if not any_open:
+        await tg_send("📈 OPEN POSITIONS\nNone")
 
 
 async def send_trades():
-    for variant in STRATEGIES:
-        name = variant["name"]
-        with db() as conn:
-            actions = conn.execute("""
-                SELECT trade_ms AS ms,outcome,signal_type AS action,filled_shares,avg_price,total_cost AS amount
-                FROM paper_trades WHERE variant=?
-                ORDER BY ms DESC LIMIT 15
-            """, (name,)).fetchall()
+    for symbol in SYMBOLS:
         lines = []
-        for r in actions:
-            dt = datetime.fromtimestamp(sf(r["ms"])/1000.0, tz=timezone.utc).strftime("%m-%d %H:%M:%S")
-            lines.append(
-                f"{dt} {r['outcome']} {r['action']} {r['filled_shares']:.2f}sh "
-                f"@ {r['avg_price']:.3f} | ${r['amount']:.2f}"
-            )
-        await tg_send(
-            f"📜 {variant['short']} LAST ACTIONS\n"
-            + ("\n".join(lines) if lines else "No trades yet.")
-        )
+        for variant in STRATEGIES_BY_SYMBOL[symbol]:
+            with db() as conn:
+                rows = conn.execute("""
+                    SELECT trade_ms AS ms,outcome,signal_type,filled_shares,avg_price,total_cost
+                    FROM paper_trades WHERE variant=? ORDER BY trade_ms DESC LIMIT 8
+                """, (variant["name"],)).fetchall()
+            tag = "A" if not variant.get("dca_enabled") else "B"
+            for r in rows:
+                dt = datetime.fromtimestamp(sf(r["ms"])/1000.0, tz=timezone.utc).strftime("%m-%d %H:%M:%S")
+                lines.append(
+                    f"{tag} {dt} {r['outcome']} {r['signal_type']} "
+                    f"{r['filled_shares']:.2f}sh @ {r['avg_price']:.3f}"
+                )
+        if lines:
+            await tg_send(f"📜 {symbol} LAST ACTIONS\n" + "\n".join(lines[:16]))
 
 
 async def handle_tg(text):
@@ -1816,16 +1859,17 @@ async def handle_tg(text):
     if cmd in {"/START", "▶️ START", "START"}:
         state_set("trading_enabled", "1")
         await tg_send(
-            "▶️ A/B STARTED\n"
-            "A = SAFE67 ENTRY 5sh only\n"
-            f"B = same ENTRY; arm DCA at <= {DCA_ARM_PRICE:.2f}, then buy {DCA_ORDER_SIZE:g}sh "
-            f"on later rebound momentum >= +{DCA_REBOUND_MOM:.2f}, ask <= {DCA_MAX_BUY_PRICE:.2f}, "
-            f"deadline {DCA_DEADLINE_SEC:g}s\n"
+            "▶️ MULTI7 SAFE67 BASE/DCA STARTED\n"
+            f"Assets: {', '.join(SYMBOLS)}\n"
+            f"A: SAFE67 ENTRY {ENTRY_ORDER_SIZE:g}sh only\n"
+            f"B: same ENTRY; arm <= {DCA_ARM_PRICE:.2f}; later rebound "
+            f">= +{DCA_REBOUND_MOM:.2f} with ask <= {DCA_MAX_BUY_PRICE:.2f} "
+            f"-> DCA {DCA_ORDER_SIZE:g}sh; deadline {DCA_DEADLINE_SEC:g}s\n"
             "NO STOP-LOSS | PAPER only"
         )
     elif cmd in {"⏹ STOP", "STOP", "/STOP", "🚨 EMERGENCY STOP", "EMERGENCY STOP"}:
         state_set("trading_enabled", "0")
-        await tg_send("⏹ New PAPER entries/DCA buys stopped.")
+        await tg_send("⏹ New PAPER ENTRY/DCA actions stopped on all tokens.")
     elif cmd in {"💰 BALANCE", "BALANCE", "/BALANCE"}:
         await send_balance()
     elif cmd in {"📊 STATISTICS", "STATISTICS", "/STATS"}:
@@ -1837,15 +1881,16 @@ async def handle_tg(text):
     elif cmd in {"🟢 PAPER", "PAPER"}:
         await tg_send("🟢 PAPER mode. No real Polymarket orders are sent.")
     elif cmd in {"🔴 LIVE", "LIVE"}:
-        await tg_send("🔒 LIVE is disabled. This build is for a clean BASE-vs-DCA PAPER test.")
+        await tg_send("🔒 LIVE is disabled. This build is a clean multi-token BASE-vs-DCA PAPER test.")
     else:
         await tg_send(
-            "SAFE67 BASE vs REVERSAL DCA\n"
+            "MULTI7 SAFE67 BASE vs REVERSAL DCA\n"
+            f"Assets: {', '.join(SYMBOLS)}\n"
             f"A: ENTRY {ENTRY_ORDER_SIZE:g}sh only.\n"
-            f"B: ENTRY {ENTRY_ORDER_SIZE:g}sh; if ask <= {DCA_ARM_PRICE:.2f} -> DCA ARMED; "
-            f"on a later tick momentum >= +{DCA_REBOUND_MOM:.2f} and ask <= {DCA_MAX_BUY_PRICE:.2f} "
-            f"-> DCA {DCA_ORDER_SIZE:g}sh.\n"
-            f"DCA only through {DCA_DEADLINE_SEC:g}s. No stop-loss. No switch."
+            f"B: ENTRY {ENTRY_ORDER_SIZE:g}sh; ask <= {DCA_ARM_PRICE:.2f} arms DCA; "
+            f"later momentum >= +{DCA_REBOUND_MOM:.2f} and ask <= {DCA_MAX_BUY_PRICE:.2f} "
+            f"buys {DCA_ORDER_SIZE:g}sh. Deadline {DCA_DEADLINE_SEC:g}s.\n"
+            "No stop-loss. No switch."
         )
 
 
@@ -1856,10 +1901,10 @@ async def telegram_loop():
     offset = 0
     await tg_send(
         f"🤖 {VERSION} online\n"
-        f"A cash: ${paper_cash('A_SAFE67_BASE'):.2f}\n"
-        f"B cash: ${paper_cash('B_SAFE67_REVERSAL_DCA'):.2f}\n"
+        f"Assets: {', '.join(SYMBOLS)}\n"
+        f"Accounts: {len(STRATEGIES)} × ${PAPER_START_BALANCE:.0f}\n"
         f"Trading: {'ON' if trading_enabled() else 'OFF'}\n"
-        "Hourly A/B ZIP reports enabled."
+        "Hourly multi-token ZIP reports enabled."
     )
     while True:
         try:
@@ -1951,6 +1996,7 @@ def strategy_summary(strategy, start_ms, end_ms):
     avg_win = sum(sf(r["pnl"]) for r in wins)/len(wins) if wins else 0.0
     avg_loss = sum(sf(r["pnl"]) for r in losses)/len(losses) if losses else 0.0
     return {
+        "symbol": strategy["symbol"],
         "variant": name,
         "short": strategy["short"],
         "dca_enabled": bool(strategy.get("dca_enabled", False)),
@@ -1993,10 +2039,10 @@ def variant_report_text(strategy, summary, start_ts, end_ts, traj_count):
         extra_rule = (
             f"DCA: arm when held-side ask <= {DCA_ARM_PRICE:.2f}; NO BUY on arm. "
             f"On a later tick buy {DCA_ORDER_SIZE:.1f}sh only if momentum >= +{DCA_REBOUND_MOM:.2f} "
-            f"and ask <= {DCA_MAX_BUY_PRICE:.2f}; deadline {DCA_DEADLINE_SEC:.0f}s; max 10sh"
+            f"and ask <= {DCA_MAX_BUY_PRICE:.2f}; deadline {DCA_DEADLINE_SEC:.0f}s; max {ENTRY_ORDER_SIZE + DCA_ORDER_SIZE:.1f}sh"
         )
     else:
-        extra_rule = "No DCA: ENTRY 5sh only; max 5sh"
+        extra_rule = f"No DCA: ENTRY {ENTRY_ORDER_SIZE:.1f}sh only; max {ENTRY_ORDER_SIZE:.1f}sh"
 
     return "\n".join([
         strategy["short"],
@@ -2032,88 +2078,107 @@ def variant_report_text(strategy, summary, start_ts, end_ts, traj_count):
 def make_report(start_ts, end_ts):
     sm, em = start_ts*1000, end_ts*1000
     summaries = [strategy_summary(v, sm, em) for v in STRATEGIES]
+    summary_by_name = {s["variant"]: s for s in summaries}
+
     with db() as conn:
         markets_rows = conn.execute(
-            "SELECT * FROM discovered_markets WHERE discovered_ms<? AND end_ts>=? ORDER BY start_ts",
+            "SELECT * FROM discovered_markets WHERE discovered_ms<? AND end_ts>=? ORDER BY symbol,start_ts",
             (em, start_ts-300),
         ).fetchall()
 
     d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-    path = REPORT_DIR / f"strategy_sim_BASE_DCA_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
+    path = REPORT_DIR / f"strategy_sim_MULTI7_BASE_DCA_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
 
     overview = [
-        "M03 V2 SAFE67 — BASE vs REVERSAL DCA",
-        "="*72,
+        "M03 V2 SAFE67 — MULTI7 BASE vs REVERSAL DCA",
+        "=" * 78,
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
+        f"Assets: {', '.join(SYMBOLS)}",
         f"A = SAFE67 ENTRY {ENTRY_ORDER_SIZE:.1f}sh only; no stop",
         (
-            f"B = same SAFE67 ENTRY; arm at ask <= {DCA_ARM_PRICE:.2f}; on later rebound "
-            f"momentum >= +{DCA_REBOUND_MOM:.2f} and ask <= {DCA_MAX_BUY_PRICE:.2f} "
-            f"buy {DCA_ORDER_SIZE:.1f}sh; deadline {DCA_DEADLINE_SEC:.0f}s; no stop"
+            f"B = same SAFE67 ENTRY; arm when ask <= {DCA_ARM_PRICE:.2f}; "
+            f"later momentum >= +{DCA_REBOUND_MOM:.2f}, ask <= {DCA_MAX_BUY_PRICE:.2f} "
+            f"-> DCA {DCA_ORDER_SIZE:.1f}sh; deadline {DCA_DEADLINE_SEC:.0f}s; no stop"
         ),
         "",
     ]
-    for s in summaries:
+
+    for symbol in SYMBOLS:
+        a, b = STRATEGIES_BY_SYMBOL[symbol]
+        sa, sb = summary_by_name[a["name"]], summary_by_name[b["name"]]
+        overview.append(f"[{symbol}]")
         overview.append(
-            f"{s['short']}: PnL ${s['pnl']:+.2f} | W/L "
-            f"{s['winning_markets']}/{s['losing_markets']} | fees ${s['fees']:.2f} | "
-            f"DCA {s['dca_armed']}/{s['dca_filled']}"
+            f"A BASE: PnL ${sa['pnl']:+.2f} | W/L {sa['winning_markets']}/{sa['losing_markets']} | "
+            f"fees ${sa['fees']:.2f}"
         )
+        overview.append(
+            f"B DCA:  PnL ${sb['pnl']:+.2f} | W/L {sb['winning_markets']}/{sb['losing_markets']} | "
+            f"fees ${sb['fees']:.2f} | DCA {sb['dca_armed']}/{sb['dca_filled']}"
+        )
+        overview.append("")
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
         z.writestr("variants_summary.csv", csv_bytes(summaries, list(summaries[0].keys())))
         z.writestr("markets.csv", csv_bytes(markets_rows))
         z.writestr("report.txt", "\n".join(overview).encode("utf-8"))
 
-        for idx, strategy in enumerate(STRATEGIES):
-            name = strategy["name"]
-            folder = "A_safe67_base_5sh" if idx == 0 else "B_safe67_reversal_dca_5plus5"
-            with db() as conn:
-                gates = conn.execute(
-                    "SELECT * FROM gate_decisions WHERE variant=? AND decision_ms>=? AND decision_ms<? ORDER BY decision_ms",
-                    (name, sm, em),
-                ).fetchall()
-                buys = conn.execute(
-                    "SELECT * FROM paper_trades WHERE variant=? AND trade_ms>=? AND trade_ms<? ORDER BY trade_ms",
-                    (name, sm, em),
-                ).fetchall()
-                dca = conn.execute(
-                    """SELECT * FROM dca_events
-                       WHERE variant=? AND (
-                           (armed_ms>=? AND armed_ms<?) OR
-                           (filled_ms>=? AND filled_ms<?)
-                       )
-                       ORDER BY armed_ms""",
-                    (name, sm, em, sm, em),
-                ).fetchall()
-                signals = conn.execute(
-                    "SELECT * FROM signals WHERE variant=? AND signal_ms>=? AND signal_ms<? ORDER BY signal_ms",
-                    (name, sm, em),
-                ).fetchall()
-                results = conn.execute("""
-                    SELECT mr.*,dm.slug,dm.start_ts,dm.end_ts
-                    FROM market_results mr JOIN discovered_markets dm ON dm.condition_id=mr.condition_id
-                    WHERE mr.variant=? AND (dm.end_ts*1000)>=? AND (dm.end_ts*1000)<?
-                    ORDER BY dm.end_ts
-                """, (name, sm, em)).fetchall()
-                traj = conn.execute(
-                    "SELECT * FROM position_trajectory WHERE variant=? AND sample_ms>=? AND sample_ms<? ORDER BY sample_ms",
-                    (name, sm, em),
-                ).fetchall()
+        for symbol in SYMBOLS:
+            for strategy in STRATEGIES_BY_SYMBOL[symbol]:
+                name = strategy["name"]
+                variant_folder = (
+                    "A_safe67_base_5sh"
+                    if not strategy.get("dca_enabled")
+                    else "B_safe67_reversal_dca_5plus5"
+                )
+                folder = f"{symbol}/{variant_folder}"
 
-            summary = summaries[idx]
-            z.writestr(f"{folder}/summary.csv", csv_bytes([summary], list(summary.keys())))
-            z.writestr(f"{folder}/gate_decisions.csv", csv_bytes(gates))
-            z.writestr(f"{folder}/paper_trades.csv", csv_bytes(buys))
-            z.writestr(f"{folder}/dca_events.csv", csv_bytes(dca))
-            z.writestr(f"{folder}/signals.csv", csv_bytes(signals))
-            z.writestr(f"{folder}/market_results.csv", csv_bytes(results))
-            z.writestr(f"{folder}/position_trajectory.csv", csv_bytes(traj))
-            z.writestr(
-                f"{folder}/report.txt",
-                variant_report_text(strategy, summary, start_ts, end_ts, len(traj)).encode("utf-8"),
-            )
+                with db() as conn:
+                    gates = conn.execute(
+                        "SELECT * FROM gate_decisions WHERE variant=? AND decision_ms>=? AND decision_ms<? ORDER BY decision_ms",
+                        (name, sm, em),
+                    ).fetchall()
+                    buys = conn.execute(
+                        "SELECT * FROM paper_trades WHERE variant=? AND trade_ms>=? AND trade_ms<? ORDER BY trade_ms",
+                        (name, sm, em),
+                    ).fetchall()
+                    dca = conn.execute(
+                        """SELECT * FROM dca_events
+                           WHERE variant=? AND (
+                               (armed_ms>=? AND armed_ms<?) OR
+                               (filled_ms>=? AND filled_ms<?)
+                           )
+                           ORDER BY armed_ms""",
+                        (name, sm, em, sm, em),
+                    ).fetchall()
+                    signals = conn.execute(
+                        "SELECT * FROM signals WHERE variant=? AND signal_ms>=? AND signal_ms<? ORDER BY signal_ms",
+                        (name, sm, em),
+                    ).fetchall()
+                    results = conn.execute("""
+                        SELECT mr.*,dm.symbol,dm.slug,dm.start_ts,dm.end_ts
+                        FROM market_results mr
+                        JOIN discovered_markets dm ON dm.condition_id=mr.condition_id
+                        WHERE mr.variant=? AND (dm.end_ts*1000)>=? AND (dm.end_ts*1000)<?
+                        ORDER BY dm.end_ts
+                    """, (name, sm, em)).fetchall()
+                    traj = conn.execute(
+                        "SELECT * FROM position_trajectory WHERE variant=? AND sample_ms>=? AND sample_ms<? ORDER BY sample_ms",
+                        (name, sm, em),
+                    ).fetchall()
+
+                summary = summary_by_name[name]
+                z.writestr(f"{folder}/summary.csv", csv_bytes([summary], list(summary.keys())))
+                z.writestr(f"{folder}/gate_decisions.csv", csv_bytes(gates))
+                z.writestr(f"{folder}/paper_trades.csv", csv_bytes(buys))
+                z.writestr(f"{folder}/dca_events.csv", csv_bytes(dca))
+                z.writestr(f"{folder}/signals.csv", csv_bytes(signals))
+                z.writestr(f"{folder}/market_results.csv", csv_bytes(results))
+                z.writestr(f"{folder}/position_trajectory.csv", csv_bytes(traj))
+                z.writestr(
+                    f"{folder}/report.txt",
+                    variant_report_text(strategy, summary, start_ts, end_ts, len(traj)).encode("utf-8"),
+                )
 
     return path, summaries
 
@@ -2145,21 +2210,29 @@ async def report_loop():
         saved = int(d.timestamp())
         state_set("last_report_end", saved)
     last_end = saved
+
     while True:
         try:
             eligible = ((now_ts()-REPORT_DELAY_SECONDS)//3600)*3600
             while last_end < eligible:
-                start, end = last_end, last_end+3600
+                start, end = last_end, last_end + 3600
                 path, summaries = make_report(start, end)
-                a, b = summaries
-                caption = (
-                    "🧪 SAFE67 BASE vs DCA\n"
-                    f"{utc_iso(start)} → {utc_iso(end)}\n"
-                    f"A BASE: ${a['pnl']:+.2f} | W/L {a['winning_markets']}/{a['losing_markets']}\n"
-                    f"B DCA: ${b['pnl']:+.2f} | W/L {b['winning_markets']}/{b['losing_markets']} | "
-                    f"armed/filled {b['dca_armed']}/{b['dca_filled']}"
-                )
-                if not await tg_file(path, caption):
+                by_name = {s["variant"]: s for s in summaries}
+
+                lines = [
+                    "🧪 MULTI7 SAFE67 BASE vs DCA",
+                    f"{utc_iso(start)} → {utc_iso(end)}",
+                ]
+                for symbol in SYMBOLS:
+                    a, b = STRATEGIES_BY_SYMBOL[symbol]
+                    sa, sb = by_name[a["name"]], by_name[b["name"]]
+                    lines.append(
+                        f"{symbol}: A ${sa['pnl']:+.2f} ({sa['winning_markets']}/{sa['losing_markets']}) | "
+                        f"B ${sb['pnl']:+.2f} ({sb['winning_markets']}/{sb['losing_markets']}) "
+                        f"DCA {sb['dca_armed']}/{sb['dca_filled']}"
+                    )
+
+                if not await tg_file(path, "\n".join(lines)):
                     break
                 last_end = end
                 state_set("last_report_end", last_end)
@@ -2178,8 +2251,10 @@ async def health(request):
         "version": VERSION,
         "paper_only": True,
         "trading_enabled": trading_enabled(),
-        "strategies": [
+        "symbols": SYMBOLS,
+        "accounts": [
             {
+                "symbol": v["symbol"],
                 "name": v["name"],
                 "short": v["short"],
                 "cash": paper_cash(v["name"]),
@@ -2219,7 +2294,7 @@ async def main():
     global session
     init_db()
     session = aiohttp.ClientSession(headers={
-        "User-Agent": f"M03Safe67BaseVsReversalDCA/{VERSION}",
+        "User-Agent": f"M03Safe67Multi7BaseVsDCA/{VERSION}",
         "Accept": "application/json",
     })
     tasks = [
@@ -2233,9 +2308,11 @@ async def main():
         asyncio.create_task(memory_maintenance_loop()),
     ]
     log.info(
-        "%s started | A=BASE %.1fsh | B=ENTRY %.1fsh + DCA %.1fsh "
-        "(arm<=%.2f, rebound>=+%.2f, buy<=%.2f, deadline %.0fs) | STOP=OFF | trading=%s",
-        VERSION, ENTRY_ORDER_SIZE, ENTRY_ORDER_SIZE, DCA_ORDER_SIZE,
+        "%s started | symbols=%s | accounts=%d | A=BASE %.1fsh | "
+        "B=ENTRY %.1fsh + DCA %.1fsh (arm<=%.2f rebound>=+%.2f buy<=%.2f deadline %.0fs) | "
+        "STOP=OFF | trading=%s",
+        VERSION, ",".join(SYMBOLS), len(STRATEGIES),
+        ENTRY_ORDER_SIZE, ENTRY_ORDER_SIZE, DCA_ORDER_SIZE,
         DCA_ARM_PRICE, DCA_REBOUND_MOM, DCA_MAX_BUY_PRICE, DCA_DEADLINE_SEC,
         "ON" if trading_enabled() else "OFF",
     )
