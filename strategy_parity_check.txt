@@ -1,0 +1,16 @@
+SAFE67 source-bot parity check
+========================================================================
+_first_v2_eligible_candidates exact: True
+candidate SHA256 source: 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
+candidate SHA256 new:    0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
+
+SAFE67 gate + first ENTRY block exact: True
+entry-core SHA256 source: e28f95112fee70cc33e6fcb878a7c958cb3706b86d59c7646e1b105e61932979
+entry-core SHA256 new:    e28f95112fee70cc33e6fcb878a7c958cb3706b86d59c7646e1b105e61932979
+
+Intentional changes AFTER first ENTRY:
+A_SAFE67_BASE: no second buy.
+B_SAFE67_REVERSAL_DCA: arm at ask<=0.50; no buy on arm tick;
+on a later tick momentum>=+0.05 and ask<=0.60 -> one 5-share DCA;
+DCA allowed only through elapsed<=120 sec.
+Stop-loss removed from both variants.

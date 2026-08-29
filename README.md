@@ -1,103 +1,176 @@
-# SAFE67 A/B — no stop vs post-pyramid stop 0.40
+# BTC SAFE67 — BASE vs REVERSAL DCA
 
-PAPER-only бот для чистого A/B теста двух вариантов одной и той же стратегии.
+PAPER-only A/B bot for a clean test of whether averaging **after a dip and confirmed rebound** improves the SAFE67 strategy.
 
-## Общая логика A и B
+## What is unchanged
 
-Оба варианта используют одинаковые сигналы и одинаковую логику входа:
+The first entry is intentionally preserved from the previous SAFE67 BTC bot:
 
-- BTC 5-minute Up/Down Polymarket;
-- цикл решения примерно каждые 3 секунды;
-- без принудительного `ensure_book()` перед формированием сигнала — как в исходном GATE64 SAFE;
-- сначала ждём первый **V2-eligible** сигнал:
-  - цена `0.55–0.75`;
-  - momentum `0.03–0.30`;
-- первый V2-eligible сигнал проходит SAFE67 только если:
-  - цена `0.67–0.75`;
-  - momentum `0.05–0.10`;
-- если первый V2-eligible сигнал не проходит SAFE67 — рынок SKIP навсегда;
-- ENTRY = `5 shares`;
-- один PYRAMID = `10 shares` после роста удерживаемой стороны ещё на `+0.08`;
-- PYRAMID momentum: `> 0` и `<= 0.30`;
-- SWITCH отключён;
-- максимум `15 shares` на рынок.
+```text
+Market: BTC 5-minute Up/Down
+Decision loop: ~3 seconds
+Trade window: first 180 seconds
 
-`ensure_book()` сохранён перед симулированным исполнением покупки, как и в предыдущем SAFE, чтобы не исполнять PAPER-покупку по явно протухшему стакану.
+First V2-eligible signal:
+price    0.55..0.75
+momentum 0.03..0.30
 
-## A / SAFE67 NO STOP
+SAFE67 PASS:
+price    0.67..0.75
+momentum 0.05..0.10
 
-Никакого стоп-лосса. Позиция держится до settlement.
+ENTRY = 5 shares
+LOOKBACK = 2 ticks
+NO SWITCH
+```
 
-## B / SAFE67 POST-PYR STOP 0.40
+There is no pre-decision `ensure_book()` REST refresh. As in the source bot, the signal uses the WebSocket-maintained book. `ensure_book()` remains immediately before a simulated fill.
 
-До PYRAMID стопа **вообще нет**. Первые 5 shares могут проседать ниже 0.40 и позиция не закрывается.
+`strategy_parity_check.txt` verifies that the V2 candidate function and the complete SAFE67 gate + first ENTRY block are exact matches to the supplied source bot.
 
-Стоп становится активным только после того, как реально исполнился PYRAMID и позиция выросла до 15 shares (или до фактически исполненного объёма при неполном заполнении).
+## A — SAFE67 BASE
 
-После этого отдельный stop-loop примерно каждые `0.20s`:
+```text
+ENTRY 5 shares
+No second buy
+No stop-loss
+Hold to settlement
+Maximum position: 5 shares
+```
 
-1. проверяет свежий стакан удерживаемого токена;
-2. если `best bid <= 0.40`, создаёт STOP event;
-3. продаёт оставшиеся shares по фактически видимым bid-уровням стакана;
-4. учитывает taker fee;
-5. если видимой ликвидности не хватило, продолжает ликвидацию на новых снимках стакана.
+This gives the baseline PnL of the SAFE67 signal without either the old +0.08 pyramid or a stop.
 
-То есть PAPER не предполагает гарантированный выход ровно по 0.40. Если рынок перескочил с 0.41 на 0.34, выход моделируется по доступным bid-ценам около 0.34.
+## B — SAFE67 REVERSAL DCA
 
-## Раздельные PAPER счета
+First ENTRY is exactly the same 5 shares as A.
 
-- A стартует с `$500`;
-- B стартует с `$500`;
-- новая база: `/var/data/safe67_ab_postpyr_stop40_cleanloop.db`.
+After ENTRY:
 
-Старая статистика предыдущих версий не смешивается.
+### Stage 1 — arm the DCA
+
+If the held side's **ask <= 0.50** and market elapsed time is **<= 120 seconds**:
+
+```text
+DCA ARMED
+```
+
+No order is placed on that tick.
+
+This is important: simply falling to 0.50 does **not** trigger a buy.
+
+### Stage 2 — require rebound
+
+On a later ~3-second decision tick, while elapsed time is still <=120 seconds:
+
+```text
+same held side
+momentum over the same 2-tick lookback >= +0.05
+current ask <= 0.60
+```
+
+Only then:
+
+```text
+DCA BUY = 5 shares
+```
+
+There is only one DCA.
+
+Maximum B position:
+
+```text
+5 ENTRY + 5 DCA = 10 shares
+```
+
+If price keeps falling without a +0.05 rebound, B does not add.
+
+If the rebound happens after 120 seconds, B does not add.
+
+## Stop-loss
+
+There is **no stop-loss** in either A or B.
+
+The old B post-pyramid `0.40` stop loop is not started and is not part of this experiment.
+
+## Hourly report
+
+The bot keeps hourly ZIP reports because they are useful for comparing the new rule.
+
+ZIP root:
+
+```text
+variants_summary.csv
+markets.csv
+report.txt
+```
+
+Variant folders:
+
+```text
+A_safe67_base_5sh/
+B_safe67_reversal_dca_5plus5/
+```
+
+Each contains:
+
+```text
+summary.csv
+gate_decisions.csv
+paper_trades.csv
+dca_events.csv
+signals.csv
+market_results.csv
+position_trajectory.csv
+report.txt
+```
+
+`dca_events.csv` records:
+
+```text
+when DCA armed
+ask at arm
+elapsed time at arm
+whether DCA later filled
+fill ask
+fill momentum
+fill elapsed time
+```
+
+`position_trajectory.csv` remains available so we can later retest 0.45/0.50/0.55 arm levels, rebound +0.03/+0.05/+0.07, and different deadlines from collected paths.
 
 ## Telegram
 
-Сохранены кнопки:
+Buttons:
 
-- START
-- STOP
-- BALANCE
-- STATISTICS
-- POSITIONS
-- TRADES
-- PAPER
-- LIVE
-- EMERGENCY STOP
+```text
+START
+STOP
+BALANCE
+STATISTICS
+POSITIONS
+TRADES
+PAPER
+LIVE
+EMERGENCY STOP
+```
 
-После нового развёртывания торговля по умолчанию OFF — нажми START.
+LIVE remains disabled in this experiment.
 
-## Часовой ZIP
+`STATISTICS` additionally shows B:
 
-Один ZIP в час, но данные разделены по двум папкам:
-
-- `A_safe67_no_stop/`
-- `B_safe67_postpyr_stop_040/`
-
-Внутри каждого варианта сохраняются:
-
-- summary.csv
-- gate_decisions.csv
-- paper_trades.csv
-- paper_exits.csv
-- stop_events.csv
-- signals.csv
-- market_results.csv
-- position_trajectory.csv
-- report.txt
-
-В корне ZIP также остаются `variants_summary.csv`, `markets.csv` и общий `report.txt`.
+```text
+DCA armed/filled
+```
 
 ## Render
 
-Build command:
+Build:
 
 ```text
 pip install -r requirements.txt
 ```
 
-Start command:
+Start:
 
 ```text
 python main.py
@@ -109,4 +182,43 @@ Persistent disk:
 /var/data
 ```
 
-Существующие `TELEGRAM_BOT_TOKEN` и `TELEGRAM_CHAT_ID` можно оставить без изменений.
+Fresh database:
+
+```text
+/var/data/safe67_base_vs_reversal_dca.db
+```
+
+Fresh report folder:
+
+```text
+/var/data/safe67_base_vs_reversal_dca_reports
+```
+
+After a new deploy, trading defaults to OFF. Press `START`.
+
+## Regression
+
+Run:
+
+```text
+python test_base_vs_dca.py
+```
+
+Expected:
+
+```text
+SAFE67 BASE vs REVERSAL DCA regression: OK
+```
+
+The test verifies:
+
+- exact SAFE67 entry thresholds;
+- A buys only 5 shares;
+- B does not buy when merely reaching 0.50;
+- B does not average a continuing falling move;
+- B buys 5 shares after a later +0.05 rebound at ask <=0.60;
+- B never buys a third time;
+- rebound after 120 seconds is ignored;
+- no stop-loss engine is present;
+- settlement accounting;
+- hourly ZIP contains DCA events and trajectory data.
