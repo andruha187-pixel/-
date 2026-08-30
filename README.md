@@ -1,6 +1,6 @@
-# MULTI7 SAFE67 — BASE vs REVERSAL DCA
+# MULTI7 SAFE67 — A / B / C / E
 
-PAPER-only bot for the same A/B experiment on **seven** Polymarket 5-minute crypto markets:
+PAPER-only experiment on seven Polymarket 5-minute crypto chains:
 
 ```text
 BTC
@@ -12,103 +12,198 @@ DOGE
 HYPE (Hyperliquid)
 ```
 
-There are **two independent strategy accounts per token**, so 14 PAPER accounts in total. Each starts at `$500` by default. Results do not share a virtual balance.
+There are **4 independent strategies per token = 28 PAPER accounts**.  
+Each account starts at `$500` by default.
 
-## Strategy A — SAFE67 BASE
+There is **no stop-loss** in any strategy.
 
-For every token:
+## Common signal engine
+
+All strategies keep the same first-V2 concept:
 
 ```text
-First V2-eligible signal:
+V2 eligible:
 price    0.55..0.75
 momentum 0.03..0.30
+lookback 2 decision ticks
 
-SAFE67 PASS:
-price    0.67..0.75
-momentum 0.05..0.10
+decision loop ~3 seconds
+trade window first 180 seconds
+no side switching
+no pre-decision REST refresh
+```
 
-ENTRY = 5 shares
-No second buy
+The first V2-eligible signal decides that strategy's market gate permanently.
+
+## A — SAFE67 BASE
+
+```text
+ENTRY price    0.67..0.75
+ENTRY momentum 0.05..0.10
+ENTRY size     5 shares
+
+No DCA
 No stop-loss
-No switch
-Hold to settlement
+Max position 5 shares
 ```
 
-The signal loop is approximately every 3 seconds and uses the WebSocket-maintained book without a pre-decision REST refresh, matching our prior SAFE67 logic.
+This is the clean BASE control.
 
-## Strategy B — SAFE67 REVERSAL DCA
+## B — SAFE67 REVERSAL DCA
 
-First ENTRY is exactly the same as A.
-
-After ENTRY:
+The previous B logic is preserved:
 
 ```text
-ask <= 0.50
+ENTRY price    0.67..0.75
+ENTRY momentum 0.05..0.10
+ENTRY size     5 shares
+
+DCA arm:
+held-side ask <= 0.50
 elapsed <= 120 sec
-```
+NO BUY on the arming tick
 
-sets:
-
-```text
-DCA ARMED
-```
-
-**No purchase is made on the arming tick.**
-
-On a later decision tick, before/at 120 seconds:
-
-```text
-same held side
-momentum over the same 2-tick lookback >= +0.05
+Later rebound:
+momentum >= +0.05
 ask <= 0.60
+DCA size = 5 shares
+one DCA only
 ```
 
-then the bot buys:
+B deliberately has **no new 0.30 floor and no +0.15 momentum cap**. This keeps it as the old DCA control.
+
+## C — TIGHT ENTRY + SAFER DCA
+
+This is the new variant we agreed to test:
 
 ```text
+ENTRY price    0.67..0.70
+ENTRY momentum 0.05..0.10
+ENTRY size     5 shares
+```
+
+DCA:
+
+```text
+arm when held-side ask <= 0.50
+do not buy on the arm tick
+
+on a later tick:
+ask      0.30..0.60
+momentum +0.05..+0.15
+elapsed  <= 120 sec
+
 DCA = 5 shares
+one DCA only
+max position = 10 shares
 ```
 
-Only one DCA is allowed.
+If a rebound happens below `0.30`, C does **not** buy it.  
+If rebound momentum is above `+0.15`, C also does **not** buy it.
 
-Default maximum position:
+No stop-loss.
+
+## E — SAFE67 CROSS-TOKEN CONSENSUS
+
+E uses the same target-token entry threshold as A:
 
 ```text
-5 ENTRY + 5 DCA = 10 shares
+target price    0.67..0.75
+target momentum 0.05..0.10
+ENTRY size      5 shares
 ```
 
-If price keeps falling, there is no DCA. If rebound occurs only after 120 seconds, there is no DCA.
-
-## Stop-loss
-
-There is **no stop-loss in either strategy**.
-
-The old post-pyramid `0.40` stop is not started in this experiment.
-
-## Accounts
-
-For each token:
+But the entry is allowed only if, at the target's first SAFE67 decision:
 
 ```text
-TOKEN_A_SAFE67_BASE
-TOKEN_B_SAFE67_REVERSAL_DCA
+at least 2 DISTINCT OTHER tokens
+had an A/BASE SAFE67 PASS
+in the SAME direction
+within the previous 10 seconds
 ```
 
-For example:
+Example:
 
 ```text
-BTC_A_SAFE67_BASE
-BTC_B_SAFE67_REVERSAL_DCA
-XRP_A_SAFE67_BASE
-XRP_B_SAFE67_REVERSAL_DCA
-...
+ETH A -> UP
+SOL A -> UP
+BTC E target -> UP
 ```
 
-Each has its own `$500` virtual PAPER balance.
+If both ETH and SOL votes are inside the 10-second window:
+
+```text
+BTC E -> BUY 5 shares
+```
+
+Rules:
+
+- the target token itself never counts;
+- one other token counts at most once;
+- only **A/BASE SAFE67 PASS** is used as a vote;
+- opposite-side signals do not count;
+- if fewer than 2 confirmations exist at the first target SAFE67 decision, E skips that market permanently;
+- E does not wait for confirmations to appear later;
+- E has no DCA and no stop-loss.
+
+The strategy loop is two-phase: all A/B/C decisions for all active tokens are processed first from the shared ~3-second WebSocket snapshot, then E is evaluated. This means genuinely simultaneous same-cycle A signals can count as consensus; signals that arrive in later cycles cannot revive an already-skipped E market.
+
+## Hourly ZIP
+
+One combined ZIP is sent each hour.
+
+Root:
+
+```text
+variants_summary.csv
+markets.csv
+report.txt
+```
+
+Each token has four folders, for example:
+
+```text
+BTC/A_safe67_base_5sh/
+BTC/B_safe67_reversal_dca_5plus5/
+BTC/C_tight67_70_safer_dca_5plus5/
+BTC/E_safe67_consensus_5sh/
+```
+
+The same structure exists for XRP, BNB, SOL, ETH, DOGE and HYPE.
+
+Every strategy folder contains:
+
+```text
+summary.csv
+gate_decisions.csv
+paper_trades.csv
+dca_events.csv
+consensus_events.csv
+signals.csv
+market_results.csv
+position_trajectory.csv
+report.txt
+```
+
+For E, `consensus_events.csv` records:
+
+```text
+target token
+target side
+target ask
+target momentum
+required confirmation count
+actual confirmation count
+confirming symbols
+age of each confirmation in milliseconds
+PASS/SKIP reason
+```
+
+This lets us later compare 2-vote vs 3-vote consensus and 5/10/15-second windows without guessing.
 
 ## Telegram
 
-Buttons:
+Buttons stay:
 
 ```text
 START
@@ -122,76 +217,9 @@ LIVE
 EMERGENCY STOP
 ```
 
-`STATISTICS` sends a separate compact comparison for each token.
+LIVE is disabled in this experiment.
 
-For B it also shows:
-
-```text
-DCA armed/filled
-```
-
-LIVE is deliberately disabled.
-
-## Hourly ZIP report
-
-One combined ZIP arrives each hour.
-
-Root:
-
-```text
-variants_summary.csv
-markets.csv
-report.txt
-```
-
-For every token there are two folders, for example:
-
-```text
-BTC/A_safe67_base_5sh/
-BTC/B_safe67_reversal_dca_5plus5/
-
-XRP/A_safe67_base_5sh/
-XRP/B_safe67_reversal_dca_5plus5/
-```
-
-and the same structure for BNB, SOL, ETH, DOGE and HYPE.
-
-Each strategy folder contains:
-
-```text
-summary.csv
-gate_decisions.csv
-paper_trades.csv
-dca_events.csv
-signals.csv
-market_results.csv
-position_trajectory.csv
-report.txt
-```
-
-`dca_events.csv` tells us when the DCA was armed and whether/when it filled.
-
-`position_trajectory.csv` remains important because later we can retest different DCA thresholds from the collected price paths.
-
-## Market discovery
-
-The bot uses the same multi-asset discovery functions as our previous MULTI6 bot, with BTC added:
-
-```text
-btc-updown-5m
-xrp-updown-5m
-bnb-updown-5m
-sol-updown-5m
-eth-updown-5m
-doge-updown-5m
-hype-updown-5m
-```
-
-`strategy_parity_check.txt` verifies:
-
-- `_first_v2_eligible_candidates()` exactly matches the BTC BASE-vs-DCA bot;
-- `evaluate_variant()` exactly matches the BTC BASE-vs-DCA bot;
-- multi-asset discovery/parser functions exactly match the previous MULTI6 collector.
+`STATISTICS` reports A/B/C/E separately for each token, including DCA armed/filled for B/C and consensus pass/checked for E.
 
 ## Render
 
@@ -216,29 +244,34 @@ Persistent disk:
 Fresh DB:
 
 ```text
-/var/data/safe67_multi7_base_vs_reversal_dca.db
+/var/data/safe67_multi7_abce.db
 ```
 
-Reports:
+Hourly reports:
 
 ```text
-/var/data/safe67_multi7_base_vs_reversal_dca_reports
+/var/data/safe67_multi7_abce_reports
 ```
 
-Trading starts OFF after a fresh database. Press `START`.
+After a fresh deploy trading starts OFF. Press `START`.
 
-## Regression test
+## Verification
 
-Run:
+`strategy_parity_check.txt` verifies that:
+
+- the first V2 candidate function is exact versus the previous MULTI7 A/B bot;
+- the complete SAFE67 gate + first ENTRY block used by A/B/C is exact;
+- multi-asset discovery/parser functions are unchanged;
+- B does not accidentally inherit C's new DCA floor/cap.
+
+Regression:
 
 ```text
-python test_multi7_base_vs_dca.py
+python test_multi7_abce.py
 ```
 
 Expected:
 
 ```text
-MULTI7 SAFE67 BASE vs REVERSAL DCA regression: OK
+MULTI7 SAFE67 A/B/C/E regression: OK
 ```
-
-The test checks all seven token configs, 14 independent accounts, BTC and XRP full DCA paths, symbol-specific settlement, no third buy, no stop engine, market prefix parsing, and all per-token ZIP report folders.

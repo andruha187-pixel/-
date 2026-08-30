@@ -1,26 +1,39 @@
-MULTI7 strategy parity check
-========================================================================
-_first_v2_eligible_candidates: EXACT
-SHA256: 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
+MULTI7 SAFE67 A/B/C/E parity check
+============================================================================
+_first_v2_eligible_candidates exact vs previous MULTI7 A/B: TRUE
+SHA256 old/new: 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
 
-evaluate_variant: EXACT
-SHA256: fd11e838695f97d0c9ed5e6457c041696c9d382e8131cb6eb518b33bb6befdbe
+SAFE67 gate + first ENTRY block exact vs previous MULTI7 A/B: TRUE
+SHA256 old/new: e28f95112fee70cc33e6fcb878a7c958cb3706b86d59c7646e1b105e61932979
 
-multi-asset market_symbol: EXACT vs previous MULTI6 collector
+market_symbol: EXACT vs previous MULTI7 collector
 SHA256: 94685f8c2df27b941e307b68534cc8e797783994b02ad0f0f3f4511448b87341
 
-multi-asset strategies_for_market: EXACT vs previous MULTI6 collector
+strategies_for_market: EXACT vs previous MULTI7 collector
 SHA256: 22ac964d43b52443e34156954fe0440884044b544747f9a10f744317c9743d24
 
-multi-asset parse_market_from_event: EXACT vs previous MULTI6 collector
+parse_market_from_event: EXACT vs previous MULTI7 collector
 SHA256: 08e0ef18fd1a6b4648469f2d14103c51d0e26ea83ea95c417886a3868f7b3000
 
-multi-asset discover_slot_market: EXACT vs previous MULTI6 collector
+discover_slot_market: EXACT vs previous MULTI7 collector
 SHA256: d55de22613c31f1135d87c2e783a8809035357d076f75805ce30a92f77000347
 
-multi-asset persist_market: EXACT vs previous MULTI6 collector
+persist_market: EXACT vs previous MULTI7 collector
 SHA256: 2425fee19ec274b538c4d0bfe666827e407137a134c73027d9ab0baffc97afc0
 
-Configured default assets: BTC,XRP,BNB,SOL,ETH,DOGE,HYPE
-Each asset gets A_SAFE67_BASE and B_SAFE67_REVERSAL_DCA.
-No stop-loss engine is started.
+A remains ENTRY-only, 0.67..0.75 / momentum 0.05..0.10.
+B remains the previous reversal-DCA behavior. Regression verifies that after
+arming at <=0.50 it can still DCA at 0.25 on a +0.06 rebound (no C filter leaks into B).
+
+C intentional changes:
+ENTRY 0.67..0.70 / momentum 0.05..0.10 / 5 shares.
+DCA arm <=0.50; later buy only 0.30..0.60, momentum +0.05..+0.15,
+one 5-share DCA, through elapsed<=120s.
+
+E intentional changes:
+ENTRY uses A SAFE67 thresholds 0.67..0.75 / momentum 0.05..0.10 / 5 shares.
+Requires >=2 DISTINCT OTHER tokens with same-side A/BASE SAFE67 PASS
+within the previous 10 seconds. Target token is excluded. One token counts once.
+No DCA. No stop-loss.
+
+No stop-loss loop exists in this build.

@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ============================================================
-# MULTI7 A/B PAPER BOT — SAFE67 BASE vs REVERSAL DCA
+# MULTI7 A/B/C/E PAPER BOT — SAFE67 experiments
 # ============================================================
 # Both variants preserve the same SAFE67 first-entry logic:
 #   * first V2-eligible signal: price 0.55..0.75, momentum 0.03..0.30
@@ -46,7 +46,7 @@ load_dotenv()
 #   * no stop-loss
 # ============================================================
 
-VERSION = "14.0-paper-multi7-safe67-base-vs-reversal-dca"
+VERSION = "15.0-paper-multi7-safe67-abce"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -114,8 +114,20 @@ DCA_MAX_BUY_PRICE = float(os.getenv("DCA_MAX_BUY_PRICE", "0.60"))
 DCA_REBOUND_MOM = float(os.getenv("DCA_REBOUND_MOM", "0.05"))
 DCA_DEADLINE_SEC = float(os.getenv("DCA_DEADLINE_SEC", "120"))
 
+# C — tighter entry + safer reversal DCA.
+C_SAFE_ENTRY_PRICE_MIN = float(os.getenv("C_SAFE_ENTRY_PRICE_MIN", "0.67"))
+C_SAFE_ENTRY_PRICE_MAX = float(os.getenv("C_SAFE_ENTRY_PRICE_MAX", "0.70"))
+C_DCA_MIN_BUY_PRICE = float(os.getenv("C_DCA_MIN_BUY_PRICE", "0.30"))
+C_DCA_MAX_BUY_PRICE = float(os.getenv("C_DCA_MAX_BUY_PRICE", "0.60"))
+C_DCA_REBOUND_MOM_MIN = float(os.getenv("C_DCA_REBOUND_MOM_MIN", "0.05"))
+C_DCA_REBOUND_MOM_MAX = float(os.getenv("C_DCA_REBOUND_MOM_MAX", "0.15"))
 
-def _strategy_pair(symbol):
+# E — cross-token consensus.
+CONSENSUS_WINDOW_SEC = float(os.getenv("CONSENSUS_WINDOW_SEC", "10"))
+CONSENSUS_MIN_OTHER_TOKENS = int(os.getenv("CONSENSUS_MIN_OTHER_TOKENS", "2"))
+
+
+def _strategy_set(symbol):
     common = {
         "symbol": symbol,
         "entry_move": ENTRY_MOVE,
@@ -124,34 +136,76 @@ def _strategy_pair(symbol):
         "v2_price_max": V2_ELIGIBLE_PRICE_MAX,
         "v2_mom_min": V2_ELIGIBLE_MOM_MIN,
         "v2_mom_max": V2_ELIGIBLE_MOM_MAX,
-        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
-        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
         "safe_entry_mom_min": SAFE_ENTRY_MOM_MIN,
         "safe_entry_mom_max": SAFE_ENTRY_MOM_MAX,
         "stop_loss_price": None,
     }
+
     a = dict(common)
     a.update({
+        "code": "A",
         "name": f"{symbol}_A_SAFE67_BASE",
         "short": f"{symbol} / A SAFE67 BASE 5SH",
+        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
+        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
         "max_buys_side": 1,
         "dca_enabled": False,
+        "consensus_enabled": False,
     })
+
     b = dict(common)
     b.update({
+        "code": "B",
         "name": f"{symbol}_B_SAFE67_REVERSAL_DCA",
         "short": f"{symbol} / B SAFE67 REVERSAL DCA 5+5",
+        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
+        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
         "max_buys_side": 2,
         "dca_enabled": True,
         "dca_arm_price": DCA_ARM_PRICE,
+        "dca_min_buy_price": MIN_PRICE,
         "dca_max_buy_price": DCA_MAX_BUY_PRICE,
         "dca_rebound_mom": DCA_REBOUND_MOM,
+        "dca_rebound_mom_max": None,
         "dca_deadline_sec": DCA_DEADLINE_SEC,
+        "consensus_enabled": False,
     })
-    return [a, b]
+
+    c = dict(common)
+    c.update({
+        "code": "C",
+        "name": f"{symbol}_C_SAFE67_TIGHT_DCA",
+        "short": f"{symbol} / C TIGHT67-70 DCA 5+5",
+        "safe_entry_price_min": C_SAFE_ENTRY_PRICE_MIN,
+        "safe_entry_price_max": C_SAFE_ENTRY_PRICE_MAX,
+        "max_buys_side": 2,
+        "dca_enabled": True,
+        "dca_arm_price": DCA_ARM_PRICE,
+        "dca_min_buy_price": C_DCA_MIN_BUY_PRICE,
+        "dca_max_buy_price": C_DCA_MAX_BUY_PRICE,
+        "dca_rebound_mom": C_DCA_REBOUND_MOM_MIN,
+        "dca_rebound_mom_max": C_DCA_REBOUND_MOM_MAX,
+        "dca_deadline_sec": DCA_DEADLINE_SEC,
+        "consensus_enabled": False,
+    })
+
+    e = dict(common)
+    e.update({
+        "code": "E",
+        "name": f"{symbol}_E_SAFE67_CONSENSUS",
+        "short": f"{symbol} / E SAFE67 CONSENSUS 5SH",
+        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
+        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
+        "max_buys_side": 1,
+        "dca_enabled": False,
+        "consensus_enabled": True,
+        "consensus_window_sec": CONSENSUS_WINDOW_SEC,
+        "consensus_min_other_tokens": CONSENSUS_MIN_OTHER_TOKENS,
+    })
+    return [a, b, c, e]
 
 
-STRATEGIES = [s for symbol in SYMBOLS for s in _strategy_pair(symbol)]
+STRATEGIES = [s for symbol in SYMBOLS for s in _strategy_set(symbol)]
 STRATEGIES_BY_SYMBOL = {
     symbol: [s for s in STRATEGIES if s["symbol"] == symbol]
     for symbol in SYMBOLS
@@ -172,15 +226,15 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "safe67_multi7_base_vs_reversal_dca.db"
-REPORT_DIR = DATA_DIR / "safe67_multi7_base_vs_reversal_dca_reports"
+DB_PATH = DATA_DIR / "safe67_multi7_abce.db"
+REPORT_DIR = DATA_DIR / "safe67_multi7_abce_reports"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("safe67-multi7-base-vs-reversal-dca")
+log = logging.getLogger("safe67-multi7-abce")
 
 session: Optional[aiohttp.ClientSession] = None
 
@@ -346,6 +400,24 @@ def init_db():
             PRIMARY KEY(condition_id, variant)
         );
 
+        CREATE TABLE IF NOT EXISTS consensus_events (
+            condition_id TEXT,
+            variant TEXT,
+            decision_ms INTEGER,
+            target_symbol TEXT,
+            target_outcome TEXT,
+            target_ask REAL,
+            target_momentum REAL,
+            window_sec REAL,
+            required_count INTEGER,
+            confirm_count INTEGER,
+            confirm_symbols_json TEXT,
+            confirm_ages_ms_json TEXT,
+            passed INTEGER,
+            reason TEXT,
+            PRIMARY KEY(condition_id, variant)
+        );
+
         CREATE TABLE IF NOT EXISTS stop_events (
             condition_id TEXT,
             variant TEXT,
@@ -434,6 +506,7 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_trades_ms ON paper_trades(trade_ms);
         CREATE INDEX IF NOT EXISTS idx_exits_ms ON paper_exits(exit_ms);
         CREATE INDEX IF NOT EXISTS idx_dca_armed_ms ON dca_events(armed_ms);
+        CREATE INDEX IF NOT EXISTS idx_consensus_ms ON consensus_events(decision_ms);
         CREATE INDEX IF NOT EXISTS idx_results_ms ON market_results(settled_ms);
         CREATE INDEX IF NOT EXISTS idx_traj_ms ON position_trajectory(sample_ms);
         CREATE INDEX IF NOT EXISTS idx_traj_cond ON position_trajectory(condition_id,variant,sample_ms);
@@ -1319,6 +1392,11 @@ async def evaluate_variant(market, variant, elapsed):
         return
     if mom < variant["dca_rebound_mom"]:
         return
+    mom_max = variant.get("dca_rebound_mom_max")
+    if mom_max is not None and mom > float(mom_max) + 1e-12:
+        return
+    if ask < float(variant.get("dca_min_buy_price", MIN_PRICE)) - 1e-12:
+        return
     if ask > variant["dca_max_buy_price"] + 1e-12:
         return
 
@@ -1331,6 +1409,149 @@ async def evaluate_variant(market, variant, elapsed):
             variant["name"], cid[-6:], outcome, ask, mom, st["buys"][asset],
         )
 
+
+
+def consensus_confirmations(target_symbol, outcome, at_ms, window_sec):
+    """Return the latest qualifying A/BASE SAFE67 signal from each OTHER token."""
+    cutoff = int(at_ms - float(window_sec) * 1000.0)
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT dm.symbol, gd.variant, gd.decision_ms
+            FROM gate_decisions gd
+            JOIN discovered_markets dm ON dm.condition_id=gd.condition_id
+            WHERE gd.passed=1
+              AND gd.outcome=?
+              AND gd.decision_ms>=?
+              AND gd.decision_ms<=?
+              AND dm.symbol<>?
+            ORDER BY gd.decision_ms DESC
+        """, (outcome, cutoff, at_ms, target_symbol)).fetchall()
+
+    latest = {}
+    for r in rows:
+        symbol = str(r["symbol"] or "").upper()
+        if symbol not in SYMBOLS or symbol == target_symbol:
+            continue
+        # E uses only the clean A/BASE SAFE67 pass from another token as a vote.
+        if str(r["variant"]) != f"{symbol}_A_SAFE67_BASE":
+            continue
+        if symbol not in latest:
+            latest[symbol] = int(r["decision_ms"])
+
+    ordered = sorted(latest.items(), key=lambda kv: kv[1], reverse=True)
+    symbols = [s for s, _ in ordered]
+    ages = [max(0, int(at_ms - ms)) for _, ms in ordered]
+    return symbols, ages
+
+
+def store_consensus_event(condition, variant, symbol, outcome, ask, mom, at_ms,
+                          confirm_symbols, confirm_ages, passed, reason):
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO consensus_events(
+                condition_id,variant,decision_ms,target_symbol,target_outcome,
+                target_ask,target_momentum,window_sec,required_count,confirm_count,
+                confirm_symbols_json,confirm_ages_ms_json,passed,reason
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(condition_id,variant) DO NOTHING
+        """, (
+            condition, variant["name"], at_ms, symbol, outcome, ask, mom,
+            float(variant["consensus_window_sec"]),
+            int(variant["consensus_min_other_tokens"]),
+            len(confirm_symbols), jd(confirm_symbols), jd(confirm_ages),
+            1 if passed else 0, reason,
+        ))
+        conn.commit()
+
+
+async def evaluate_consensus_variant(market, variant, elapsed):
+    """E: same SAFE67 target signal, but enter only with >=2 other-token A votes."""
+    cid = market["condition_id"]
+    symbol = market_symbol(market)
+    st = get_variant_state(cid, variant)
+
+    if st.get("stopped_out"):
+        return
+
+    if not st["gate_decided"] and not st["started_sides"]:
+        candidates = _first_v2_eligible_candidates(market, variant)
+        if not candidates:
+            return
+
+        mom, asset, outcome, ask, ref = candidates[0]
+        price_ok = variant["safe_entry_price_min"] <= ask <= variant["safe_entry_price_max"]
+        mom_ok = variant["safe_entry_mom_min"] <= mom <= variant["safe_entry_mom_max"]
+        safe_ok = bool(price_ok and mom_ok)
+
+        at_ms = now_ms()
+        confirm_symbols, confirm_ages = [], []
+        consensus_ok = False
+
+        if safe_ok:
+            confirm_symbols, confirm_ages = consensus_confirmations(
+                symbol, outcome, at_ms, variant["consensus_window_sec"]
+            )
+            consensus_ok = len(confirm_symbols) >= int(variant["consensus_min_other_tokens"])
+
+        passed = bool(safe_ok and consensus_ok)
+        st["gate_decided"] = True
+        st["gate_passed"] = passed
+        st["gate_asset"] = asset if passed else None
+
+        if ask < variant["safe_entry_price_min"]:
+            reason = "SAFE_PRICE_LOW"
+        elif ask > variant["safe_entry_price_max"]:
+            reason = "SAFE_PRICE_HIGH"
+        elif mom < variant["safe_entry_mom_min"]:
+            reason = "SAFE_MOMENTUM_LOW"
+        elif mom > variant["safe_entry_mom_max"]:
+            reason = "SAFE_MOMENTUM_HIGH"
+        elif not consensus_ok:
+            reason = "CONSENSUS_INSUFFICIENT"
+        else:
+            reason = "CONSENSUS_OK"
+
+        store_gate_decision(
+            cid, variant, asset, outcome, ask, ref, mom, elapsed, passed, reason
+        )
+        store_consensus_event(
+            cid, variant, symbol, outcome, ask, mom, at_ms,
+            confirm_symbols, confirm_ages, passed, reason
+        )
+
+        log.info(
+            "CONSENSUS %-22s %s | %s %.3f mom=%+.3f | votes=%d [%s] | %s",
+            variant["name"], cid[-6:], outcome, ask, mom, len(confirm_symbols),
+            ",".join(confirm_symbols) if confirm_symbols else "-",
+            "PASS" if passed else f"SKIP {reason}",
+        )
+        if not passed:
+            return
+
+    if st["gate_decided"] and not st["gate_passed"]:
+        return
+
+    if not st["started_sides"]:
+        asset = st.get("gate_asset")
+        if not asset:
+            return
+        outcome = "Up" if asset == market["up_asset"] else "Down"
+        ask = best_ask(asset)
+        if ask is None:
+            return
+        mom, ref = momentum_for(cid, asset, variant["lookback"])
+        if mom is None:
+            return
+        if not (variant["safe_entry_price_min"] <= ask <= variant["safe_entry_price_max"]):
+            return
+        if not (variant["safe_entry_mom_min"] <= mom <= variant["safe_entry_mom_max"]):
+            return
+        store_signal(cid, variant, asset, outcome, ask, ref, mom, "ENTRY", elapsed)
+        await execute_paper(cid, variant, asset, outcome, "ENTRY")
+        return
+
+    # E is ENTRY-only: no DCA and no stop-loss.
+    return
 
 
 # No stop-loss engine in this experiment.
@@ -1408,32 +1629,49 @@ async def strategy_loop():
         started = time.monotonic()
         n = time.time()
         try:
+            trade_ready = []
+
+            # Phase 0: one WebSocket-book snapshot/history sample for every market.
+            # No pre-decision REST refresh — same SAFE67 sampling contract.
             for cid, market in list(markets.items()):
                 elapsed = n - market["start_ts"]
                 if not (-30 <= elapsed <= 310):
                     continue
 
-                # IMPORTANT: this is intentionally identical to the original
-                # single SAFE67 decision loop. Do NOT REST-refresh the books
-                # before the signal sample. Use the current WebSocket-maintained
-                # best ask exactly as SAFE did.
                 for asset in (market["up_asset"], market["down_asset"]):
                     ask = best_ask(asset)
                     if ask is not None:
                         price_history[cid][asset].append((now_ms(), ask))
 
-                pair = strategies_for_market(market)
+                variants = strategies_for_market(market)
                 if 0 <= elapsed <= 305:
-                    for variant in pair:
+                    for variant in variants:
                         record_position_trajectory(market, variant, elapsed)
 
                 if elapsed < 0 or elapsed > TRADE_WINDOW_SECONDS or not trading_enabled():
                     continue
                 if best_ask(market["up_asset"]) is None or best_ask(market["down_asset"]) is None:
                     continue
+                trade_ready.append((market, elapsed, variants))
 
-                for variant in pair:
+            # Phase 1: A/B/C for ALL tokens first.
+            # This records every token's A/BASE SAFE67 gate decision for this
+            # decision cycle before E asks for cross-token confirmations.
+            for market, elapsed, variants in trade_ready:
+                for variant in variants:
+                    if variant.get("consensus_enabled"):
+                        continue
                     await evaluate_variant(market, variant, elapsed)
+
+            # Phase 2: E/CONSENSUS. It can now see A votes from any other token
+            # that occurred earlier in the 10-second window, including this
+            # shared 3-second decision snapshot.
+            for market, elapsed, variants in trade_ready:
+                for variant in variants:
+                    if not variant.get("consensus_enabled"):
+                        continue
+                    await evaluate_consensus_variant(market, variant, elapsed)
+
         except Exception:
             log.exception("Strategy loop failed")
 
@@ -1701,6 +1939,12 @@ def account_stats(strategy_name):
         dca_filled = si(conn.execute(
             "SELECT COUNT(*) c FROM dca_events WHERE variant=? AND filled_ms IS NOT NULL", (strategy_name,)
         ).fetchone()["c"])
+        consensus_checked = si(conn.execute(
+            "SELECT COUNT(*) c FROM consensus_events WHERE variant=?", (strategy_name,)
+        ).fetchone()["c"])
+        consensus_passed = si(conn.execute(
+            "SELECT COUNT(*) c FROM consensus_events WHERE variant=? AND passed=1", (strategy_name,)
+        ).fetchone()["c"])
 
     oc = open_cost_basis(strategy_name)
     return {
@@ -1723,6 +1967,8 @@ def account_stats(strategy_name):
         "stops": stops,
         "dca_armed": dca_armed,
         "dca_filled": dca_filled,
+        "consensus_checked": consensus_checked,
+        "consensus_passed": consensus_passed,
     }
 
 
@@ -1759,7 +2005,7 @@ async def tg_send(text):
 
 def format_balance(strategy, s):
     return (
-        f"{strategy['short']}\n"
+        f"{strategy['code']} — {strategy['short']}\n"
         f"Cash: ${s['cash']:.2f} | Realized: ${s['realized']:+.2f}\n"
         f"Open cost: ${s['open_cost']:.2f} | Equity: ${s['equity_cost']:.2f}"
     )
@@ -1767,10 +2013,10 @@ def format_balance(strategy, s):
 
 async def send_balance():
     for symbol in SYMBOLS:
-        pair = STRATEGIES_BY_SYMBOL[symbol]
+        variants = STRATEGIES_BY_SYMBOL[symbol]
         await tg_send(
-            f"💰 {symbol} SAFE67 BASE vs DCA\n\n"
-            + "\n\n".join(format_balance(v, account_stats(v["name"])) for v in pair)
+            f"💰 {symbol} A/B/C/E\n\n"
+            + "\n\n".join(format_balance(v, account_stats(v["name"])) for v in variants)
             + f"\n\nGlobal trading: {'ON' if trading_enabled() else 'OFF'}"
         )
 
@@ -1778,25 +2024,30 @@ async def send_balance():
 def format_stats(strategy, s):
     d = s["wins"] + s["losses"]
     wr = s["wins"] / d * 100.0 if d else 0.0
-    dca_line = ""
+    extras = []
     if strategy.get("dca_enabled"):
-        dca_line = f"\nDCA armed/filled: {s['dca_armed']}/{s['dca_filled']}"
+        extras.append(f"DCA armed/filled: {s['dca_armed']}/{s['dca_filled']}")
+    if strategy.get("consensus_enabled"):
+        extras.append(
+            f"Consensus pass/checked: {s['consensus_passed']}/{s['consensus_checked']}"
+        )
+    suffix = ("\n" + "\n".join(extras)) if extras else ""
     return (
-        f"{strategy['short']}\n"
+        f"{strategy['code']} — {strategy['short']}\n"
         f"Markets: {s['traded_markets']} | W/L {s['wins']}/{s['losses']} ({wr:.1f}%)\n"
         f"Gate pass/skip: {s['gate_pass']}/{s['gate_skip']} | Buys: {s['buy_trades']}\n"
         f"Fees: ${s['fees']:.2f} | Avg W/L: ${s['avg_win']:+.2f}/${s['avg_loss']:+.2f}\n"
         f"Worst: ${s['worst']:+.2f} | PnL: ${s['realized']:+.2f}"
-        + dca_line
+        + suffix
     )
 
 
 async def send_statistics():
     for symbol in SYMBOLS:
-        pair = STRATEGIES_BY_SYMBOL[symbol]
+        variants = STRATEGIES_BY_SYMBOL[symbol]
         await tg_send(
-            f"📊 {symbol} SAFE67 BASE vs REVERSAL DCA\n\n"
-            + "\n\n".join(format_stats(v, account_stats(v["name"])) for v in pair)
+            f"📊 {symbol} SAFE67 A/B/C/E\n\n"
+            + "\n\n".join(format_stats(v, account_stats(v["name"])) for v in variants)
         )
 
 
@@ -1825,8 +2076,8 @@ async def send_positions():
                 if variant.get("dca_enabled") and st.get("dca_armed") and not pos.get("has_dca"):
                     extra = " | DCA ARMED"
                 lines.append(
-                    f"{'A' if not variant.get('dca_enabled') else 'B'} "
-                    f"{r['outcome']} {pos['remaining']:.2f}sh | cost ${pos['buy_cost']:.2f}{extra}"
+                    f"{variant['code']} {r['outcome']} {pos['remaining']:.2f}sh | "
+                    f"cost ${pos['buy_cost']:.2f}{extra}"
                 )
         if lines:
             await tg_send(f"📈 {symbol} OPEN POSITIONS\n" + "\n".join(lines))
@@ -1841,17 +2092,16 @@ async def send_trades():
             with db() as conn:
                 rows = conn.execute("""
                     SELECT trade_ms AS ms,outcome,signal_type,filled_shares,avg_price,total_cost
-                    FROM paper_trades WHERE variant=? ORDER BY trade_ms DESC LIMIT 8
+                    FROM paper_trades WHERE variant=? ORDER BY trade_ms DESC LIMIT 6
                 """, (variant["name"],)).fetchall()
-            tag = "A" if not variant.get("dca_enabled") else "B"
             for r in rows:
                 dt = datetime.fromtimestamp(sf(r["ms"])/1000.0, tz=timezone.utc).strftime("%m-%d %H:%M:%S")
                 lines.append(
-                    f"{tag} {dt} {r['outcome']} {r['signal_type']} "
+                    f"{variant['code']} {dt} {r['outcome']} {r['signal_type']} "
                     f"{r['filled_shares']:.2f}sh @ {r['avg_price']:.3f}"
                 )
         if lines:
-            await tg_send(f"📜 {symbol} LAST ACTIONS\n" + "\n".join(lines[:16]))
+            await tg_send(f"📜 {symbol} LAST ACTIONS\n" + "\n".join(lines[:24]))
 
 
 async def handle_tg(text):
@@ -1859,17 +2109,20 @@ async def handle_tg(text):
     if cmd in {"/START", "▶️ START", "START"}:
         state_set("trading_enabled", "1")
         await tg_send(
-            "▶️ MULTI7 SAFE67 BASE/DCA STARTED\n"
+            "▶️ MULTI7 SAFE67 A/B/C/E STARTED\n"
             f"Assets: {', '.join(SYMBOLS)}\n"
-            f"A: SAFE67 ENTRY {ENTRY_ORDER_SIZE:g}sh only\n"
-            f"B: same ENTRY; arm <= {DCA_ARM_PRICE:.2f}; later rebound "
-            f">= +{DCA_REBOUND_MOM:.2f} with ask <= {DCA_MAX_BUY_PRICE:.2f} "
-            f"-> DCA {DCA_ORDER_SIZE:g}sh; deadline {DCA_DEADLINE_SEC:g}s\n"
+            f"A: 0.67–0.75, ENTRY {ENTRY_ORDER_SIZE:g}sh only\n"
+            f"B: A entry + reversal DCA {DCA_ORDER_SIZE:g}sh; arm <= {DCA_ARM_PRICE:.2f}; "
+            f"rebound >= +{DCA_REBOUND_MOM:.2f}, ask <= {DCA_MAX_BUY_PRICE:.2f}, deadline {DCA_DEADLINE_SEC:g}s\n"
+            f"C: ENTRY {C_SAFE_ENTRY_PRICE_MIN:.2f}–{C_SAFE_ENTRY_PRICE_MAX:.2f}; "
+            f"DCA arm <= {DCA_ARM_PRICE:.2f}; buy only {C_DCA_MIN_BUY_PRICE:.2f}–{C_DCA_MAX_BUY_PRICE:.2f}, "
+            f"momentum +{C_DCA_REBOUND_MOM_MIN:.2f}…+{C_DCA_REBOUND_MOM_MAX:.2f}\n"
+            f"E: A entry + >= {CONSENSUS_MIN_OTHER_TOKENS} other same-side A signals in previous {CONSENSUS_WINDOW_SEC:g}s\n"
             "NO STOP-LOSS | PAPER only"
         )
     elif cmd in {"⏹ STOP", "STOP", "/STOP", "🚨 EMERGENCY STOP", "EMERGENCY STOP"}:
         state_set("trading_enabled", "0")
-        await tg_send("⏹ New PAPER ENTRY/DCA actions stopped on all tokens.")
+        await tg_send("⏹ New PAPER actions stopped on all tokens.")
     elif cmd in {"💰 BALANCE", "BALANCE", "/BALANCE"}:
         await send_balance()
     elif cmd in {"📊 STATISTICS", "STATISTICS", "/STATS"}:
@@ -1881,15 +2134,14 @@ async def handle_tg(text):
     elif cmd in {"🟢 PAPER", "PAPER"}:
         await tg_send("🟢 PAPER mode. No real Polymarket orders are sent.")
     elif cmd in {"🔴 LIVE", "LIVE"}:
-        await tg_send("🔒 LIVE is disabled. This build is a clean multi-token BASE-vs-DCA PAPER test.")
+        await tg_send("🔒 LIVE is disabled. This build is a clean A/B/C/E PAPER experiment.")
     else:
         await tg_send(
-            "MULTI7 SAFE67 BASE vs REVERSAL DCA\n"
-            f"Assets: {', '.join(SYMBOLS)}\n"
-            f"A: ENTRY {ENTRY_ORDER_SIZE:g}sh only.\n"
-            f"B: ENTRY {ENTRY_ORDER_SIZE:g}sh; ask <= {DCA_ARM_PRICE:.2f} arms DCA; "
-            f"later momentum >= +{DCA_REBOUND_MOM:.2f} and ask <= {DCA_MAX_BUY_PRICE:.2f} "
-            f"buys {DCA_ORDER_SIZE:g}sh. Deadline {DCA_DEADLINE_SEC:g}s.\n"
+            "MULTI7 SAFE67 A/B/C/E\n"
+            "A = BASE 0.67–0.75, 5sh\n"
+            "B = A + reversal DCA 5sh\n"
+            "C = 0.67–0.70 + safer reversal DCA 5sh\n"
+            f"E = A + cross-token consensus ({CONSENSUS_MIN_OTHER_TOKENS} other tokens / {CONSENSUS_WINDOW_SEC:g}s)\n"
             "No stop-loss. No switch."
         )
 
@@ -1904,7 +2156,7 @@ async def telegram_loop():
         f"Assets: {', '.join(SYMBOLS)}\n"
         f"Accounts: {len(STRATEGIES)} × ${PAPER_START_BALANCE:.0f}\n"
         f"Trading: {'ON' if trading_enabled() else 'OFF'}\n"
-        "Hourly multi-token ZIP reports enabled."
+        "Hourly A/B/C/E ZIP reports enabled."
     )
     while True:
         try:
@@ -1959,6 +2211,7 @@ def strategy_summary(strategy, start_ms, end_ms):
         exit_proceeds = sum(sf(r["exit_proceeds"]) for r in traded)
         wins = [r for r in traded if sf(r["pnl"]) > 0]
         losses = [r for r in traded if sf(r["pnl"]) < 0]
+
         buy_fees = sf(conn.execute(
             "SELECT COALESCE(SUM(fee),0) f FROM paper_trades WHERE variant=? AND trade_ms>=? AND trade_ms<?",
             (name, start_ms, end_ms),
@@ -1991,25 +2244,47 @@ def strategy_summary(strategy, start_ms, end_ms):
             "SELECT COUNT(*) c FROM dca_events WHERE variant=? AND filled_ms>=? AND filled_ms<?",
             (name, start_ms, end_ms),
         ).fetchone()["c"])
+        consensus_checked = si(conn.execute(
+            "SELECT COUNT(*) c FROM consensus_events WHERE variant=? AND decision_ms>=? AND decision_ms<?",
+            (name, start_ms, end_ms),
+        ).fetchone()["c"])
+        consensus_passed = si(conn.execute(
+            "SELECT COUNT(*) c FROM consensus_events WHERE variant=? AND decision_ms>=? AND decision_ms<? AND passed=1",
+            (name, start_ms, end_ms),
+        ).fetchone()["c"])
 
     wr = 100.0 * len(wins)/(len(wins)+len(losses)) if wins or losses else 0.0
     avg_win = sum(sf(r["pnl"]) for r in wins)/len(wins) if wins else 0.0
     avg_loss = sum(sf(r["pnl"]) for r in losses)/len(losses) if losses else 0.0
+
     return {
         "symbol": strategy["symbol"],
+        "code": strategy["code"],
         "variant": name,
         "short": strategy["short"],
         "dca_enabled": bool(strategy.get("dca_enabled", False)),
+        "consensus_enabled": bool(strategy.get("consensus_enabled", False)),
         "entry_order_size": ENTRY_ORDER_SIZE,
         "dca_order_size": DCA_ORDER_SIZE if strategy.get("dca_enabled") else 0.0,
-        "dca_arm_price": DCA_ARM_PRICE if strategy.get("dca_enabled") else "",
-        "dca_max_buy_price": DCA_MAX_BUY_PRICE if strategy.get("dca_enabled") else "",
-        "dca_rebound_mom": DCA_REBOUND_MOM if strategy.get("dca_enabled") else "",
-        "dca_deadline_sec": DCA_DEADLINE_SEC if strategy.get("dca_enabled") else "",
-        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
-        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
-        "safe_entry_mom_min": SAFE_ENTRY_MOM_MIN,
-        "safe_entry_mom_max": SAFE_ENTRY_MOM_MAX,
+        "v2_price_min": strategy["v2_price_min"],
+        "v2_price_max": strategy["v2_price_max"],
+        "v2_mom_min": strategy["v2_mom_min"],
+        "v2_mom_max": strategy["v2_mom_max"],
+        "safe_entry_price_min": strategy["safe_entry_price_min"],
+        "safe_entry_price_max": strategy["safe_entry_price_max"],
+        "safe_entry_mom_min": strategy["safe_entry_mom_min"],
+        "safe_entry_mom_max": strategy["safe_entry_mom_max"],
+        "dca_arm_price": strategy.get("dca_arm_price", ""),
+        "dca_min_buy_price": strategy.get("dca_min_buy_price", ""),
+        "dca_max_buy_price": strategy.get("dca_max_buy_price", ""),
+        "dca_rebound_mom_min": strategy.get("dca_rebound_mom", ""),
+        "dca_rebound_mom_max": (
+            "" if strategy.get("dca_rebound_mom_max") is None
+            else strategy.get("dca_rebound_mom_max")
+        ),
+        "dca_deadline_sec": strategy.get("dca_deadline_sec", ""),
+        "consensus_window_sec": strategy.get("consensus_window_sec", ""),
+        "consensus_min_other_tokens": strategy.get("consensus_min_other_tokens", ""),
         "markets_settled": len(rows),
         "traded_markets": len(traded),
         "winning_markets": len(wins),
@@ -2021,6 +2296,8 @@ def strategy_summary(strategy, start_ms, end_ms):
         "exit_trades": exits,
         "dca_armed": dca_armed,
         "dca_filled": dca_filled,
+        "consensus_checked": consensus_checked,
+        "consensus_passed": consensus_passed,
         "fees": round(buy_fees + exit_fees, 5),
         "buy_cost": round(buy_cost, 5),
         "exit_proceeds": round(exit_proceeds, 5),
@@ -2034,28 +2311,46 @@ def strategy_summary(strategy, start_ms, end_ms):
     }
 
 
-def variant_report_text(strategy, summary, start_ts, end_ts, traj_count):
-    if strategy.get("dca_enabled"):
-        extra_rule = (
-            f"DCA: arm when held-side ask <= {DCA_ARM_PRICE:.2f}; NO BUY on arm. "
-            f"On a later tick buy {DCA_ORDER_SIZE:.1f}sh only if momentum >= +{DCA_REBOUND_MOM:.2f} "
-            f"and ask <= {DCA_MAX_BUY_PRICE:.2f}; deadline {DCA_DEADLINE_SEC:.0f}s; max {ENTRY_ORDER_SIZE + DCA_ORDER_SIZE:.1f}sh"
+def variant_rule_text(strategy):
+    code = strategy["code"]
+    if code == "A":
+        return f"ENTRY {ENTRY_ORDER_SIZE:.1f}sh only; no DCA"
+    if code == "B":
+        return (
+            f"ENTRY {ENTRY_ORDER_SIZE:.1f}sh; DCA arm ask <= {strategy['dca_arm_price']:.2f}; "
+            f"later buy {DCA_ORDER_SIZE:.1f}sh if momentum >= +{strategy['dca_rebound_mom']:.2f} "
+            f"and ask <= {strategy['dca_max_buy_price']:.2f}; deadline {strategy['dca_deadline_sec']:.0f}s"
         )
-    else:
-        extra_rule = f"No DCA: ENTRY {ENTRY_ORDER_SIZE:.1f}sh only; max {ENTRY_ORDER_SIZE:.1f}sh"
+    if code == "C":
+        return (
+            f"ENTRY {ENTRY_ORDER_SIZE:.1f}sh; DCA arm ask <= {strategy['dca_arm_price']:.2f}; "
+            f"later buy {DCA_ORDER_SIZE:.1f}sh only at ask {strategy['dca_min_buy_price']:.2f}.."
+            f"{strategy['dca_max_buy_price']:.2f}, momentum +{strategy['dca_rebound_mom']:.2f}.."
+            f"+{strategy['dca_rebound_mom_max']:.2f}; deadline {strategy['dca_deadline_sec']:.0f}s"
+        )
+    if code == "E":
+        return (
+            f"ENTRY {ENTRY_ORDER_SIZE:.1f}sh only if >= {strategy['consensus_min_other_tokens']} "
+            f"OTHER tokens had same-side A/BASE SAFE67 PASS within previous "
+            f"{strategy['consensus_window_sec']:.0f}s"
+        )
+    return ""
 
-    return "\n".join([
+
+def variant_report_text(strategy, summary, start_ts, end_ts, traj_count):
+    lines = [
         strategy["short"],
-        "=" * 72,
+        "=" * 76,
         f"Version: {VERSION}",
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
         "",
         "RULES",
-        f"V2 eligible: price {V2_ELIGIBLE_PRICE_MIN:.2f}..{V2_ELIGIBLE_PRICE_MAX:.2f}, momentum {V2_ELIGIBLE_MOM_MIN:.2f}..{V2_ELIGIBLE_MOM_MAX:.2f}",
-        f"SAFE67 pass: price {SAFE_ENTRY_PRICE_MIN:.2f}..{SAFE_ENTRY_PRICE_MAX:.2f}, momentum {SAFE_ENTRY_MOM_MIN:.2f}..{SAFE_ENTRY_MOM_MAX:.2f}",
-        f"ENTRY {ENTRY_ORDER_SIZE:.1f}sh | no switch",
-        extra_rule,
-        "Stop-loss: NONE",
+        f"V2 eligible: price {strategy['v2_price_min']:.2f}..{strategy['v2_price_max']:.2f}, "
+        f"momentum {strategy['v2_mom_min']:.2f}..{strategy['v2_mom_max']:.2f}",
+        f"ENTRY gate: price {strategy['safe_entry_price_min']:.2f}..{strategy['safe_entry_price_max']:.2f}, "
+        f"momentum {strategy['safe_entry_mom_min']:.2f}..{strategy['safe_entry_mom_max']:.2f}",
+        variant_rule_text(strategy),
+        "No switch | Stop-loss: NONE",
         "",
         "RESULT",
         f"Traded markets: {summary['traded_markets']}",
@@ -2063,6 +2358,7 @@ def variant_report_text(strategy, summary, start_ts, end_ts, traj_count):
         f"Gate pass/skip: {summary['gate_passed']}/{summary['gate_skipped']}",
         f"Buys: {summary['buy_trades']}",
         f"DCA armed/filled: {summary['dca_armed']}/{summary['dca_filled']}",
+        f"Consensus pass/checked: {summary['consensus_passed']}/{summary['consensus_checked']}",
         f"Fees: ${summary['fees']:.2f}",
         f"Buy cost: ${summary['buy_cost']:.2f}",
         f"PnL: ${summary['pnl']:+.2f}",
@@ -2072,7 +2368,17 @@ def variant_report_text(strategy, summary, start_ts, end_ts, traj_count):
         f"Trajectory samples: {traj_count}",
         "",
         "PAPER ONLY.",
-    ])
+    ]
+    return "\n".join(lines)
+
+
+def variant_folder(strategy):
+    return {
+        "A": "A_safe67_base_5sh",
+        "B": "B_safe67_reversal_dca_5plus5",
+        "C": "C_tight67_70_safer_dca_5plus5",
+        "E": "E_safe67_consensus_5sh",
+    }[strategy["code"]]
 
 
 def make_report(start_ts, end_ts):
@@ -2088,34 +2394,42 @@ def make_report(start_ts, end_ts):
 
     d1 = datetime.fromtimestamp(start_ts, tz=timezone.utc)
     d2 = datetime.fromtimestamp(end_ts, tz=timezone.utc)
-    path = REPORT_DIR / f"strategy_sim_MULTI7_BASE_DCA_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
+    path = REPORT_DIR / f"strategy_sim_MULTI7_ABCE_{d1:%Y-%m-%d_%H-%M}_{d2:%H-%M}_UTC.zip"
 
     overview = [
-        "M03 V2 SAFE67 — MULTI7 BASE vs REVERSAL DCA",
+        "M03 V2 SAFE67 — MULTI7 A/B/C/E",
         "=" * 78,
         f"Period UTC: {utc_iso(start_ts)} -> {utc_iso(end_ts)}",
         f"Assets: {', '.join(SYMBOLS)}",
-        f"A = SAFE67 ENTRY {ENTRY_ORDER_SIZE:.1f}sh only; no stop",
+        f"A: ENTRY {SAFE_ENTRY_PRICE_MIN:.2f}..{SAFE_ENTRY_PRICE_MAX:.2f}, 5sh only",
+        f"B: same A entry + reversal DCA 5sh",
         (
-            f"B = same SAFE67 ENTRY; arm when ask <= {DCA_ARM_PRICE:.2f}; "
-            f"later momentum >= +{DCA_REBOUND_MOM:.2f}, ask <= {DCA_MAX_BUY_PRICE:.2f} "
-            f"-> DCA {DCA_ORDER_SIZE:.1f}sh; deadline {DCA_DEADLINE_SEC:.0f}s; no stop"
+            f"C: ENTRY {C_SAFE_ENTRY_PRICE_MIN:.2f}..{C_SAFE_ENTRY_PRICE_MAX:.2f}; "
+            f"DCA buy only {C_DCA_MIN_BUY_PRICE:.2f}..{C_DCA_MAX_BUY_PRICE:.2f}, "
+            f"momentum +{C_DCA_REBOUND_MOM_MIN:.2f}..+{C_DCA_REBOUND_MOM_MAX:.2f}"
         ),
+        (
+            f"E: A entry + >= {CONSENSUS_MIN_OTHER_TOKENS} other-token same-side "
+            f"A/BASE SAFE67 passes in previous {CONSENSUS_WINDOW_SEC:.0f}s"
+        ),
+        "NO STOP-LOSS",
         "",
     ]
 
     for symbol in SYMBOLS:
-        a, b = STRATEGIES_BY_SYMBOL[symbol]
-        sa, sb = summary_by_name[a["name"]], summary_by_name[b["name"]]
+        variants = STRATEGIES_BY_SYMBOL[symbol]
         overview.append(f"[{symbol}]")
-        overview.append(
-            f"A BASE: PnL ${sa['pnl']:+.2f} | W/L {sa['winning_markets']}/{sa['losing_markets']} | "
-            f"fees ${sa['fees']:.2f}"
-        )
-        overview.append(
-            f"B DCA:  PnL ${sb['pnl']:+.2f} | W/L {sb['winning_markets']}/{sb['losing_markets']} | "
-            f"fees ${sb['fees']:.2f} | DCA {sb['dca_armed']}/{sb['dca_filled']}"
-        )
+        for v in variants:
+            s = summary_by_name[v["name"]]
+            extra = ""
+            if v["code"] in {"B", "C"}:
+                extra = f" | DCA {s['dca_armed']}/{s['dca_filled']}"
+            elif v["code"] == "E":
+                extra = f" | CONS {s['consensus_passed']}/{s['consensus_checked']}"
+            overview.append(
+                f"{v['code']}: PnL ${s['pnl']:+.2f} | W/L "
+                f"{s['winning_markets']}/{s['losing_markets']} | fees ${s['fees']:.2f}{extra}"
+            )
         overview.append("")
 
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
@@ -2126,12 +2440,7 @@ def make_report(start_ts, end_ts):
         for symbol in SYMBOLS:
             for strategy in STRATEGIES_BY_SYMBOL[symbol]:
                 name = strategy["name"]
-                variant_folder = (
-                    "A_safe67_base_5sh"
-                    if not strategy.get("dca_enabled")
-                    else "B_safe67_reversal_dca_5plus5"
-                )
-                folder = f"{symbol}/{variant_folder}"
+                folder = f"{symbol}/{variant_folder(strategy)}"
 
                 with db() as conn:
                     gates = conn.execute(
@@ -2150,6 +2459,10 @@ def make_report(start_ts, end_ts):
                            )
                            ORDER BY armed_ms""",
                         (name, sm, em, sm, em),
+                    ).fetchall()
+                    consensus = conn.execute(
+                        "SELECT * FROM consensus_events WHERE variant=? AND decision_ms>=? AND decision_ms<? ORDER BY decision_ms",
+                        (name, sm, em),
                     ).fetchall()
                     signals = conn.execute(
                         "SELECT * FROM signals WHERE variant=? AND signal_ms>=? AND signal_ms<? ORDER BY signal_ms",
@@ -2172,6 +2485,7 @@ def make_report(start_ts, end_ts):
                 z.writestr(f"{folder}/gate_decisions.csv", csv_bytes(gates))
                 z.writestr(f"{folder}/paper_trades.csv", csv_bytes(buys))
                 z.writestr(f"{folder}/dca_events.csv", csv_bytes(dca))
+                z.writestr(f"{folder}/consensus_events.csv", csv_bytes(consensus))
                 z.writestr(f"{folder}/signals.csv", csv_bytes(signals))
                 z.writestr(f"{folder}/market_results.csv", csv_bytes(results))
                 z.writestr(f"{folder}/position_trajectory.csv", csv_bytes(traj))
@@ -2220,16 +2534,19 @@ async def report_loop():
                 by_name = {s["variant"]: s for s in summaries}
 
                 lines = [
-                    "🧪 MULTI7 SAFE67 BASE vs DCA",
+                    "🧪 MULTI7 SAFE67 A/B/C/E",
                     f"{utc_iso(start)} → {utc_iso(end)}",
                 ]
                 for symbol in SYMBOLS:
-                    a, b = STRATEGIES_BY_SYMBOL[symbol]
-                    sa, sb = by_name[a["name"]], by_name[b["name"]]
+                    a, b, c, e = STRATEGIES_BY_SYMBOL[symbol]
+                    sa, sb, sc, se = (
+                        by_name[a["name"]], by_name[b["name"]],
+                        by_name[c["name"]], by_name[e["name"]],
+                    )
                     lines.append(
-                        f"{symbol}: A ${sa['pnl']:+.2f} ({sa['winning_markets']}/{sa['losing_markets']}) | "
-                        f"B ${sb['pnl']:+.2f} ({sb['winning_markets']}/{sb['losing_markets']}) "
-                        f"DCA {sb['dca_armed']}/{sb['dca_filled']}"
+                        f"{symbol}: A {sa['pnl']:+.2f} | B {sb['pnl']:+.2f} | "
+                        f"C {sc['pnl']:+.2f} | E {se['pnl']:+.2f} "
+                        f"(E {se['winning_markets']}/{se['losing_markets']})"
                     )
 
                 if not await tg_file(path, "\n".join(lines)):
@@ -2255,21 +2572,41 @@ async def health(request):
         "accounts": [
             {
                 "symbol": v["symbol"],
+                "code": v["code"],
                 "name": v["name"],
                 "short": v["short"],
                 "cash": paper_cash(v["name"]),
                 "dca_enabled": bool(v.get("dca_enabled")),
+                "consensus_enabled": bool(v.get("consensus_enabled")),
             }
             for v in STRATEGIES
         ],
-        "entry_order_size": ENTRY_ORDER_SIZE,
-        "dca_order_size": DCA_ORDER_SIZE,
-        "safe_entry_price": [SAFE_ENTRY_PRICE_MIN, SAFE_ENTRY_PRICE_MAX],
-        "safe_entry_momentum": [SAFE_ENTRY_MOM_MIN, SAFE_ENTRY_MOM_MAX],
-        "dca_arm_price": DCA_ARM_PRICE,
-        "dca_max_buy_price": DCA_MAX_BUY_PRICE,
-        "dca_rebound_momentum": DCA_REBOUND_MOM,
-        "dca_deadline_sec": DCA_DEADLINE_SEC,
+        "rules": {
+            "A_entry": [SAFE_ENTRY_PRICE_MIN, SAFE_ENTRY_PRICE_MAX],
+            "B_entry": [SAFE_ENTRY_PRICE_MIN, SAFE_ENTRY_PRICE_MAX],
+            "C_entry": [C_SAFE_ENTRY_PRICE_MIN, C_SAFE_ENTRY_PRICE_MAX],
+            "E_entry": [SAFE_ENTRY_PRICE_MIN, SAFE_ENTRY_PRICE_MAX],
+            "entry_momentum": [SAFE_ENTRY_MOM_MIN, SAFE_ENTRY_MOM_MAX],
+            "B_dca": {
+                "arm_max": DCA_ARM_PRICE,
+                "buy_max": DCA_MAX_BUY_PRICE,
+                "momentum_min": DCA_REBOUND_MOM,
+                "deadline_sec": DCA_DEADLINE_SEC,
+            },
+            "C_dca": {
+                "arm_max": DCA_ARM_PRICE,
+                "buy_min": C_DCA_MIN_BUY_PRICE,
+                "buy_max": C_DCA_MAX_BUY_PRICE,
+                "momentum_min": C_DCA_REBOUND_MOM_MIN,
+                "momentum_max": C_DCA_REBOUND_MOM_MAX,
+                "deadline_sec": DCA_DEADLINE_SEC,
+            },
+            "E_consensus": {
+                "other_tokens_min": CONSENSUS_MIN_OTHER_TOKENS,
+                "window_sec": CONSENSUS_WINDOW_SEC,
+                "source": "other-token A/BASE SAFE67 PASS",
+            },
+        },
         "stop_loss": None,
         "markets_tracked": len(markets),
         "assets_subscribed": len(subscribed_assets),
@@ -2294,7 +2631,7 @@ async def main():
     global session
     init_db()
     session = aiohttp.ClientSession(headers={
-        "User-Agent": f"M03Safe67Multi7BaseVsDCA/{VERSION}",
+        "User-Agent": f"M03Safe67Multi7ABCE/{VERSION}",
         "Accept": "application/json",
     })
     tasks = [
@@ -2308,12 +2645,12 @@ async def main():
         asyncio.create_task(memory_maintenance_loop()),
     ]
     log.info(
-        "%s started | symbols=%s | accounts=%d | A=BASE %.1fsh | "
-        "B=ENTRY %.1fsh + DCA %.1fsh (arm<=%.2f rebound>=+%.2f buy<=%.2f deadline %.0fs) | "
-        "STOP=OFF | trading=%s",
+        "%s started | symbols=%s | accounts=%d | "
+        "A=BASE 5 | B=DCA 5+5 | C=TIGHT %.2f..%.2f + SAFE-DCA | "
+        "E=CONSENSUS %d others/%gs | STOP=OFF | trading=%s",
         VERSION, ",".join(SYMBOLS), len(STRATEGIES),
-        ENTRY_ORDER_SIZE, ENTRY_ORDER_SIZE, DCA_ORDER_SIZE,
-        DCA_ARM_PRICE, DCA_REBOUND_MOM, DCA_MAX_BUY_PRICE, DCA_DEADLINE_SEC,
+        C_SAFE_ENTRY_PRICE_MIN, C_SAFE_ENTRY_PRICE_MAX,
+        CONSENSUS_MIN_OTHER_TOKENS, CONSENSUS_WINDOW_SEC,
         "ON" if trading_enabled() else "OFF",
     )
     try:
