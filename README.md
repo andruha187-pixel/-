@@ -1,225 +1,161 @@
-# MULTI7 SAFE67 — A / B / C / E
+# BNB + ETH G/H FIRST‑V2 Consensus — 1s / ~6s MOMENTUM — PAPER/LIVE
 
-PAPER-only experiment on seven Polymarket 5-minute crypto chains:
+Экспериментальная торговая версия стратегий **G и H**. Реальные и PAPER-сделки открываются **только на BNB и ETH**.
 
-```text
-BTC
-XRP
-BNB
-SOL
-ETH
-DOGE
-HYPE (Hyperliquid)
-```
+Главное отличие от предыдущей сборки:
 
-There are **4 independent strategies per token = 28 PAPER accounts**.  
-Each account starts at `$500` by default.
+- decision cycle: **1.0 sec** вместо 3 sec;
+- momentum НЕ сокращён до 2 секунд;
+- reference price ищется примерно **6 секунд назад по timestamp**, чтобы сохранить смысл исходного `2 ticks × 3 sec ≈ 6 sec`;
+- все остальные правила G/H, PAPER/LIVE, Telegram, размеры shares и FAK execution оставлены теми же.
 
-There is **no stop-loss** in any strategy.
+При этом бот продолжает наблюдать 7 пятиминутных рынков:
 
-## Common signal engine
+`BTC, XRP, BNB, SOL, ETH, DOGE, HYPE`
 
-All strategies keep the same first-V2 concept:
+Это обязательно для исходной логики G/H: целевому BNB или ETH нужны **минимум 2 DISTINCT OTHER токена** с одинаковым FIRST‑V2 направлением за предыдущие 10 секунд. Остальные пять токенов являются только источниками голосов и никогда не открывают позиции.
 
-```text
-V2 eligible:
-price    0.55..0.75
-momentum 0.03..0.30
-lookback 2 decision ticks
+## Стратегия G
 
-decision loop ~3 seconds
-trade window first 180 seconds
-no side switching
-no pre-decision REST refresh
-```
+FIRST‑V2 голос любого наблюдаемого токена:
 
-The first V2-eligible signal decides that strategy's market gate permanently.
+- price `0.55..0.75`
+- momentum `0.03..0.30`
+- momentum reference: примерно `6 sec` назад по timestamp (при sampling каждые `1 sec`)
 
-## A — SAFE67 BASE
+Для BNB/ETH G:
 
-```text
-ENTRY price    0.67..0.75
-ENTRY momentum 0.05..0.10
-ENTRY size     5 shares
+- target ask `0.67..0.70`
+- target momentum `+0.05..+0.10`
+- минимум `2` других токена
+- то же направление
+- FIRST‑V2 голоса в предыдущие `10 sec`
+- один ENTRY
+- DCA нет
+- stop-loss нет
+- side switching нет
 
-No DCA
-No stop-loss
-Max position 5 shares
-```
+Default ENTRY: **5 shares**.
 
-This is the clean BASE control.
+## Стратегия H
 
-## B — SAFE67 REVERSAL DCA
+ENTRY полностью совпадает с G.
 
-The previous B logic is preserved:
+После фактического ENTRY разрешён один safer reversal DCA:
 
-```text
-ENTRY price    0.67..0.75
-ENTRY momentum 0.05..0.10
-ENTRY size     5 shares
+1. held-side ask `<= 0.50` при elapsed `<=120 sec` → DCA ARMED;
+2. на tick, где произошло ARM, покупки нет;
+3. на более позднем tick ask должен быть `0.30..0.60`;
+4. rebound momentum должен быть `+0.05..+0.15`;
+5. elapsed `<=120 sec`;
+6. один DCA максимум.
 
-DCA arm:
-held-side ask <= 0.50
-elapsed <= 120 sec
-NO BUY on the arming tick
+Default: **ENTRY 5 shares + DCA 5 shares**.
 
-Later rebound:
-momentum >= +0.05
-ask <= 0.60
-DCA size = 5 shares
-one DCA only
-```
+## Настройка shares из Telegram
 
-B deliberately has **no new 0.30 floor and no +0.15 momentum cap**. This keeps it as the old DCA control.
-
-## C — TIGHT ENTRY + SAFER DCA
-
-This is the new variant we agreed to test:
+Быстро на весь токен:
 
 ```text
-ENTRY price    0.67..0.70
-ENTRY momentum 0.05..0.10
-ENTRY size     5 shares
+SIZE BNB 7 7
 ```
 
-DCA:
+Это означает:
+
+- BNB G ENTRY = 7
+- BNB H ENTRY = 7
+- BNB H DCA = 7
+
+Отдельно по стратегиям:
 
 ```text
-arm when held-side ask <= 0.50
-do not buy on the arm tick
-
-on a later tick:
-ask      0.30..0.60
-momentum +0.05..+0.15
-elapsed  <= 120 sec
-
-DCA = 5 shares
-one DCA only
-max position = 10 shares
+SIZE BNB G 7
+SIZE BNB H 7 5
+SIZE ETH G 5
+SIZE ETH H 5 5
 ```
 
-If a rebound happens below `0.30`, C does **not** buy it.  
-If rebound momentum is above `+0.15`, C also does **not** buy it.
+Размер нельзя менять, пока у конкретной стратегии есть открытая bot-tracked позиция.
 
-No stop-loss.
+## PAPER / LIVE отдельно для G и H
 
-## E — SAFE67 CROSS-TOKEN CONSENSUS
-
-E uses the same target-token entry threshold as A:
+Каждая из четырёх стратегий имеет независимый режим:
 
 ```text
-target price    0.67..0.75
-target momentum 0.05..0.10
-ENTRY size      5 shares
+BNB G
+BNB H
+ETH G
+ETH H
 ```
 
-But the entry is allowed only if, at the target's first SAFE67 decision:
+Команды:
 
 ```text
-at least 2 DISTINCT OTHER tokens
-had an A/BASE SAFE67 PASS
-in the SAME direction
-within the previous 10 seconds
+MODE BNB G PAPER
+MODE BNB G OFF
+MODE BNB G LIVE
+CONFIRM LIVE BNB G
+
+MODE BNB H PAPER
+MODE BNB H LIVE
+CONFIRM LIVE BNB H
 ```
 
-Example:
+LIVE требует одновременно:
 
-```text
-ETH A -> UP
-SOL A -> UP
-BTC E target -> UP
-```
+1. `LIVE_MASTER_ENABLE=1` в Environment;
+2. готовый Polymarket wallet SDK;
+3. `MODE <TOKEN> <G/H> LIVE`;
+4. `CONFIRM LIVE <TOKEN> <G/H>` в течение 60 секунд.
 
-If both ETH and SOL votes are inside the 10-second window:
+**Важно:** если одновременно включить `BNB G = LIVE` и `BNB H = LIVE`, при одном и том же G/H entry-сигнале будут отправлены **два независимых реальных ENTRY**. Это ожидаемое поведение двух стратегий. Если нужна только одна реальная позиция, вторую стратегию оставь PAPER или OFF.
 
-```text
-BTC E -> BUY 5 shares
-```
-
-Rules:
-
-- the target token itself never counts;
-- one other token counts at most once;
-- only **A/BASE SAFE67 PASS** is used as a vote;
-- opposite-side signals do not count;
-- if fewer than 2 confirmations exist at the first target SAFE67 decision, E skips that market permanently;
-- E does not wait for confirmations to appear later;
-- E has no DCA and no stop-loss.
-
-The strategy loop is two-phase: all A/B/C decisions for all active tokens are processed first from the shared ~3-second WebSocket snapshot, then E is evaluated. This means genuinely simultaneous same-cycle A signals can count as consensus; signals that arrive in later cycles cannot revive an already-skipped E market.
-
-## Hourly ZIP
-
-One combined ZIP is sent each hour.
-
-Root:
-
-```text
-variants_summary.csv
-markets.csv
-report.txt
-```
-
-Each token has four folders, for example:
-
-```text
-BTC/A_safe67_base_5sh/
-BTC/B_safe67_reversal_dca_5plus5/
-BTC/C_tight67_70_safer_dca_5plus5/
-BTC/E_safe67_consensus_5sh/
-```
-
-The same structure exists for XRP, BNB, SOL, ETH, DOGE and HYPE.
-
-Every strategy folder contains:
-
-```text
-summary.csv
-gate_decisions.csv
-paper_trades.csv
-dca_events.csv
-consensus_events.csv
-signals.csv
-market_results.csv
-position_trajectory.csv
-report.txt
-```
-
-For E, `consensus_events.csv` records:
-
-```text
-target token
-target side
-target ask
-target momentum
-required confirmation count
-actual confirmation count
-confirming symbols
-age of each confirmation in milliseconds
-PASS/SKIP reason
-```
-
-This lets us later compare 2-vote vs 3-vote consensus and 5/10/15-second windows without guessing.
-
-## Telegram
-
-Buttons stay:
+## Telegram buttons
 
 ```text
 START
 STOP
+MODES
+SIZES
 BALANCE
-STATISTICS
 POSITIONS
+STATISTICS
 TRADES
-PAPER
-LIVE
+WALLET
 EMERGENCY STOP
 ```
 
-LIVE is disabled in this experiment.
+`STOP` / `EMERGENCY STOP` блокирует новые ENTRY/DCA. Стратегия stop-loss не используется.
 
-`STATISTICS` reports A/B/C/E separately for each token, including DCA armed/filled for B/C and consensus pass/checked for E.
+## LIVE order execution
+
+LIVE использует защитный wrapper из торгового бота:
+
+- `LIVE_MASTER_ENABLE`;
+- отдельный PAPER/LIVE/OFF mode;
+- 60-секундное подтверждение LIVE;
+- fresh-book check перед execution;
+- signed limit order, конвертированный в `FAK`;
+- requested shares — максимальный объём попытки исполнения;
+- при неоднозначной ошибке submission этот market/action становится fail-closed и автоматически повторно не отправляется;
+- режим PAPER↔LIVE нельзя пересечь при открытой позиции этой стратегии.
+
+Частичный fill возможен, если в видимом стакане недостаточно ликвидности.
+
+## Timing этого эксперимента
+
+По умолчанию:
+
+```text
+DECISION_INTERVAL=1.0
+MOMENTUM_LOOKBACK_SEC=6.0
+```
+
+Это означает: бот обновляет свою decision-history примерно каждую секунду, но momentum для FIRST-V2, ENTRY и H DCA считается относительно последней доступной цены примерно 6 секунд назад. Поэтому пороги momentum `0.03..0.30`, `0.05..0.10` и `0.05..0.15` не превращаются в 2-секундные пороги.
+
+`LOOKBACK_TICKS=2` оставлен для совместимости структуры стратегии с исходным ботом, но в этой версии временной горизонт momentum задаёт `MOMENTUM_LOOKBACK_SEC`.
+
+Параметры G/H используют те же имена ENV, что исходный тестовый бот: `C_SAFE_ENTRY_PRICE_*`, `G_CONSENSUS_MIN_OTHER_TOKENS`, `H_CONSENSUS_MIN_OTHER_TOKENS`, `C_DCA_*`.
 
 ## Render
 
@@ -241,37 +177,41 @@ Persistent disk:
 /var/data
 ```
 
-Fresh DB:
+Новая база:
 
 ```text
-/var/data/safe67_multi7_abce.db
+/var/data/bnb_eth_gh_1s6s_paper_live.db
 ```
 
-Hourly reports:
+Hourly ZIP reports в этой торговой сборке отключены.
+
+## Первый запуск
+
+Сначала оставь:
 
 ```text
-/var/data/safe67_multi7_abce_reports
+LIVE_MASTER_ENABLE=0
 ```
 
-After a fresh deploy trading starts OFF. Press `START`.
+После deploy нажми `WALLET`. Проверь SDK, wallet и collateral. Потом при необходимости включай master и redeploy.
 
-## Verification
-
-`strategy_parity_check.txt` verifies that:
-
-- the first V2 candidate function is exact versus the previous MULTI7 A/B bot;
-- the complete SAFE67 gate + first ENTRY block used by A/B/C is exact;
-- multi-asset discovery/parser functions are unchanged;
-- B does not accidentally inherit C's new DCA floor/cap.
-
-Regression:
+Для первого реального теста лучше оставить только одну стратегию LIVE, например:
 
 ```text
-python test_multi7_abce.py
+MODE BNB H LIVE
+CONFIRM LIVE BNB H
+```
+
+а остальные держать PAPER/OFF.
+
+## Regression test
+
+```text
+python test_bnb_eth_gh.py
 ```
 
 Expected:
 
 ```text
-MULTI7 SAFE67 A/B/C/E regression: OK
+BNB/ETH G/H PAPER/LIVE regression: OK
 ```

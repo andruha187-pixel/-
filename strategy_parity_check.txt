@@ -1,39 +1,36 @@
-MULTI7 SAFE67 A/B/C/E parity check
-============================================================================
-_first_v2_eligible_candidates exact vs previous MULTI7 A/B: TRUE
-SHA256 old/new: 0555e1d69931fd91e5db8c3b7661057d02573d5c7922aa58bcaa1e68f74f6a3e
+BNB/ETH G/H PAPER/LIVE parity check
+================================================================================
 
-SAFE67 gate + first ENTRY block exact vs previous MULTI7 A/B: TRUE
-SHA256 old/new: e28f95112fee70cc33e6fcb878a7c958cb3706b86d59c7646e1b105e61932979
+Source G/H rules preserved:
+- FIRST V2 eligible: price 0.55..0.75, momentum 0.03..0.30, lookback 2 ticks.
+- Consensus source: FIRST V2-eligible vote, NOT SAFE target pass.
+- Target token never confirms itself.
+- One other token counts at most once.
+- Same-cycle votes share one decision timestamp.
+- G: target 0.67..0.70, momentum +0.05..+0.10, >=2 DISTINCT OTHER
+  same-side FIRST-V2 votes in previous 10 sec, one ENTRY, no DCA.
+- H: exact same entry gate as G.
+- H DCA: arm ask <=0.50; no buy on arm tick; later ask 0.30..0.60,
+  rebound +0.05..+0.15, elapsed <=120 sec, one DCA only.
+- No side switching.
+- No strategy stop-loss.
 
-market_symbol: EXACT vs previous MULTI7 collector
-SHA256: 94685f8c2df27b941e307b68534cc8e797783994b02ad0f0f3f4511448b87341
+Trading adaptation:
+- Tradable targets are BNB and ETH only.
+- BTC/XRP/SOL/DOGE/HYPE remain monitor-only consensus sources.
+- Four independent execution modes: BNB-G, BNB-H, ETH-G, ETH-H.
+- Default G ENTRY = 5 shares.
+- Default H ENTRY = 5 shares; H DCA = 5 shares.
+- Sizes are persisted and configurable from Telegram.
+- PAPER/LIVE/OFF is persisted per strategy.
+- LIVE execution uses the original trading bot's guarded signed FAK path.
+- Hourly ZIP reporting remains disabled in the trading build.
 
-strategies_for_market: EXACT vs previous MULTI7 collector
-SHA256: 22ac964d43b52443e34156954fe0440884044b544747f9a10f744317c9743d24
+Regression result:
+BNB/ETH G/H PAPER/LIVE regression: OK
 
-parse_market_from_event: EXACT vs previous MULTI7 collector
-SHA256: 08e0ef18fd1a6b4648469f2d14103c51d0e26ea83ea95c417886a3868f7b3000
 
-discover_slot_market: EXACT vs previous MULTI7 collector
-SHA256: d55de22613c31f1135d87c2e783a8809035357d076f75805ce30a92f77000347
-
-persist_market: EXACT vs previous MULTI7 collector
-SHA256: 2425fee19ec274b538c4d0bfe666827e407137a134c73027d9ab0baffc97afc0
-
-A remains ENTRY-only, 0.67..0.75 / momentum 0.05..0.10.
-B remains the previous reversal-DCA behavior. Regression verifies that after
-arming at <=0.50 it can still DCA at 0.25 on a +0.06 rebound (no C filter leaks into B).
-
-C intentional changes:
-ENTRY 0.67..0.70 / momentum 0.05..0.10 / 5 shares.
-DCA arm <=0.50; later buy only 0.30..0.60, momentum +0.05..+0.15,
-one 5-share DCA, through elapsed<=120s.
-
-E intentional changes:
-ENTRY uses A SAFE67 thresholds 0.67..0.75 / momentum 0.05..0.10 / 5 shares.
-Requires >=2 DISTINCT OTHER tokens with same-side A/BASE SAFE67 PASS
-within the previous 10 seconds. Target token is excluded. One token counts once.
-No DCA. No stop-loss.
-
-No stop-loss loop exists in this build.
+EXPERIMENTAL TIMING DELTA (intentional):
+- decision cycle: 1.0 sec (was 3.0 sec)
+- momentum reference: timestamp-based ~6.0 sec (preserves old effective 2 ticks x 3 sec horizon)
+- G/H thresholds and source ENV names otherwise kept at source parity.
