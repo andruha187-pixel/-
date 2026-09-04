@@ -1,116 +1,310 @@
-# BNB + ETH G/H FIRST‑V2 Consensus — 1s / ~6s MOMENTUM — PAPER/LIVE
+# MULTI7 SAFE67 A/B/C/E — PAPER/LIVE + NET TP 0.60
 
-Экспериментальная торговая версия стратегий **G и H**. Реальные и PAPER-сделки открываются **только на BNB и ETH**.
+Trading build of the uploaded MULTI7 A/B/C/E PAPER bot.
 
-Главное отличие от предыдущей сборки:
-
-- decision cycle: **1.0 sec** вместо 3 sec;
-- momentum НЕ сокращён до 2 секунд;
-- reference price ищется примерно **6 секунд назад по timestamp**, чтобы сохранить смысл исходного `2 ticks × 3 sec ≈ 6 sec`;
-- все остальные правила G/H, PAPER/LIVE, Telegram, размеры shares и FAK execution оставлены теми же.
-
-При этом бот продолжает наблюдать 7 пятиминутных рынков:
-
-`BTC, XRP, BNB, SOL, ETH, DOGE, HYPE`
-
-Это обязательно для исходной логики G/H: целевому BNB или ETH нужны **минимум 2 DISTINCT OTHER токена** с одинаковым FIRST‑V2 направлением за предыдущие 10 секунд. Остальные пять токенов являются только источниками голосов и никогда не открывают позиции.
-
-## Стратегия G
-
-FIRST‑V2 голос любого наблюдаемого токена:
-
-- price `0.55..0.75`
-- momentum `0.03..0.30`
-- momentum reference: примерно `6 sec` назад по timestamp (при sampling каждые `1 sec`)
-
-Для BNB/ETH G:
-
-- target ask `0.67..0.70`
-- target momentum `+0.05..+0.10`
-- минимум `2` других токена
-- то же направление
-- FIRST‑V2 голоса в предыдущие `10 sec`
-- один ENTRY
-- DCA нет
-- stop-loss нет
-- side switching нет
-
-Default ENTRY: **5 shares**.
-
-## Стратегия H
-
-ENTRY полностью совпадает с G.
-
-После фактического ENTRY разрешён один safer reversal DCA:
-
-1. held-side ask `<= 0.50` при elapsed `<=120 sec` → DCA ARMED;
-2. на tick, где произошло ARM, покупки нет;
-3. на более позднем tick ask должен быть `0.30..0.60`;
-4. rebound momentum должен быть `+0.05..+0.15`;
-5. elapsed `<=120 sec`;
-6. один DCA максимум.
-
-Default: **ENTRY 5 shares + DCA 5 shares**.
-
-## Настройка shares из Telegram
-
-Быстро на весь токен:
+Version:
 
 ```text
-SIZE BNB 7 7
+19.0-multi7-abce-paper-live-tp60
 ```
 
-Это означает:
+## Tokens and strategies
 
-- BNB G ENTRY = 7
-- BNB H ENTRY = 7
-- BNB H DCA = 7
-
-Отдельно по стратегиям:
+Default tokens:
 
 ```text
-SIZE BNB G 7
-SIZE BNB H 7 5
-SIZE ETH G 5
-SIZE ETH H 5 5
+BTC
+XRP
+BNB
+SOL
+ETH
+DOGE
+HYPE
 ```
 
-Размер нельзя менять, пока у конкретной стратегии есть открытая bot-tracked позиция.
-
-## PAPER / LIVE отдельно для G и H
-
-Каждая из четырёх стратегий имеет независимый режим:
+Four strategies per token = **28 independent strategy accounts**:
 
 ```text
-BNB G
-BNB H
-ETH G
-ETH H
+A
+B
+C
+E
 ```
 
-Команды:
+Each has its own mode:
 
 ```text
-MODE BNB G PAPER
-MODE BNB G OFF
-MODE BNB G LIVE
-CONFIRM LIVE BNB G
-
-MODE BNB H PAPER
-MODE BNB H LIVE
-CONFIRM LIVE BNB H
+PAPER
+LIVE
+OFF
 ```
 
-LIVE требует одновременно:
+Fresh database defaults every strategy to `PAPER`.
+Global trading starts `OFF`; use `START`.
 
-1. `LIVE_MASTER_ENABLE=1` в Environment;
-2. готовый Polymarket wallet SDK;
-3. `MODE <TOKEN> <G/H> LIVE`;
-4. `CONFIRM LIVE <TOKEN> <G/H>` в течение 60 секунд.
+## Strategy logic preserved
 
-**Важно:** если одновременно включить `BNB G = LIVE` и `BNB H = LIVE`, при одном и том же G/H entry-сигнале будут отправлены **два независимых реальных ENTRY**. Это ожидаемое поведение двух стратегий. Если нужна только одна реальная позиция, вторую стратегию оставь PAPER или OFF.
+### A — SAFE67 BASE
 
-## Telegram buttons
+```text
+FIRST V2 eligible:
+price 0.55..0.75
+momentum 0.03..0.30
+
+ENTRY:
+price 0.67..0.75
+momentum 0.05..0.10
+default 5 shares
+
+No DCA
+No stop-loss
+```
+
+### B — SAFE67 old reversal DCA
+
+```text
+ENTRY:
+price 0.67..0.75
+momentum 0.05..0.10
+default 5 shares
+
+DCA arm:
+held-side ask <= 0.50
+elapsed <= 120 sec
+NO BUY on arm tick
+
+Later:
+momentum >= +0.05
+ask <= 0.60
+default +5 shares
+one DCA
+```
+
+B intentionally keeps no `0.30` floor and no `+0.15` rebound cap.
+
+### C — tighter entry + safer reversal DCA
+
+```text
+ENTRY:
+price 0.67..0.70
+momentum 0.05..0.10
+default 5 shares
+
+DCA arm:
+ask <= 0.50
+elapsed <= 120 sec
+NO BUY on arm tick
+
+Later:
+ask 0.30..0.60
+momentum +0.05..+0.15
+default +5 shares
+one DCA
+```
+
+### E — cross-token consensus
+
+```text
+target entry:
+price 0.67..0.75
+momentum 0.05..0.10
+
+confirmation:
+>= 2 DISTINCT OTHER tokens
+with A/BASE SAFE67 PASS
+same direction
+previous 10 sec
+
+default ENTRY 5 shares
+No DCA
+```
+
+The target token does not count itself. One other token counts once.
+
+A signals are still evaluated as consensus sources even when A's trading mode is
+`OFF`; `OFF` blocks order execution, not signal/gate recording.
+
+No strategy switches sides and there is no stop-loss.
+
+## Default NET take-profit
+
+Default:
+
+```text
+TAKE_PROFIT_USDC=0.60
+```
+
+This is **+$0.60 NET for the whole remaining position**, not per share.
+
+The bot's threshold calculation includes:
+
+```text
+entry gross cost
++ entry commission
+- prior exit net
+- projected current sell net
+including projected exit commission
+```
+
+Change it in hosting Environment Variables:
+
+```text
+TAKE_PROFIT_USDC=0.30
+TAKE_PROFIT_USDC=0.60
+TAKE_PROFIT_USDC=1.00
+```
+
+Disable:
+
+```text
+TAKE_PROFIT_USDC=OFF
+```
+
+or:
+
+```text
+TAKE_PROFIT_USDC=0
+```
+
+After changing an environment variable, redeploy/restart the service.
+
+For B/C after a DCA, `0.60` is still the target for the **whole remaining
+position**, including all buys and fees.
+
+### PAPER TP
+
+PAPER requires enough visible bid depth to sell the entire remaining position.
+It does not record a partial PAPER take-profit merely to hit the threshold.
+
+### LIVE TP
+
+LIVE checks the same bot-tracked NET target, freshness-checks the book and uses
+the protected real-order path:
+
+```text
+signed LIMIT -> FAK SELL
+```
+
+A genuine partial LIVE TP fill is recorded. Once a real TP has partially filled,
+TP becomes latched and the bot continues trying to flatten the bot-tracked
+remainder on later cycles.
+
+An ambiguous submission remains fail-closed; it is not blindly duplicated.
+
+`STOP` blocks new ENTRY/DCA actions, but TP monitoring continues for already
+open bot-tracked PAPER/LIVE positions.
+
+## LIVE safety
+
+Master gate:
+
+```text
+LIVE_MASTER_ENABLE=0
+```
+
+First deploy with `0`. In Telegram use:
+
+```text
+WALLET
+```
+
+Verify:
+
+```text
+SDK: READY
+Wallet: expected address
+Collateral: expected balance
+LIVE master: OFF
+```
+
+Then set:
+
+```text
+LIVE_MASTER_ENABLE=1
+```
+
+and redeploy.
+
+Every individual strategy still needs a second 60-second Telegram confirmation:
+
+```text
+MODE BTC B LIVE
+CONFIRM LIVE BTC B
+```
+
+Examples:
+
+```text
+MODE ETH C LIVE
+CONFIRM LIVE ETH C
+
+MODE SOL E LIVE
+CONFIRM LIVE SOL E
+```
+
+Switch back:
+
+```text
+MODE BTC B PAPER
+MODE BTC B OFF
+```
+
+Mode crossing PAPER <-> LIVE is blocked while that strategy holds an open
+position in the other execution mode.
+
+## Multiple LIVE strategies on one token
+
+Default:
+
+```text
+ALLOW_MULTI_LIVE_PER_TOKEN=0
+```
+
+This prevents, for example, BTC A and BTC B from both being LIVE at the same
+time. The strategies can share a signal and would otherwise send independent
+real orders.
+
+If you deliberately want several A/B/C/E strategies LIVE on the same token:
+
+```text
+ALLOW_MULTI_LIVE_PER_TOKEN=1
+```
+
+then redeploy.
+
+Different tokens can be LIVE at the same time.
+
+## Sizes
+
+Whole token:
+
+```text
+SIZE BTC 5 5
+```
+
+sets:
+
+```text
+A ENTRY = 5
+E ENTRY = 5
+B ENTRY = 5, DCA = 5
+C ENTRY = 5, DCA = 5
+```
+
+Per strategy:
+
+```text
+SIZE BTC A 5
+SIZE BTC B 5 5
+SIZE BTC C 5 5
+SIZE BTC E 5
+```
+
+Use the other token names in the same way.
+
+Sizes cannot be changed while that strategy has an open bot-tracked position.
+
+## Telegram controls
 
 ```text
 START
@@ -125,37 +319,89 @@ WALLET
 EMERGENCY STOP
 ```
 
-`STOP` / `EMERGENCY STOP` блокирует новые ENTRY/DCA. Стратегия stop-loss не используется.
+## LIVE execution
 
-## LIVE order execution
-
-LIVE использует защитный wrapper из торгового бота:
-
-- `LIVE_MASTER_ENABLE`;
-- отдельный PAPER/LIVE/OFF mode;
-- 60-секундное подтверждение LIVE;
-- fresh-book check перед execution;
-- signed limit order, конвертированный в `FAK`;
-- requested shares — максимальный объём попытки исполнения;
-- при неоднозначной ошибке submission этот market/action становится fail-closed и автоматически повторно не отправляется;
-- режим PAPER↔LIVE нельзя пересечь при открытой позиции этой стратегии.
-
-Частичный fill возможен, если в видимом стакане недостаточно ликвидности.
-
-## Timing этого эксперимента
-
-По умолчанию:
+The real-order wrapper is the same protected pattern used in the earlier
+PAPER/LIVE bot:
 
 ```text
-DECISION_INTERVAL=1.0
-MOMENTUM_LOOKBACK_SEC=6.0
+fresh book check
+signed LIMIT order
+converted to FAK
+actual accepted fill amount persisted
 ```
 
-Это означает: бот обновляет свою decision-history примерно каждую секунду, но momentum для FIRST-V2, ENTRY и H DCA считается относительно последней доступной цены примерно 6 секунд назад. Поэтому пороги momentum `0.03..0.30`, `0.05..0.10` и `0.05..0.15` не превращаются в 2-секундные пороги.
+If the response after submission is ambiguous, that market/action is marked
+fail-closed and the bot does not automatically submit a possible duplicate.
 
-`LOOKBACK_TICKS=2` оставлен для совместимости структуры стратегии с исходным ботом, но в этой версии временной горизонт momentum задаёт `MOMENTUM_LOOKBACK_SEC`.
+LIVE settlement PnL is bot-tracked from accepted fill amounts. Winning LIVE
+shares that remain to market settlement are **not auto-redeemed** by this bot.
 
-Параметры G/H используют те же имена ENV, что исходный тестовый бот: `C_SAFE_ENTRY_PRICE_*`, `G_CONSENSUS_MIN_OTHER_TOKENS`, `H_CONSENSUS_MIN_OTHER_TOKENS`, `C_DCA_*`.
+## Hosting variables
+
+Minimum first-deploy block:
+
+```text
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_CHAT_ID=
+
+PORT=8080
+DATA_DIR=/var/data
+
+POLYMARKET_PRIVATE_KEY=
+POLYMARKET_WALLET_ADDRESS=
+
+LIVE_MASTER_ENABLE=0
+ALLOW_MULTI_LIVE_PER_TOKEN=0
+
+TAKE_PROFIT_USDC=0.60
+
+PAPER_START_BALANCE=500
+ENTRY_ORDER_SIZE=5
+DCA_ORDER_SIZE=5
+```
+
+Never put the real `POLYMARKET_PRIVATE_KEY` in GitHub. Keep it only in the
+hosting Environment/Secret store.
+
+Optional:
+
+```text
+POLYMARKET_RELAYER_API_KEY=
+POLYMARKET_RELAYER_API_KEY_ADDRESS=
+```
+
+Leave them blank unless your wallet setup specifically uses them.
+
+The complete template is in `.env.example`.
+
+## Coolify
+
+A `Dockerfile` is included.
+
+Expose:
+
+```text
+8080
+```
+
+Persistent storage mount:
+
+```text
+/var/data
+```
+
+Health endpoint:
+
+```text
+/health
+```
+
+Database:
+
+```text
+/var/data/safe67_multi7_abce_paper_live_tp60.db
+```
 
 ## Render
 
@@ -171,47 +417,41 @@ Start:
 python main.py
 ```
 
-Persistent disk:
+Persistent disk should also be mounted at:
 
 ```text
 /var/data
 ```
 
-Новая база:
+## Reports
+
+The hourly ZIP reporter is deliberately disabled in this LIVE trading build.
+Persistent SQLite still stores PAPER trades, LIVE orders, exits, signals,
+consensus decisions, trajectories and results.
+
+## Regression
+
+Run:
 
 ```text
-/var/data/bnb_eth_gh_1s6s_paper_live.db
-```
-
-Hourly ZIP reports в этой торговой сборке отключены.
-
-## Первый запуск
-
-Сначала оставь:
-
-```text
-LIVE_MASTER_ENABLE=0
-```
-
-После deploy нажми `WALLET`. Проверь SDK, wallet и collateral. Потом при необходимости включай master и redeploy.
-
-Для первого реального теста лучше оставить только одну стратегию LIVE, например:
-
-```text
-MODE BNB H LIVE
-CONFIRM LIVE BNB H
-```
-
-а остальные держать PAPER/OFF.
-
-## Regression test
-
-```text
-python test_bnb_eth_gh.py
+python test_multi7_abce_live_tp60.py
 ```
 
 Expected:
 
 ```text
-BNB/ETH G/H PAPER/LIVE regression: OK
+MULTI7 A/B/C/E PAPER/LIVE + NET TP60 regression: OK
 ```
+
+The regression verifies:
+
+- 7 tokens × A/B/C/E = 28 strategies;
+- uploaded A/B/C/E entry and DCA settings;
+- B can still take the old deep rebound DCA;
+- C rejects DCA below 0.30 and rebound momentum above +0.15;
+- E still requires two other-token A/BASE confirmations;
+- `TAKE_PROFIT_USDC` defaults to 0.60 and can be changed/disabled via ENV;
+- PAPER TP does not close below +$0.60 NET and closes above it;
+- fake-SDK LIVE ENTRY uses the FAK wrapper;
+- fake-SDK LIVE TP sends a SELL FAK and fully closes;
+- multiple LIVE strategies on the same token are blocked by default.

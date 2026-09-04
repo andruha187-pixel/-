@@ -33,27 +33,21 @@ except ImportError:
 load_dotenv()
 
 # ============================================================
-# BNB + ETH G/H FIRST-V2 CONSENSUS — PAPER + LIVE
+# MULTI7 A/B/C/E — PAPER + LIVE + CONFIGURABLE NET TAKE-PROFIT
 # ============================================================
-# Trading targets: BNB and ETH only.
-# Signal monitoring: BTC/XRP/BNB/SOL/ETH/DOGE/HYPE, because G/H require
-# >=2 DISTINCT OTHER same-side FIRST-V2 votes within the previous 10 seconds.
+# Tokens: BTC, XRP, BNB, SOL, ETH, DOGE, HYPE.
+# Strategies are preserved from the uploaded PAPER bot:
+#   A = SAFE67 BASE, ENTRY only.
+#   B = SAFE67 0.67..0.75 + old reversal DCA.
+#   C = tight 0.67..0.70 + safer reversal DCA.
+#   E = SAFE67 + >=2 other-token A/BASE confirmations / 10 sec.
 #
-# FIRST-V2 vote (all monitored tokens):
-#   price 0.55..0.75, momentum 0.03..0.30, ~6-second time lookback.
-# G ENTRY (BNB/ETH):
-#   target 0.67..0.70, momentum 0.05..0.10,
-#   >=2 other same-side FIRST-V2 votes in 10 sec, one ENTRY only.
-# H ENTRY: exactly the same gate as G.
-# H DCA: after actual ENTRY, arm when held-side ask <=0.50 and elapsed<=120s;
-#   no buy on arming tick; later buy once at ask 0.30..0.60 with
-#   rebound momentum +0.05..+0.15 and elapsed<=120s.
-# No side switching. No strategy stop-loss.
-# Default sizes: ENTRY 5 shares; H DCA 5 shares. Sizes are user-configurable.
-# Experimental timing: 1-second decision cycle, momentum still ~6 seconds.
+# Every strategy has independent PAPER/LIVE/OFF mode.
+# No side switching. No stop-loss.
+# Whole-position NET take-profit is configurable from .env.
 # ============================================================
 
-VERSION = "17.1-bnb-eth-gh-1s-6s-paper-live"
+VERSION = "19.0-multi7-abce-paper-live-tp60"
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -69,14 +63,22 @@ ASSET_CONFIG = {
     "HYPE": {"prefix": "hype-updown-5m", "label": "Hyperliquid"},
 }
 
-# These seven chains are SIGNAL SOURCES. Only BNB and ETH can execute trades.
-SYMBOLS = ["BTC", "XRP", "BNB", "SOL", "ETH", "DOGE", "HYPE"]
-TRADE_SYMBOLS = ["BNB", "ETH"]
 
-DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "1.0"))
-# Keep the original strategy's effective momentum horizon (~2 ticks × 3 sec = ~6 sec)
-# even though this experimental build samples the book every 1 second.
-MOMENTUM_LOOKBACK_SEC = float(os.getenv("MOMENTUM_LOOKBACK_SEC", "6.0"))
+def _configured_symbols():
+    raw = os.getenv("SYMBOLS", "BTC,XRP,BNB,SOL,ETH,DOGE,HYPE")
+    result = []
+    for item in raw.split(","):
+        symbol = item.strip().upper()
+        if symbol in ASSET_CONFIG and symbol not in result:
+            result.append(symbol)
+    return result or ["BTC", "XRP", "BNB", "SOL", "ETH", "DOGE", "HYPE"]
+
+
+SYMBOLS = _configured_symbols()
+TRADE_SYMBOLS = list(SYMBOLS)
+
+
+DECISION_INTERVAL = float(os.getenv("DECISION_INTERVAL", "3.0"))
 TRADE_WINDOW_SECONDS = int(os.getenv("TRADE_WINDOW_SECONDS", "180"))
 ENTRY_ORDER_SIZE = float(os.getenv("ENTRY_ORDER_SIZE", "5"))
 DCA_ORDER_SIZE = float(os.getenv("DCA_ORDER_SIZE", "5"))
@@ -99,30 +101,51 @@ V2_ELIGIBLE_PRICE_MAX = float(os.getenv("V2_ELIGIBLE_PRICE_MAX", "0.75"))
 V2_ELIGIBLE_MOM_MIN = float(os.getenv("V2_ELIGIBLE_MOM_MIN", "0.03"))
 V2_ELIGIBLE_MOM_MAX = float(os.getenv("V2_ELIGIBLE_MOM_MAX", "0.30"))
 
+SAFE_ENTRY_PRICE_MIN = float(os.getenv("SAFE_ENTRY_PRICE_MIN", "0.67"))
+SAFE_ENTRY_PRICE_MAX = float(os.getenv("SAFE_ENTRY_PRICE_MAX", "0.75"))
 SAFE_ENTRY_MOM_MIN = float(os.getenv("SAFE_ENTRY_MOM_MIN", "0.05"))
 SAFE_ENTRY_MOM_MAX = float(os.getenv("SAFE_ENTRY_MOM_MAX", "0.10"))
-# Same ENV names as the source F/G/H/J test bot for exact G/H parameter parity.
-C_SAFE_ENTRY_PRICE_MIN = float(os.getenv("C_SAFE_ENTRY_PRICE_MIN", "0.67"))
-C_SAFE_ENTRY_PRICE_MAX = float(os.getenv("C_SAFE_ENTRY_PRICE_MAX", "0.70"))
-
-CONSENSUS_WINDOW_SEC = float(os.getenv("CONSENSUS_WINDOW_SEC", "10"))
-G_CONSENSUS_MIN_OTHER_TOKENS = int(os.getenv("G_CONSENSUS_MIN_OTHER_TOKENS", "2"))
-H_CONSENSUS_MIN_OTHER_TOKENS = int(os.getenv("H_CONSENSUS_MIN_OTHER_TOKENS", "2"))
 
 DCA_ARM_PRICE = float(os.getenv("DCA_ARM_PRICE", "0.50"))
+DCA_MAX_BUY_PRICE = float(os.getenv("DCA_MAX_BUY_PRICE", "0.60"))
+DCA_REBOUND_MOM = float(os.getenv("DCA_REBOUND_MOM", "0.05"))
+DCA_DEADLINE_SEC = float(os.getenv("DCA_DEADLINE_SEC", "120"))
+
+C_SAFE_ENTRY_PRICE_MIN = float(os.getenv("C_SAFE_ENTRY_PRICE_MIN", "0.67"))
+C_SAFE_ENTRY_PRICE_MAX = float(os.getenv("C_SAFE_ENTRY_PRICE_MAX", "0.70"))
 C_DCA_MIN_BUY_PRICE = float(os.getenv("C_DCA_MIN_BUY_PRICE", "0.30"))
 C_DCA_MAX_BUY_PRICE = float(os.getenv("C_DCA_MAX_BUY_PRICE", "0.60"))
 C_DCA_REBOUND_MOM_MIN = float(os.getenv("C_DCA_REBOUND_MOM_MIN", "0.05"))
 C_DCA_REBOUND_MOM_MAX = float(os.getenv("C_DCA_REBOUND_MOM_MAX", "0.15"))
-DCA_DEADLINE_SEC = float(os.getenv("DCA_DEADLINE_SEC", "120"))
+
+CONSENSUS_WINDOW_SEC = float(os.getenv("CONSENSUS_WINDOW_SEC", "10"))
+CONSENSUS_MIN_OTHER_TOKENS = int(os.getenv("CONSENSUS_MIN_OTHER_TOKENS", "2"))
+
+def _take_profit_from_env():
+    raw = os.getenv("TAKE_PROFIT_USDC", "0.60").strip()
+    if raw.upper() in {"OFF", "NONE", "DISABLED"}:
+        return None
+    try:
+        value = float(raw.replace(",", "."))
+    except (TypeError, ValueError):
+        logging.getLogger("btc-xrp-eth-bc-live").warning(
+            "Invalid TAKE_PROFIT_USDC=%r; using 0.60", raw
+        )
+        return 0.60
+    return value if value > 0 else None
+
+TAKE_PROFIT_USDC = _take_profit_from_env()
 
 MIN_PRICE = float(os.getenv("MIN_PRICE", "0.08"))
 MAX_PRICE = float(os.getenv("MAX_PRICE", "0.95"))
 
 # LIVE is deliberately guarded twice:
 # 1) Render/env must explicitly set LIVE_MASTER_ENABLE=1.
-# 2) Each BNB/ETH strategy must be switched from PAPER to LIVE in Telegram.
+# 2) Each A/B/C/E strategy must be switched from PAPER to LIVE in Telegram.
 LIVE_MASTER_ENABLE = os.getenv("LIVE_MASTER_ENABLE", "0").strip().lower() in {"1", "true", "yes", "on"}
+ALLOW_MULTI_LIVE_PER_TOKEN = os.getenv(
+    "ALLOW_MULTI_LIVE_PER_TOKEN", "0"
+).strip().lower() in {"1", "true", "yes", "on"}
 POLYMARKET_PRIVATE_KEY = os.getenv("POLYMARKET_PRIVATE_KEY", "").strip()
 POLYMARKET_WALLET_ADDRESS = (
     os.getenv("POLYMARKET_WALLET_ADDRESS", "").strip()
@@ -133,15 +156,6 @@ POLYMARKET_RELAYER_API_KEY_ADDRESS = os.getenv("POLYMARKET_RELAYER_API_KEY_ADDRE
 LIVE_MAX_SHARES_PER_ORDER = float(os.getenv("LIVE_MAX_SHARES_PER_ORDER", "1000"))
 LIVE_MIN_SHARES = float(os.getenv("LIVE_MIN_SHARES", "0.01"))
 
-V2_PROBE = {
-    "lookback": LOOKBACK_TICKS,
-    "v2_price_min": V2_ELIGIBLE_PRICE_MIN,
-    "v2_price_max": V2_ELIGIBLE_PRICE_MAX,
-    "v2_mom_min": V2_ELIGIBLE_MOM_MIN,
-    "v2_mom_max": V2_ELIGIBLE_MOM_MAX,
-}
-
-
 def _strategy_set(symbol):
     common = {
         "symbol": symbol,
@@ -151,28 +165,48 @@ def _strategy_set(symbol):
         "v2_price_max": V2_ELIGIBLE_PRICE_MAX,
         "v2_mom_min": V2_ELIGIBLE_MOM_MIN,
         "v2_mom_max": V2_ELIGIBLE_MOM_MAX,
-        "safe_entry_price_min": C_SAFE_ENTRY_PRICE_MIN,
-        "safe_entry_price_max": C_SAFE_ENTRY_PRICE_MAX,
         "safe_entry_mom_min": SAFE_ENTRY_MOM_MIN,
         "safe_entry_mom_max": SAFE_ENTRY_MOM_MAX,
-        "consensus_enabled": True,
-        "consensus_window_sec": CONSENSUS_WINDOW_SEC,
+        "stop_loss_price": None,
+    }
+
+    a = dict(common)
+    a.update({
+        "code": "A",
+        "name": f"{symbol}_A_SAFE67_BASE",
+        "short": f"{symbol} / A SAFE67 BASE 5SH",
+        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
+        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
         "max_buys_side": 1,
         "dca_enabled": False,
-    }
-    g = dict(common)
-    g.update({
-        "code": "G",
-        "name": f"{symbol}_G_TIGHT_TWO_V2",
-        "short": f"{symbol} / G TIGHT + 2 V2",
-        "consensus_min_other_tokens": G_CONSENSUS_MIN_OTHER_TOKENS,
+        "consensus_enabled": False,
     })
-    h = dict(common)
-    h.update({
-        "code": "H",
-        "name": f"{symbol}_H_TIGHT_TWO_V2_SAFE_DCA",
-        "short": f"{symbol} / H G + SAFE DCA",
-        "consensus_min_other_tokens": H_CONSENSUS_MIN_OTHER_TOKENS,
+
+    b = dict(common)
+    b.update({
+        "code": "B",
+        "name": f"{symbol}_B_SAFE67_REVERSAL_DCA",
+        "short": f"{symbol} / B SAFE67 REVERSAL DCA 5+5",
+        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
+        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
+        "max_buys_side": 2,
+        "dca_enabled": True,
+        "dca_arm_price": DCA_ARM_PRICE,
+        "dca_min_buy_price": MIN_PRICE,
+        "dca_max_buy_price": DCA_MAX_BUY_PRICE,
+        "dca_rebound_mom": DCA_REBOUND_MOM,
+        "dca_rebound_mom_max": None,
+        "dca_deadline_sec": DCA_DEADLINE_SEC,
+        "consensus_enabled": False,
+    })
+
+    c = dict(common)
+    c.update({
+        "code": "C",
+        "name": f"{symbol}_C_SAFE67_TIGHT_DCA",
+        "short": f"{symbol} / C TIGHT67-70 DCA 5+5",
+        "safe_entry_price_min": C_SAFE_ENTRY_PRICE_MIN,
+        "safe_entry_price_max": C_SAFE_ENTRY_PRICE_MAX,
         "max_buys_side": 2,
         "dca_enabled": True,
         "dca_arm_price": DCA_ARM_PRICE,
@@ -181,14 +215,29 @@ def _strategy_set(symbol):
         "dca_rebound_mom": C_DCA_REBOUND_MOM_MIN,
         "dca_rebound_mom_max": C_DCA_REBOUND_MOM_MAX,
         "dca_deadline_sec": DCA_DEADLINE_SEC,
+        "consensus_enabled": False,
     })
-    return [g, h]
+
+    e = dict(common)
+    e.update({
+        "code": "E",
+        "name": f"{symbol}_E_SAFE67_CONSENSUS",
+        "short": f"{symbol} / E SAFE67 CONSENSUS 5SH",
+        "safe_entry_price_min": SAFE_ENTRY_PRICE_MIN,
+        "safe_entry_price_max": SAFE_ENTRY_PRICE_MAX,
+        "max_buys_side": 1,
+        "dca_enabled": False,
+        "consensus_enabled": True,
+        "consensus_window_sec": CONSENSUS_WINDOW_SEC,
+        "consensus_min_other_tokens": CONSENSUS_MIN_OTHER_TOKENS,
+    })
+    return [a, b, c, e]
 
 
-STRATEGIES = [s for symbol in TRADE_SYMBOLS for s in _strategy_set(symbol)]
+STRATEGIES = [s for symbol in SYMBOLS for s in _strategy_set(symbol)]
 STRATEGIES_BY_SYMBOL = {
     symbol: [s for s in STRATEGIES if s["symbol"] == symbol]
-    for symbol in TRADE_SYMBOLS
+    for symbol in SYMBOLS
 }
 STRATEGY_BY_NAME = {x["name"]: x for x in STRATEGIES}
 
@@ -206,15 +255,15 @@ except Exception:
     DATA_DIR = Path("./data")
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-DB_PATH = DATA_DIR / "bnb_eth_gh_1s6s_paper_live.db"
-REPORT_DIR = DATA_DIR / "bnb_eth_gh_1s6s_reports_DISABLED"
+DB_PATH = DATA_DIR / "safe67_multi7_abce_paper_live_tp60.db"
+REPORT_DIR = DATA_DIR / "safe67_multi7_abce_live_reports_DISABLED"
 REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
     format="%(asctime)s [%(levelname)s] %(message)s",
 )
-log = logging.getLogger("bnb-eth-gh-live")
+log = logging.getLogger("multi7-abce-paper-live-tp60")
 
 session: Optional[aiohttp.ClientSession] = None
 
@@ -1125,7 +1174,7 @@ async def memory_maintenance_loop():
 
 
 # ============================================================
-# G/H FIRST-V2 CONSENSUS STRATEGY ENGINE
+# MULTI7 A/B/C/E SAFE67 STRATEGY ENGINE
 # ============================================================
 
 def get_variant_state(condition, variant):
@@ -1144,6 +1193,7 @@ def get_variant_state(condition, variant):
         "dca_armed": False,
         "dca_filled": False,
         "stopped_out": False,
+        "take_profit_closed": False,
     }
 
     with db() as conn:
@@ -1188,35 +1238,41 @@ def get_variant_state(condition, variant):
             st["dca_armed"] = True
             st["dca_filled"] = bool(dca["filled_ms"]) or st["dca_filled"]
 
+        # Hydrate TP-closed state from persisted execution rows.
+        paper_bought = sf(conn.execute(
+            "SELECT COALESCE(SUM(filled_shares),0) x FROM paper_trades "
+            "WHERE condition_id=? AND variant=?",
+            (condition, variant["name"]),
+        ).fetchone()["x"])
+        live_bought = sf(conn.execute(
+            "SELECT COALESCE(SUM(filled_shares),0) x FROM live_orders "
+            "WHERE condition_id=? AND variant=? AND action='BUY' AND filled_shares>0",
+            (condition, variant["name"]),
+        ).fetchone()["x"])
+        paper_tp = sf(conn.execute(
+            "SELECT COALESCE(SUM(filled_shares),0) x FROM paper_exits "
+            "WHERE condition_id=? AND variant=? AND reason='TAKE_PROFIT'",
+            (condition, variant["name"]),
+        ).fetchone()["x"])
+        live_tp = sf(conn.execute(
+            "SELECT COALESCE(SUM(filled_shares),0) x FROM live_orders "
+            "WHERE condition_id=? AND variant=? AND action='SELL' "
+            "AND reason='TAKE_PROFIT' AND filled_shares>0",
+            (condition, variant["name"]),
+        ).fetchone()["x"])
+        total_bought = paper_bought + live_bought
+        if total_bought > 0 and paper_tp + live_tp >= total_bought - 1e-8:
+            st["take_profit_closed"] = True
+
     strategy_state[key] = st
     return st
 
 def momentum_for(condition, asset, lookback):
-    """Price change versus approximately MOMENTUM_LOOKBACK_SEC seconds ago.
-
-    The source strategy used lookback=2 decision ticks with a 3-second cycle,
-    i.e. roughly a 6-second momentum horizon. This experimental build samples
-    every 1 second, so using two samples would silently change the strategy to
-    ~2-second momentum. Instead, choose the newest recorded sample at or before
-    current_sample_time - MOMENTUM_LOOKBACK_SEC.
-
-    `lookback` is intentionally kept in the signature for source-code/API
-    compatibility with the G/H engine and tests; the time horizon is controlled
-    by MOMENTUM_LOOKBACK_SEC in this build.
-    """
     h = price_history[condition][asset]
-    if len(h) < 2:
+    if len(h) <= lookback:
         return None, None
-
-    current_ms, current = h[-1]
-    target_ms = int(current_ms - MOMENTUM_LOOKBACK_SEC * 1000.0)
-    ref = None
-    for sample_ms, sample_price in reversed(h):
-        if int(sample_ms) <= target_ms:
-            ref = sample_price
-            break
-    if ref is None:
-        return None, None
+    current = h[-1][1]
+    ref = h[-1 - lookback][1]
     return current - ref, ref
 
 
@@ -1426,6 +1482,271 @@ def position_totals(condition, variant_name):
         "has_dca": dca_trades > 0,
         "execution_mode": execution_mode,
     }
+
+
+async def ensure_sell_book(asset):
+    """Refresh only when the bid side used for TP is missing/stale."""
+    b = books.get(asset)
+    if b and b.get("bids"):
+        age = now_ms() - si(b.get("received_ms"))
+        if age <= MAX_BOOK_AGE_MS:
+            return age
+    await refresh_book(asset)
+    b = books.get(asset)
+    if not b or not b.get("bids"):
+        return None
+    return now_ms() - si(b.get("received_ms"))
+
+
+def projected_full_exit(condition, variant_name):
+    """Executable whole-position NET PnL if all remaining shares sell now."""
+    pos = position_totals(condition, variant_name)
+    remaining = pos["remaining"]
+    asset = pos["primary_asset"]
+    if not asset or remaining <= 1e-8:
+        return None
+
+    fills, filled = simulate_sell(asset, remaining)
+    if filled < remaining - 1e-8:
+        return None
+
+    gross = sum(sf(px) * sf(q) for px, q in fills)
+    fee = sum(fee_usdc(sf(q), sf(px)) for px, q in fills)
+    net = gross - fee
+    avg = gross / filled if filled > 1e-9 else None
+    total_pnl = pos["exit_net"] + net - pos["buy_cost"]
+
+    return {
+        "pos": pos,
+        "asset": asset,
+        "remaining": remaining,
+        "fills": fills,
+        "filled": filled,
+        "gross": gross,
+        "fee": fee,
+        "net": net,
+        "avg": avg,
+        "total_pnl": total_pnl,
+    }
+
+
+def take_profit_latched(condition, variant_name):
+    """True after a LIVE TP has actually sold at least some shares."""
+    with db() as conn:
+        return bool(conn.execute(
+            """SELECT 1 FROM live_orders
+               WHERE condition_id=? AND variant=? AND action='SELL'
+                 AND reason='TAKE_PROFIT' AND filled_shares>0
+               LIMIT 1""",
+            (condition, variant_name),
+        ).fetchone())
+
+
+def finalize_take_profit_result(condition, variant, market):
+    """Persist a fully flattened TP result so later settlement cannot pay it twice."""
+    name = variant["name"]
+    pos = position_totals(condition, name)
+    if not pos["buys"] or pos["remaining"] > 1e-8:
+        return False
+
+    with db() as conn:
+        if conn.execute(
+            "SELECT 1 FROM market_results WHERE condition_id=? AND variant=?",
+            (condition, name),
+        ).fetchone():
+            return False
+
+        up_asset = str(market["up_asset"])
+        down_asset = str(market["down_asset"])
+        buys = pos["buys"]
+        exits = pos["exits"]
+
+        up_bought = sum(sf(r["filled_shares"]) for r in buys if str(r["asset"]) == up_asset)
+        down_bought = sum(sf(r["filled_shares"]) for r in buys if str(r["asset"]) == down_asset)
+        up_exited = sum(sf(r["filled_shares"]) for r in exits if str(r["asset"]) == up_asset)
+        down_exited = sum(sf(r["filled_shares"]) for r in exits if str(r["asset"]) == down_asset)
+        pnl = pos["exit_net"] - pos["buy_cost"]
+        mode = pos.get("execution_mode") or strategy_mode(name)
+
+        conn.execute("""
+            INSERT INTO market_results(
+                condition_id,variant,winning_asset,winning_outcome,buy_cost,
+                exit_proceeds,payout,pnl,buy_trades,exit_trades,up_bought,
+                down_bought,up_exited,down_exited,stopped_out,execution_mode,settled_ms
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            condition, name, "", "TAKE_PROFIT", pos["buy_cost"],
+            pos["exit_net"], 0.0, pnl, len(buys), len(exits),
+            up_bought, down_bought, up_exited, down_exited, 0, mode, now_ms(),
+        ))
+        conn.commit()
+
+    st = get_variant_state(condition, variant)
+    st["take_profit_closed"] = True
+    return True
+
+
+async def execute_paper_take_profit(market, variant, candidate, age):
+    cid = market["condition_id"]
+    name = variant["name"]
+    pos = position_totals(cid, name)
+    if pos["execution_mode"] != "PAPER" or pos["remaining"] <= 1e-8:
+        return False
+    if abs(pos["remaining"] - candidate["remaining"]) > 1e-7:
+        return False
+
+    asset = candidate["asset"]
+    outcome = pos["primary_outcome"] or (
+        "Up" if asset == str(market["up_asset"]) else "Down"
+    )
+    trigger_bid = best_bid(asset)
+    cash_before = paper_cash(name)
+    cash_after = cash_before + candidate["net"]
+    book_received_ms = si((books.get(asset) or {}).get("received_ms"))
+
+    with db() as conn:
+        # Duplicate/race guard.
+        bought = sf(conn.execute(
+            "SELECT COALESCE(SUM(filled_shares),0) x FROM paper_trades "
+            "WHERE condition_id=? AND variant=?",
+            (cid, name),
+        ).fetchone()["x"])
+        exited = sf(conn.execute(
+            "SELECT COALESCE(SUM(filled_shares),0) x FROM paper_exits "
+            "WHERE condition_id=? AND variant=?",
+            (cid, name),
+        ).fetchone()["x"])
+        remaining_now = max(0.0, bought - exited)
+        if remaining_now <= 1e-8 or abs(remaining_now - candidate["remaining"]) > 1e-7:
+            return False
+
+        conn.execute("""
+            INSERT INTO paper_exits(
+                exit_ms,condition_id,variant,asset,outcome,reason,trigger_price,
+                requested_shares,filled_shares,avg_price,gross_proceeds,fee,
+                net_proceeds,book_age_ms,book_received_ms,fills_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+        """, (
+            now_ms(), cid, name, asset, outcome, "TAKE_PROFIT", trigger_bid,
+            candidate["remaining"], candidate["filled"], candidate["avg"],
+            candidate["gross"], candidate["fee"], candidate["net"], age,
+            book_received_ms,
+            jd([{"price": px, "shares": q} for px, q in candidate["fills"]]),
+        ))
+        conn.execute(
+            "INSERT INTO state(key,value) VALUES(?,?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (f"paper_cash:{name}", str(cash_after)),
+        )
+        conn.commit()
+
+    finalize_take_profit_result(cid, variant, market)
+    log.info(
+        "🟢 PAPER TP %-25s | %.4fsh @ %.4f | NET PnL=%+.4f target=%+.4f",
+        name, candidate["filled"], candidate["avg"],
+        candidate["total_pnl"], TAKE_PROFIT_USDC,
+    )
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+        await tg_send(
+            f"💵 PAPER TAKE PROFIT {variant['symbol']} {variant['code']}\n"
+            f"{candidate['filled']:.4f}sh @ {candidate['avg']:.4f}\n"
+            f"NET PnL: ${candidate['total_pnl']:+.2f} | target ${TAKE_PROFIT_USDC:.2f}"
+        )
+    return True
+
+
+async def maybe_take_profit(market, variant, elapsed):
+    """Monitor PAPER/LIVE positions and close at configurable whole-position NET PnL."""
+    if TAKE_PROFIT_USDC is None:
+        return False
+
+    cid = market["condition_id"]
+    name = variant["name"]
+    st = get_variant_state(cid, variant)
+    if not st["started_sides"] or st.get("take_profit_closed"):
+        return False
+
+    with db() as conn:
+        if conn.execute(
+            "SELECT 1 FROM market_results WHERE condition_id=? AND variant=?",
+            (cid, name),
+        ).fetchone():
+            return False
+
+    pos = position_totals(cid, name)
+    if not pos["buys"] or pos["remaining"] <= 1e-8:
+        return False
+
+    mode = pos.get("execution_mode") or strategy_mode(name)
+    latched = mode == "LIVE" and take_profit_latched(cid, name)
+
+    candidate = projected_full_exit(cid, name)
+    if not latched:
+        if candidate is None or candidate["total_pnl"] + 1e-12 < TAKE_PROFIT_USDC:
+            return False
+
+        # Threshold touch must survive a fresh bid-book check.
+        await ensure_sell_book(candidate["asset"])
+        candidate = projected_full_exit(cid, name)
+        if candidate is None or candidate["total_pnl"] + 1e-12 < TAKE_PROFIT_USDC:
+            return False
+    else:
+        # A real TP that partially filled is a committed liquidation attempt.
+        # Continue toward flat; ambiguous submissions remain fail-closed inside
+        # execute_live_fak and will not be duplicated automatically.
+        await ensure_sell_book(pos["primary_asset"])
+        candidate = projected_full_exit(cid, name)
+
+    if mode == "PAPER":
+        if candidate is None:
+            return False
+        age = now_ms() - si((books.get(candidate["asset"]) or {}).get("received_ms"))
+        return await execute_paper_take_profit(market, variant, candidate, age)
+
+    if mode != "LIVE":
+        return False
+
+    # For the initial trigger require full visible depth. After a partial LIVE
+    # fill, the latch may continue with whatever visible depth is currently
+    # available; FAK itself caps execution to the visible snapshot.
+    remaining = position_totals(cid, name)["remaining"]
+    if remaining <= 1e-8:
+        finalize_take_profit_result(cid, variant, market)
+        return True
+
+    if not latched and candidate is None:
+        return False
+
+    outcome = pos["primary_outcome"] or (
+        "Up" if pos["primary_asset"] == str(market["up_asset"]) else "Down"
+    )
+    result = await execute_live_fak(
+        cid, variant, pos["primary_asset"], outcome,
+        "TAKE_PROFIT", "SELL", remaining,
+    )
+
+    filled = sf(result.get("filled"))
+    if filled <= 1e-9:
+        return False
+
+    after = position_totals(cid, name)
+    if after["remaining"] <= 1e-8:
+        finalize_take_profit_result(cid, variant, market)
+        pnl = after["exit_net"] - after["buy_cost"]
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            await tg_send(
+                f"💵 LIVE TAKE PROFIT COMPLETE {variant['symbol']} {variant['code']}\n"
+                f"NET PnL estimate: ${pnl:+.2f} | target ${TAKE_PROFIT_USDC:.2f}\n"
+                "Position fully closed."
+            )
+    else:
+        if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
+            await tg_send(
+                f"⚠️ LIVE TP PARTIAL {variant['symbol']} {variant['code']}\n"
+                f"Filled {filled:.4f}sh; remaining {after['remaining']:.4f}sh.\n"
+                "TP is latched; bot will continue liquidation unless submission becomes ambiguous."
+            )
+    return True
 
 
 def live_action_ambiguous(condition, variant_name, action, reason):
@@ -1711,6 +2032,10 @@ async def execute_paper(condition, variant, asset, outcome, signal_type):
 
 
 async def execute_order(condition, variant, asset, outcome, signal_type):
+    pos_before = position_totals(condition, variant["name"])
+    if pos_before["buys"] and pos_before["remaining"] <= 1e-8:
+        return False
+
     mode = strategy_mode(variant["name"])
     if mode == "OFF":
         return False
@@ -1740,56 +2065,160 @@ def _first_v2_eligible_candidates(market, variant):
     return out
 
 
-def record_first_v2_vote(market, elapsed, decision_ms):
-    """Record exactly one FIRST V2-eligible vote for every monitored token/market."""
+async def evaluate_variant(market, variant, elapsed):
     cid = market["condition_id"]
-    with db() as conn:
-        if conn.execute("SELECT 1 FROM v2_votes WHERE condition_id=? LIMIT 1", (cid,)).fetchone():
+    st = get_variant_state(cid, variant)
+
+    # No stop-loss in either experiment variant.
+    if st.get("stopped_out") or st.get("take_profit_closed"):
+        return
+
+    # ------------------------------------------------------------------
+    # SAFE67 ENTRY — kept identical to the previous bot.
+    # ------------------------------------------------------------------
+    if not st["gate_decided"] and not st["started_sides"]:
+        candidates = _first_v2_eligible_candidates(market, variant)
+        if not candidates:
+            return
+        mom, asset, outcome, ask, ref = candidates[0]
+        price_ok = variant["safe_entry_price_min"] <= ask <= variant["safe_entry_price_max"]
+        mom_ok = variant["safe_entry_mom_min"] <= mom <= variant["safe_entry_mom_max"]
+        passed = bool(price_ok and mom_ok)
+        st["gate_decided"] = True
+        st["gate_passed"] = passed
+        st["gate_asset"] = asset if passed else None
+
+        if ask < variant["safe_entry_price_min"]:
+            reason = "SAFE_PRICE_LOW"
+        elif ask > variant["safe_entry_price_max"]:
+            reason = "SAFE_PRICE_HIGH"
+        elif mom < variant["safe_entry_mom_min"]:
+            reason = "SAFE_MOMENTUM_LOW"
+        elif mom > variant["safe_entry_mom_max"]:
+            reason = "SAFE_MOMENTUM_HIGH"
+        else:
+            reason = "SAFE_ENTRY_OK"
+
+        store_gate_decision(cid, variant, asset, outcome, ask, ref, mom, elapsed, passed, reason)
+        log.info(
+            "GATE %-20s %s | %s %.3f mom=%+.3f | %s",
+            variant["name"], cid[-6:], outcome, ask, mom,
+            "PASS" if passed else f"SKIP {reason}",
+        )
+        if not passed:
             return
 
-    symbol = market_symbol(market)
-    if symbol not in SYMBOLS:
-        return
-    candidates = _first_v2_eligible_candidates(market, V2_PROBE)
-    if not candidates:
+    if st["gate_decided"] and not st["gate_passed"]:
         return
 
-    mom, asset, outcome, ask, ref = candidates[0]
-    with db() as conn:
-        conn.execute("""
-            INSERT OR IGNORE INTO v2_votes(
-                condition_id,symbol,decision_ms,asset,outcome,ask,
-                reference_ask,momentum,elapsed_sec
-            ) VALUES(?,?,?,?,?,?,?,?,?)
-        """, (cid, symbol, int(decision_ms), asset, outcome, ask, ref, mom, elapsed))
-        conn.commit()
-    log.info("V2 VOTE %-4s %s | %s %.3f mom=%+.3f", symbol, cid[-6:], outcome, ask, mom)
+    if not st["started_sides"]:
+        asset = st.get("gate_asset")
+        if not asset:
+            return
+        outcome = "Up" if asset == market["up_asset"] else "Down"
+        ask = best_ask(asset)
+        if ask is None:
+            return
+        mom, ref = momentum_for(cid, asset, variant["lookback"])
+        if mom is None:
+            return
+        if not (variant["safe_entry_price_min"] <= ask <= variant["safe_entry_price_max"]):
+            return
+        if not (variant["safe_entry_mom_min"] <= mom <= variant["safe_entry_mom_max"]):
+            return
+        store_signal(cid, variant, asset, outcome, ask, ref, mom, "ENTRY", elapsed)
+        await execute_order(cid, variant, asset, outcome, "ENTRY")
+        return
 
+    # ------------------------------------------------------------------
+    # A / BASE ends after the first 5-share ENTRY.
+    # ------------------------------------------------------------------
+    if not variant.get("dca_enabled"):
+        return
 
-def first_v2_vote(condition_id):
-    with db() as conn:
-        return conn.execute("SELECT * FROM v2_votes WHERE condition_id=?", (condition_id,)).fetchone()
+    asset = st.get("primary_asset")
+    if not asset or st["buys"][asset] >= variant["max_buys_side"]:
+        return
+
+    # DCA is deliberately disabled after 120 sec even though initial trading
+    # remains allowed to 180 sec. This avoids averaging late in the market.
+    if elapsed > variant["dca_deadline_sec"]:
+        return
+
+    ask = best_ask(asset)
+    if ask is None or ask < MIN_PRICE or ask > MAX_PRICE:
+        return
+
+    outcome = "Up" if asset == market["up_asset"] else "Down"
+
+    # First stage: price must genuinely weaken to <= 0.50. Do NOT buy here.
+    # We return immediately so the DCA can only happen on a later 3-second tick.
+    if not st.get("dca_armed"):
+        if ask <= variant["dca_arm_price"] + 1e-12:
+            arm_dca(cid, variant, ask, elapsed)
+            log.info(
+                "DCA ARMED %-19s %s | %s ask=%.3f <= %.3f | elapsed=%.1fs",
+                variant["name"], cid[-6:], outcome, ask, variant["dca_arm_price"], elapsed,
+            )
+        return
+
+    # Second stage: wait for an actual rebound in the SAME held side.
+    # No falling-knife buy: momentum must turn positive by at least +0.05.
+    mom, ref = momentum_for(cid, asset, variant["lookback"])
+    if mom is None:
+        return
+    if mom < variant["dca_rebound_mom"]:
+        return
+    mom_max = variant.get("dca_rebound_mom_max")
+    if mom_max is not None and mom > float(mom_max) + 1e-12:
+        return
+    if ask < float(variant.get("dca_min_buy_price", MIN_PRICE)) - 1e-12:
+        return
+    if ask > variant["dca_max_buy_price"] + 1e-12:
+        return
+
+    store_signal(cid, variant, asset, outcome, ask, ref, mom, "DCA", elapsed)
+    filled = await execute_order(cid, variant, asset, outcome, "DCA")
+    if filled:
+        mark_dca_filled(cid, variant, ask, mom, elapsed)
+        log.info(
+            "DCA FILLED %-18s %s | %s ask=%.3f mom=%+.3f | total buys=%d",
+            variant["name"], cid[-6:], outcome, ask, mom, st["buys"][asset],
+        )
+
 
 
 def consensus_confirmations(target_symbol, outcome, at_ms, window_sec):
+    """Return the latest qualifying A/BASE SAFE67 signal from each OTHER token."""
     cutoff = int(at_ms - float(window_sec) * 1000.0)
     with db() as conn:
         rows = conn.execute("""
-            SELECT symbol,decision_ms,condition_id,ask,momentum,outcome
-            FROM v2_votes
-            WHERE outcome=? AND decision_ms>=? AND decision_ms<=? AND symbol<>?
-            ORDER BY decision_ms DESC
+            SELECT dm.symbol, gd.variant, gd.decision_ms
+            FROM gate_decisions gd
+            JOIN discovered_markets dm ON dm.condition_id=gd.condition_id
+            WHERE gd.passed=1
+              AND gd.outcome=?
+              AND gd.decision_ms>=?
+              AND gd.decision_ms<=?
+              AND dm.symbol<>?
+            ORDER BY gd.decision_ms DESC
         """, (outcome, cutoff, at_ms, target_symbol)).fetchall()
+
     latest = {}
     for r in rows:
         symbol = str(r["symbol"] or "").upper()
         if symbol not in SYMBOLS or symbol == target_symbol:
             continue
+        # E uses only the clean A/BASE SAFE67 pass from another token as a vote.
+        if str(r["variant"]) != f"{symbol}_A_SAFE67_BASE":
+            continue
         if symbol not in latest:
             latest[symbol] = int(r["decision_ms"])
-    ordered = sorted(latest.items(), key=lambda kv: kv[1], reverse=True)
-    return [s for s, _ in ordered], [max(0, int(at_ms-ms)) for _, ms in ordered]
 
+    ordered = sorted(latest.items(), key=lambda kv: kv[1], reverse=True)
+    symbols = [s for s, _ in ordered]
+    ages = [max(0, int(at_ms - ms)) for _, ms in ordered]
+    return symbols, ages
 
 def store_consensus_event(condition, variant, symbol, outcome, ask, mom, at_ms,
                           confirm_symbols, confirm_ages, passed, reason):
@@ -1803,40 +2232,36 @@ def store_consensus_event(condition, variant, symbol, outcome, ask, mom, at_ms,
             ON CONFLICT(condition_id,variant) DO NOTHING
         """, (
             condition, variant["name"], at_ms, symbol, outcome, ask, mom,
-            float(variant["consensus_window_sec"]), int(variant["consensus_min_other_tokens"]),
+            float(variant["consensus_window_sec"]),
+            int(variant["consensus_min_other_tokens"]),
             len(confirm_symbols), jd(confirm_symbols), jd(confirm_ages),
             1 if passed else 0, reason,
         ))
         conn.commit()
 
-
 async def evaluate_consensus_variant(market, variant, elapsed):
-    """Exact G/H target gate + H safer reversal DCA; execution routes PAPER/LIVE."""
+    """E: same SAFE67 target signal, but enter only with >=2 other-token A votes."""
     cid = market["condition_id"]
     symbol = market_symbol(market)
     st = get_variant_state(cid, variant)
 
+    if st.get("stopped_out") or st.get("take_profit_closed"):
+        return
+
     if not st["gate_decided"] and not st["started_sides"]:
-        vote = first_v2_vote(cid)
-        if vote is None:
-            record_first_v2_vote(market, elapsed, now_ms())
-            vote = first_v2_vote(cid)
-        if vote is None:
+        candidates = _first_v2_eligible_candidates(market, variant)
+        if not candidates:
             return
 
-        mom = sf(vote["momentum"])
-        asset = str(vote["asset"])
-        outcome = str(vote["outcome"])
-        ask = sf(vote["ask"])
-        ref = sf(vote["reference_ask"])
-        at_ms = si(vote["decision_ms"])
-
+        mom, asset, outcome, ask, ref = candidates[0]
         price_ok = variant["safe_entry_price_min"] <= ask <= variant["safe_entry_price_max"]
         mom_ok = variant["safe_entry_mom_min"] <= mom <= variant["safe_entry_mom_max"]
         safe_ok = bool(price_ok and mom_ok)
 
+        at_ms = now_ms()
         confirm_symbols, confirm_ages = [], []
         consensus_ok = False
+
         if safe_ok:
             confirm_symbols, confirm_ages = consensus_confirmations(
                 symbol, outcome, at_ms, variant["consensus_window_sec"]
@@ -1857,19 +2282,21 @@ async def evaluate_consensus_variant(market, variant, elapsed):
         elif mom > variant["safe_entry_mom_max"]:
             reason = "SAFE_MOMENTUM_HIGH"
         elif not consensus_ok:
-            reason = "V2_CONSENSUS_INSUFFICIENT"
+            reason = "CONSENSUS_INSUFFICIENT"
         else:
-            reason = "V2_CONSENSUS_OK"
+            reason = "CONSENSUS_OK"
 
-        store_gate_decision(cid, variant, asset, outcome, ask, ref, mom, elapsed, passed, reason)
+        store_gate_decision(
+            cid, variant, asset, outcome, ask, ref, mom, elapsed, passed, reason
+        )
         store_consensus_event(
             cid, variant, symbol, outcome, ask, mom, at_ms,
             confirm_symbols, confirm_ages, passed, reason
         )
+
         log.info(
-            "V2 CONS %-30s %s | %s %.3f mom=%+.3f | need=%d votes=%d [%s] | %s",
-            variant["name"], cid[-6:], outcome, ask, mom,
-            int(variant["consensus_min_other_tokens"]), len(confirm_symbols),
+            "CONSENSUS %-22s %s | %s %.3f mom=%+.3f | votes=%d [%s] | %s",
+            variant["name"], cid[-6:], outcome, ask, mom, len(confirm_symbols),
             ",".join(confirm_symbols) if confirm_symbols else "-",
             "PASS" if passed else f"SKIP {reason}",
         )
@@ -1879,7 +2306,6 @@ async def evaluate_consensus_variant(market, variant, elapsed):
     if st["gate_decided"] and not st["gate_passed"]:
         return
 
-    # ENTRY uses the current target book/momentum after the first-V2 gate passes.
     if not st["started_sides"]:
         asset = st.get("gate_asset")
         if not asset:
@@ -1899,51 +2325,8 @@ async def evaluate_consensus_variant(market, variant, elapsed):
         await execute_order(cid, variant, asset, outcome, "ENTRY")
         return
 
-    if not variant.get("dca_enabled"):
-        return
-
-    asset = st.get("primary_asset")
-    if not asset or st["buys"][asset] >= variant["max_buys_side"] or st.get("dca_filled"):
-        return
-    if elapsed > variant["dca_deadline_sec"]:
-        return
-
-    ask = best_ask(asset)
-    if ask is None or ask < MIN_PRICE or ask > MAX_PRICE:
-        return
-    outcome = "Up" if asset == market["up_asset"] else "Down"
-
-    # Arm on weakness; never buy on the arm tick.
-    if not st.get("dca_armed"):
-        if ask <= variant["dca_arm_price"] + 1e-12:
-            arm_dca(cid, variant, ask, elapsed)
-            log.info(
-                "DCA ARMED %-28s %s | %s ask=%.3f <= %.3f | elapsed=%.1fs",
-                variant["name"], cid[-6:], outcome, ask, variant["dca_arm_price"], elapsed,
-            )
-        return
-
-    mom, ref = momentum_for(cid, asset, variant["lookback"])
-    if mom is None or mom < variant["dca_rebound_mom"]:
-        return
-    if mom > float(variant["dca_rebound_mom_max"]) + 1e-12:
-        return
-    if ask < float(variant["dca_min_buy_price"]) - 1e-12:
-        return
-    if ask > float(variant["dca_max_buy_price"]) + 1e-12:
-        return
-
-    store_signal(cid, variant, asset, outcome, ask, ref, mom, "DCA", elapsed)
-    filled = await execute_order(cid, variant, asset, outcome, "DCA")
-    if filled:
-        mark_dca_filled(cid, variant, ask, mom, elapsed)
-        log.info(
-            "DCA FILLED %-27s %s | %s ask=%.3f mom=%+.3f | total buys=%d",
-            variant["name"], cid[-6:], outcome, ask, mom, st["buys"][asset],
-        )
-
-# No stop-loss engine: G/H source strategy has no stop-loss.
-
+    # E is ENTRY-only: no DCA and no stop-loss.
+    return
 
 def record_position_trajectory(market, variant, elapsed):
     cid = market["condition_id"]
@@ -2018,12 +2401,14 @@ async def strategy_loop():
         n = time.time()
         try:
             trade_ready = []
+
+            # Phase 0: one WebSocket-book snapshot/history sample for every market.
+            # No pre-decision REST refresh — same SAFE67 sampling contract.
             for cid, market in list(markets.items()):
                 elapsed = n - market["start_ts"]
                 if not (-30 <= elapsed <= 310):
                     continue
 
-                # One shared WS-book sample per active market; no pre-decision REST refresh.
                 for asset in (market["up_asset"], market["down_asset"]):
                     ask = best_ask(asset)
                     if ask is not None:
@@ -2033,6 +2418,9 @@ async def strategy_loop():
                 if 0 <= elapsed <= 305:
                     for variant in variants:
                         record_position_trajectory(market, variant, elapsed)
+                        # TP monitoring continues for already-open PAPER/LIVE positions
+                        # even if START/STOP blocks new entries.
+                        await maybe_take_profit(market, variant, elapsed)
 
                 if elapsed < 0 or elapsed > TRADE_WINDOW_SECONDS or not trading_enabled():
                     continue
@@ -2040,23 +2428,30 @@ async def strategy_loop():
                     continue
                 trade_ready.append((market, elapsed, variants))
 
-            # Phase 1: all seven monitored tokens can write a FIRST-V2 vote using
-            # exactly one decision-cycle timestamp. Monitor-only tokens never trade.
-            cycle_ms = now_ms()
-            for market, elapsed, _variants in trade_ready:
-                record_first_v2_vote(market, elapsed, cycle_ms)
-
-            # Phase 2: execute only BNB/ETH G/H strategies.
+            # Phase 1: A/B/C for ALL tokens first.
+            # This records every token's A/BASE SAFE67 gate decision for this
+            # decision cycle before E asks for cross-token confirmations.
             for market, elapsed, variants in trade_ready:
                 for variant in variants:
-                    if strategy_mode(variant["name"]) == "OFF":
+                    if variant.get("consensus_enabled"):
+                        continue
+                    await evaluate_variant(market, variant, elapsed)
+
+            # Phase 2: E/CONSENSUS. It can now see A votes from any other token
+            # that occurred earlier in the 10-second window, including this
+            # shared 3-second decision snapshot.
+            for market, elapsed, variants in trade_ready:
+                for variant in variants:
+                    if not variant.get("consensus_enabled"):
                         continue
                     await evaluate_consensus_variant(market, variant, elapsed)
+
         except Exception:
             log.exception("Strategy loop failed")
 
         spent = time.monotonic() - started
         await asyncio.sleep(max(0.05, DECISION_INTERVAL - spent))
+
 
 async def settle_from_resolution(ev):
     cid = str(ev.get("market") or ev.get("condition_id") or "")
@@ -2339,7 +2734,17 @@ def account_stats(strategy_name):
         ).fetchone()["c"])
         paper_fees = sf(conn.execute(
             "SELECT COALESCE(SUM(fee),0) f FROM paper_trades WHERE variant=?", (strategy_name,)
+        ).fetchone()["f"]) + sf(conn.execute(
+            "SELECT COALESCE(SUM(fee),0) f FROM paper_exits WHERE variant=?", (strategy_name,)
         ).fetchone()["f"])
+        tp_exits = si(conn.execute(
+            "SELECT COUNT(*) c FROM paper_exits WHERE variant=? AND reason='TAKE_PROFIT'",
+            (strategy_name,),
+        ).fetchone()["c"]) + si(conn.execute(
+            "SELECT COUNT(*) c FROM live_orders WHERE variant=? AND action='SELL' "
+            "AND reason='TAKE_PROFIT' AND filled_shares>0",
+            (strategy_name,),
+        ).fetchone()["c"])
         live_fee_est = sf(conn.execute(
             "SELECT COALESCE(SUM(fee_estimate),0) f FROM live_orders WHERE variant=? AND filled_shares>0", (strategy_name,)
         ).fetchone()["f"])
@@ -2359,6 +2764,7 @@ def account_stats(strategy_name):
         "initial": initial, "cash": cash, "open_cost": open_cost_basis(strategy_name),
         "realized": realized, "traded_markets": traded, "wins": wins, "losses": losses,
         "buy_trades": paper_buys + live_buys, "fees": paper_fees + live_fee_est,
+        "take_profit_exits": tp_exits,
         "avg_win": avg_win, "avg_loss": avg_loss, "gate_pass": gate_pass, "gate_skip": gate_skip,
     }
 
@@ -2395,29 +2801,44 @@ async def tg_send(text):
 
 
 def strategy_status_line(v):
-    dca = f" | DCA {dca_shares(v):g}sh" if v.get("dca_enabled") else ""
-    return f"{v['symbol']} {v['code']}: {strategy_mode(v['name'])} | ENTRY {entry_shares(v):g}sh{dca}"
+    mode = strategy_mode(v["name"])
+    if v.get("dca_enabled"):
+        size = f"ENTRY {entry_shares(v):g}sh | DCA {dca_shares(v):g}sh"
+    else:
+        size = f"ENTRY {entry_shares(v):g}sh"
+    return f"{v['symbol']} {v['code']}: {mode} | {size}"
 
 
 async def send_modes():
     wallet_flag = "READY" if live_client_ready else f"NOT READY ({live_client_error or 'no credentials'})"
+    tp = f"${TAKE_PROFIT_USDC:.2f} NET" if TAKE_PROFIT_USDC is not None else "OFF"
     await tg_send(
-        "🎛 G/H MODES\n" + "\n".join(strategy_status_line(v) for v in STRATEGIES)
+        "🎛 MULTI7 A/B/C/E MODES\n"
+        + "\n".join(strategy_status_line(v) for v in STRATEGIES)
         + f"\n\nLIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'} | wallet: {wallet_flag}"
-        + "\n\nMODE BNB G PAPER/LIVE/OFF"
-        + "\nMODE BNB H PAPER/LIVE/OFF"
-        + "\nLIVE confirmation: CONFIRM LIVE BNB G"
+        + f"\nMultiple LIVE strategies per token: "
+          f"{'ALLOWED' if ALLOW_MULTI_LIVE_PER_TOKEN else 'BLOCKED'}"
+        + f"\nTake-profit: {tp}"
+        + "\n\nExamples:"
+        + "\nMODE BTC B PAPER/LIVE/OFF"
+        + "\nMODE ETH C PAPER/LIVE/OFF"
+        + "\nMODE SOL E PAPER/LIVE/OFF"
+        + "\nCONFIRM LIVE BTC B"
     )
 
 
 async def send_sizes():
     await tg_send(
-        "📐 SHARE SIZES\n" + "\n".join(strategy_status_line(v) for v in STRATEGIES)
-        + "\n\nQuick per-token: SIZE BNB 7 7"
-        + "\n  -> G entry=7, H entry=7, H DCA=7"
-        + "\nPer-strategy: SIZE BNB G 7"
-        + "\nPer-strategy H: SIZE BNB H 7 5"
-        + "\nSizes cannot change while that strategy has an open position."
+        "📐 SHARE SIZES\n"
+        + "\n".join(strategy_status_line(v) for v in STRATEGIES)
+        + "\n\nWhole token: SIZE BTC 5 5"
+        + "\n  -> A/E ENTRY=5; B/C ENTRY=5 and DCA=5"
+        + "\nPer strategy:"
+        + "\nSIZE BTC A 5"
+        + "\nSIZE BTC B 5 5"
+        + "\nSIZE BTC C 5 5"
+        + "\nSIZE BTC E 5"
+        + "\nSizes cannot change while that strategy has an open bot-tracked position."
     )
 
 
@@ -2429,13 +2850,19 @@ async def send_wallet():
         wallet_type = str(getattr(live_client, "wallet_type", ""))
     else:
         wallet = POLYMARKET_WALLET_ADDRESS or "not configured"
-        signer = "n/a"; wallet_type = "n/a"
+        signer = "n/a"
+        wallet_type = "n/a"
+
     bal = f"${live_balance:.2f}" if live_balance is not None else "unavailable"
+    tp = f"${TAKE_PROFIT_USDC:.2f} NET" if TAKE_PROFIT_USDC is not None else "OFF"
     await tg_send(
         "🔐 POLYMARKET WALLET\n"
         f"SDK: {'READY' if live_client_ready else 'NOT READY'}\n"
         f"LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'}\n"
         f"Wallet: {wallet}\nSigner: {signer}\nType: {wallet_type}\nCollateral: {bal}\n"
+        f"Take-profit: {tp}\n"
+        f"Multiple LIVE strategies/token: "
+        f"{'ALLOWED' if ALLOW_MULTI_LIVE_PER_TOKEN else 'BLOCKED'}\n"
         f"Error: {live_client_error or '-'}\n\nNever send the private key in Telegram."
     )
 
@@ -2443,32 +2870,44 @@ async def send_wallet():
 async def send_balance():
     live_balance = await live_collateral_balance() if live_client_ready else None
     lines = [
-        "💰 BALANCE",
+        "💰 MULTI7 A/B/C/E BALANCE",
         f"Global START: {'ON' if trading_enabled() else 'OFF'}",
-        f"Real wallet collateral: ${live_balance:.2f}" if live_balance is not None else "Real wallet collateral: unavailable",
+        f"Real wallet collateral: ${live_balance:.2f}" if live_balance is not None
+        else "Real wallet collateral: unavailable",
         "",
     ]
-    for v in STRATEGIES:
-        s = account_stats(v["name"])
-        lines.append(f"{v['symbol']} {v['code']} [{strategy_mode(v['name'])}] | paperCash ${s['cash']:.2f}")
+    for symbol in SYMBOLS:
+        lines.append(f"[{symbol}]")
+        for v in STRATEGIES_BY_SYMBOL[symbol]:
+            ss = account_stats(v["name"])
+            lines.append(
+                f"{v['code']} [{strategy_mode(v['name'])}] | "
+                f"paperCash ${ss['cash']:.2f} | tracked PnL~${ss['realized']:+.2f}"
+            )
     await tg_send("\n".join(lines))
 
 
-def format_stats(v, s):
-    d = s["wins"] + s["losses"]
-    wr = s["wins"] / d * 100.0 if d else 0.0
+def format_stats(v, ss):
+    d = ss["wins"] + ss["losses"]
+    wr = ss["wins"] / d * 100.0 if d else 0.0
     return (
         f"{v['symbol']} {v['code']} [{strategy_mode(v['name'])}] | "
-        f"W/L {s['wins']}/{s['losses']} ({wr:.1f}%) | PnL~${s['realized']:+.2f} | "
-        f"buys {s['buy_trades']} | fees~${s['fees']:.2f} | gate {s['gate_pass']}/{s['gate_skip']}"
+        f"W/L {ss['wins']}/{ss['losses']} ({wr:.1f}%) | PnL~${ss['realized']:+.2f} | "
+        f"buys {ss['buy_trades']} | TP exits {ss['take_profit_exits']} | "
+        f"fees~${ss['fees']:.2f} | gate {ss['gate_pass']}/{ss['gate_skip']}"
     )
 
 
 async def send_statistics():
-    lines = ["📊 BNB/ETH G/H STATISTICS"]
-    for v in STRATEGIES:
-        lines.append(format_stats(v, account_stats(v["name"])))
-    lines.append("\nLIVE PnL/fees are estimates from accepted fill amounts; winning LIVE shares are not auto-redeemed.")
+    lines = ["📊 MULTI7 A/B/C/E STATISTICS"]
+    for symbol in SYMBOLS:
+        lines.append(f"\n[{symbol}]")
+        for v in STRATEGIES_BY_SYMBOL[symbol]:
+            lines.append(format_stats(v, account_stats(v["name"])))
+    lines.append(
+        "\nLIVE PnL/fees are bot estimates from accepted fill amounts. "
+        "Winning LIVE shares left to settlement are not auto-redeemed."
+    )
     await tg_send("\n".join(lines))
 
 
@@ -2481,9 +2920,11 @@ async def send_positions():
             if pos["remaining"] <= 1e-8:
                 continue
             found = True
+            mark = projected_full_exit(cid, v["name"])
+            mark_txt = f" | exitPnL~${mark['total_pnl']:+.2f}" if mark else ""
             lines.append(
                 f"{v['symbol']} {v['code']} {pos.get('execution_mode') or strategy_mode(v['name'])} "
-                f"{pos['primary_outcome']} | {pos['remaining']:.4f}sh | buy~${pos['buy_cost']:.2f}"
+                f"{pos['primary_outcome']} | {pos['remaining']:.4f}sh | buy~${pos['buy_cost']:.2f}{mark_txt}"
             )
     if not found:
         lines.append("None")
@@ -2497,10 +2938,14 @@ async def send_trades():
                    filled_shares,avg_price,'PAPER' AS mode,total_cost AS amount
             FROM paper_trades WHERE filled_shares>0
             UNION ALL
+            SELECT exit_ms AS ms,variant,outcome,reason,'SELL' AS action,
+                   filled_shares,avg_price,'PAPER' AS mode,net_proceeds AS amount
+            FROM paper_exits WHERE filled_shares>0
+            UNION ALL
             SELECT submitted_ms AS ms,variant,outcome,reason,action,
                    filled_shares,avg_price,'LIVE' AS mode,net_or_total AS amount
             FROM live_orders WHERE filled_shares>0
-            ORDER BY ms DESC LIMIT 30
+            ORDER BY ms DESC LIMIT 40
         """).fetchall()
     lines = ["📜 LAST BOT ACTIONS"]
     for r in rows:
@@ -2523,30 +2968,72 @@ def _set_mode_direct(strategy, mode):
     current = strategy_mode(strategy["name"])
     if current == mode:
         return True, f"already {mode}"
+
     if mode != "OFF" and strategy_has_open_position(strategy["name"]):
         for cid in open_condition_ids(strategy["name"]):
             pos_mode = position_totals(cid, strategy["name"]).get("execution_mode")
             if pos_mode and pos_mode != mode:
-                return False, f"open {pos_mode} position: switch to {mode} blocked until settlement"
+                return False, f"open {pos_mode} position: switch to {mode} blocked until flat"
+
     state_set(f"mode:{strategy['name']}", mode)
     return True, mode
+
+
+def _other_live_same_symbol(v):
+    """Find another strategy on the same token that is LIVE or holds LIVE shares."""
+    for other in STRATEGIES_BY_SYMBOL.get(v["symbol"], []):
+        if other["name"] == v["name"]:
+            continue
+        if strategy_mode(other["name"]) == "LIVE":
+            return other
+        for cid in open_condition_ids(other["name"]):
+            if position_totals(cid, other["name"]).get("execution_mode") == "LIVE":
+                return other
+    return None
 
 
 async def request_live(symbol, code):
     v = strategy_for(symbol, code)
     if not v:
-        await tg_send("Unknown BNB/ETH G/H strategy."); return
+        await tg_send("Unknown token/strategy. Use BTC/XRP/BNB/SOL/ETH/DOGE/HYPE + A/B/C/E.")
+        return
+
     if not LIVE_MASTER_ENABLE:
-        await tg_send("🔒 LIVE_MASTER_ENABLE=0 on Render. Enable it there and redeploy first."); return
+        await tg_send(
+            "🔒 LIVE_MASTER_ENABLE=0. Set it to 1 in hosting Environment and redeploy first."
+        )
+        return
     if not live_client_ready:
-        await tg_send(f"🔒 Wallet SDK is not ready: {live_client_error or 'credentials missing'}"); return
+        await tg_send(f"🔒 Wallet SDK is not ready: {live_client_error or 'credentials missing'}")
+        return
     if strategy_has_open_position(v["name"]) and strategy_mode(v["name"]) != "LIVE":
-        await tg_send(f"🔒 {symbol} {code} has an open position; mode switch blocked."); return
+        await tg_send(f"🔒 {symbol} {code} has an open position; mode switch blocked.")
+        return
+
+    other = _other_live_same_symbol(v)
+    if other and not ALLOW_MULTI_LIVE_PER_TOKEN:
+        await tg_send(
+            f"🔒 {symbol} {other['code']} is already LIVE or still holds a LIVE position. "
+            "By default only one strategy per token may be LIVE. "
+            "Set ALLOW_MULTI_LIVE_PER_TOKEN=1 and redeploy only if you deliberately want "
+            "multiple independent real orders on the same market."
+        )
+        return
+
     key = (str(symbol).upper(), str(code).upper())
     pending_live_confirmations[key] = time.time() + 60
+
+    warning = ""
+    if other:
+        warning = (
+            f"\n⚠️ {symbol} {other['code']} is also LIVE. "
+            "These strategies can submit separate real orders on the same market."
+        )
+
     await tg_send(
         f"⚠️ REAL MONEY confirmation for {key[0]} {key[1]}.\n"
-        f"Send exactly: CONFIRM LIVE {key[0]} {key[1]}\nExpires in 60 seconds."
+        f"Send exactly: CONFIRM LIVE {key[0]} {key[1]}\n"
+        f"Expires in 60 seconds.{warning}"
     )
 
 
@@ -2554,12 +3041,27 @@ async def confirm_live(symbol, code):
     key = (str(symbol).upper(), str(code).upper())
     expiry = pending_live_confirmations.pop(key, 0)
     if expiry < time.time():
-        await tg_send("LIVE confirmation missing or expired. Use MODE command again."); return
+        await tg_send("LIVE confirmation missing or expired. Use MODE command again.")
+        return
+
     v = strategy_for(*key)
     if not v or not LIVE_MASTER_ENABLE or not live_client_ready:
-        await tg_send("LIVE cannot be enabled: wallet/master not ready."); return
+        await tg_send("LIVE cannot be enabled: wallet/master not ready.")
+        return
+
+    other = _other_live_same_symbol(v)
+    if other and not ALLOW_MULTI_LIVE_PER_TOKEN:
+        await tg_send(
+            f"LIVE switch blocked: {key[0]} {other['code']} is already LIVE "
+            "or still holds a LIVE position."
+        )
+        return
+
     ok, msg = _set_mode_direct(v, "LIVE")
-    await tg_send(f"🔴 {key[0]} {key[1]} = LIVE" if ok else f"LIVE switch blocked: {msg}")
+    await tg_send(
+        f"🔴 {key[0]} {key[1]} = LIVE"
+        if ok else f"LIVE switch blocked: {msg}"
+    )
 
 
 def _can_resize(v):
@@ -2570,83 +3072,153 @@ async def handle_tg(text):
     raw = str(text or "").strip()
     cmd = raw.upper()
     parts = cmd.split()
+    codes = {"A", "B", "C", "E"}
 
     if cmd in {"/START", "▶️ START", "START"}:
         state_set("trading_enabled", "1")
+        tp = f"${TAKE_PROFIT_USDC:.2f} NET" if TAKE_PROFIT_USDC is not None else "OFF"
         await tg_send(
-            "▶️ BNB/ETH G/H STARTED\n"
-            "Monitoring votes: BTC, XRP, BNB, SOL, ETH, DOGE, HYPE\n"
-            "Trading targets: BNB, ETH only\n"
-            "G: 0.67–0.70, mom 0.05–0.10, >=2 other V2 votes/10s\n"
-            "H: same entry + one safer reversal DCA\nNo stop-loss."
-        ); return
+            "▶️ MULTI7 A/B/C/E STARTED\n"
+            f"Tokens: {', '.join(SYMBOLS)}\n"
+            "A: SAFE67 BASE 0.67–0.75, ENTRY only\n"
+            "B: SAFE67 0.67–0.75 + old reversal DCA\n"
+            "C: tight 0.67–0.70 + safer reversal DCA\n"
+            f"E: SAFE67 + >= {CONSENSUS_MIN_OTHER_TOKENS} other A confirmations / "
+            f"{CONSENSUS_WINDOW_SEC:g}s\n"
+            f"Take-profit: {tp} for the whole position\n"
+            "No stop-loss."
+        )
+        return
 
     if cmd in {"⏹ STOP", "STOP", "/STOP", "🚨 EMERGENCY STOP", "EMERGENCY STOP"}:
         state_set("trading_enabled", "0")
-        await tg_send("⏹ New G/H ENTRY/DCA actions stopped globally."); return
+        await tg_send(
+            "⏹ New ENTRY/DCA actions stopped globally. "
+            "Take-profit monitoring continues for already-open bot positions."
+        )
+        return
 
-    if cmd in {"💰 BALANCE", "BALANCE", "/BALANCE"}: await send_balance(); return
-    if cmd in {"📊 STATISTICS", "STATISTICS", "/STATS"}: await send_statistics(); return
-    if cmd in {"📈 POSITIONS", "POSITIONS"}: await send_positions(); return
-    if cmd in {"📜 TRADES", "TRADES"}: await send_trades(); return
-    if cmd in {"🎛 MODES", "MODES", "LIVE", "🔴 LIVE", "PAPER", "🟢 PAPER"}: await send_modes(); return
-    if cmd in {"📐 SIZES", "SIZES"}: await send_sizes(); return
-    if cmd in {"🔐 WALLET", "WALLET", "/WALLET"}: await send_wallet(); return
+    if cmd in {"💰 BALANCE", "BALANCE", "/BALANCE"}:
+        await send_balance(); return
+    if cmd in {"📊 STATISTICS", "STATISTICS", "/STATS"}:
+        await send_statistics(); return
+    if cmd in {"📈 POSITIONS", "POSITIONS"}:
+        await send_positions(); return
+    if cmd in {"📜 TRADES", "TRADES"}:
+        await send_trades(); return
+    if cmd in {"🎛 MODES", "MODES", "LIVE", "🔴 LIVE", "PAPER", "🟢 PAPER"}:
+        await send_modes(); return
+    if cmd in {"📐 SIZES", "SIZES"}:
+        await send_sizes(); return
+    if cmd in {"🔐 WALLET", "WALLET", "/WALLET"}:
+        await send_wallet(); return
 
-    # MODE BNB G LIVE/PAPER/OFF
-    if len(parts) == 4 and parts[0] == "MODE" and parts[1] in TRADE_SYMBOLS and parts[2] in {"G", "H"}:
+    # MODE BTC B LIVE/PAPER/OFF
+    if (
+        len(parts) == 4 and parts[0] == "MODE"
+        and parts[1] in SYMBOLS and parts[2] in codes
+    ):
         v = strategy_for(parts[1], parts[2])
         mode = parts[3]
         if mode == "LIVE":
             await request_live(parts[1], parts[2]); return
         if mode in {"PAPER", "OFF"}:
             ok, msg = _set_mode_direct(v, mode)
-            await tg_send(f"{'🟢' if mode=='PAPER' else '⛔'} {parts[1]} {parts[2]}: {msg}"); return
+            await tg_send(
+                f"{'🟢' if mode == 'PAPER' else '⛔'} "
+                f"{parts[1]} {parts[2]}: {msg}"
+            )
+            return
 
-    # CONFIRM LIVE BNB G
-    if len(parts) == 4 and parts[0] == "CONFIRM" and parts[1] == "LIVE" and parts[2] in TRADE_SYMBOLS and parts[3] in {"G", "H"}:
+    # CONFIRM LIVE BTC B
+    if (
+        len(parts) == 4 and parts[0] == "CONFIRM" and parts[1] == "LIVE"
+        and parts[2] in SYMBOLS and parts[3] in codes
+    ):
         await confirm_live(parts[2], parts[3]); return
 
-    # Quick token sizing: SIZE BNB 7 7 => both entries 7, H DCA 7.
-    if len(parts) == 4 and parts[0] == "SIZE" and parts[1] in TRADE_SYMBOLS and parts[2] not in {"G", "H"}:
+    # Whole token: SIZE BTC 5 5
+    # A/E get ENTRY=5. B/C get ENTRY=5, DCA=5.
+    if len(parts) == 4 and parts[0] == "SIZE" and parts[1] in SYMBOLS:
         symbol = parts[1]
-        e, d = sf(parts[2], -1), sf(parts[3], -1)
-        if not _valid_user_shares(e) or not _valid_user_shares(d):
-            await tg_send(f"Invalid size. Allowed: {LIVE_MIN_SHARES:g}..{LIVE_MAX_SHARES_PER_ORDER:g} shares."); return
+        entry = sf(parts[2], -1)
+        dca = sf(parts[3], -1)
+        if not _valid_user_shares(entry) or not _valid_user_shares(dca):
+            await tg_send(
+                f"Invalid size. Allowed: {LIVE_MIN_SHARES:g}.."
+                f"{LIVE_MAX_SHARES_PER_ORDER:g} shares."
+            )
+            return
+
         targets = STRATEGIES_BY_SYMBOL[symbol]
         if any(not _can_resize(v) for v in targets):
-            await tg_send(f"🔒 {symbol} has an open G/H position. Resize after settlement."); return
-        for v in targets:
-            state_set(f"entry_shares:{v['name']}", e)
-            if v.get("dca_enabled"):
-                state_set(f"dca_shares:{v['name']}", d)
-        await tg_send(f"📐 {symbol}: G ENTRY {e:g} | H ENTRY {e:g} | H DCA {d:g} shares"); return
+            await tg_send(
+                f"🔒 {symbol} has an open A/B/C/E position. Resize after it is flat."
+            )
+            return
 
-    # Strategy sizing: SIZE BNB G 7  OR  SIZE BNB H 7 5
-    if len(parts) in {4,5} and parts[0] == "SIZE" and parts[1] in TRADE_SYMBOLS and parts[2] in {"G", "H"}:
+        for v in targets:
+            state_set(f"entry_shares:{v['name']}", entry)
+            if v.get("dca_enabled"):
+                state_set(f"dca_shares:{v['name']}", dca)
+
+        await tg_send(
+            f"📐 {symbol}: A/E ENTRY {entry:g} | "
+            f"B/C ENTRY {entry:g}, DCA {dca:g} shares"
+        )
+        return
+
+    # Per strategy:
+    # SIZE BTC A 5
+    # SIZE BTC B 5 5
+    if (
+        len(parts) in {4, 5}
+        and parts[0] == "SIZE"
+        and parts[1] in SYMBOLS
+        and parts[2] in codes
+    ):
         v = strategy_for(parts[1], parts[2])
-        e = sf(parts[3], -1)
-        d = sf(parts[4], -1) if len(parts) == 5 else None
-        if not _valid_user_shares(e) or (v.get("dca_enabled") and d is not None and not _valid_user_shares(d)):
-            await tg_send(f"Invalid size. Allowed: {LIVE_MIN_SHARES:g}..{LIVE_MAX_SHARES_PER_ORDER:g} shares."); return
+        entry = sf(parts[3], -1)
+        dca = sf(parts[4], -1) if len(parts) == 5 else dca_shares(v)
+
+        if not _valid_user_shares(entry):
+            await tg_send(
+                f"Invalid ENTRY size. Allowed: {LIVE_MIN_SHARES:g}.."
+                f"{LIVE_MAX_SHARES_PER_ORDER:g} shares."
+            )
+            return
+        if v.get("dca_enabled") and not _valid_user_shares(dca):
+            await tg_send(
+                f"Invalid DCA size. Allowed: {LIVE_MIN_SHARES:g}.."
+                f"{LIVE_MAX_SHARES_PER_ORDER:g} shares."
+            )
+            return
         if not _can_resize(v):
-            await tg_send(f"🔒 {parts[1]} {parts[2]} has an open position. Resize after settlement."); return
-        state_set(f"entry_shares:{v['name']}", e)
+            await tg_send(
+                f"🔒 {parts[1]} {parts[2]} has an open position. Resize after it is flat."
+            )
+            return
+
+        state_set(f"entry_shares:{v['name']}", entry)
         if v.get("dca_enabled"):
-            if d is None:
-                d = dca_shares(v)
-            state_set(f"dca_shares:{v['name']}", d)
-            await tg_send(f"📐 {parts[1]} H: ENTRY {e:g} | DCA {d:g} shares")
+            state_set(f"dca_shares:{v['name']}", dca)
+            await tg_send(
+                f"📐 {parts[1]} {parts[2]}: ENTRY {entry:g} | DCA {dca:g} shares"
+            )
         else:
-            await tg_send(f"📐 {parts[1]} G: ENTRY {e:g} shares")
+            await tg_send(
+                f"📐 {parts[1]} {parts[2]}: ENTRY {entry:g} shares"
+            )
         return
 
     await tg_send(
-        "BNB/ETH G/H PAPER/LIVE BOT\n"
-        "Trade targets: BNB, ETH. Seven tokens are still monitored for consensus votes.\n\n"
-        "MODE BNB G PAPER/LIVE/OFF\nMODE BNB H PAPER/LIVE/OFF\n"
-        "SIZE BNB 5 5\nSIZE BNB G 5\nSIZE BNB H 5 5\n"
-        "LIVE requires: CONFIRM LIVE BNB G"
+        "MULTI7 A/B/C/E PAPER/LIVE BOT\n"
+        "MODE BTC A/B/C/E PAPER/LIVE/OFF\n"
+        "CONFIRM LIVE BTC B\n"
+        "SIZE BTC 5 5\n"
+        "SIZE BTC A 5\n"
+        "SIZE BTC B 5 5\n"
+        "Use XRP/BNB/SOL/ETH/DOGE/HYPE the same way."
     )
 
 
@@ -2654,23 +3226,29 @@ async def telegram_loop():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         log.warning("Telegram not configured")
         return
+
     offset = 0
+    tp = f"${TAKE_PROFIT_USDC:.2f} NET" if TAKE_PROFIT_USDC is not None else "OFF"
     await tg_send(
         f"🤖 {VERSION} online\n"
-        f"Trading: {', '.join(TRADE_SYMBOLS)} | strategies G/H\n"
-        f"Consensus monitoring: {', '.join(SYMBOLS)}\n"
+        f"Tokens: {', '.join(SYMBOLS)} | strategies A/B/C/E\n"
+        f"Accounts: {len(STRATEGIES)}\n"
         f"Global trading: {'ON' if trading_enabled() else 'OFF'}\n"
-        f"Wallet: {'READY' if live_client_ready else 'NOT READY'} | LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'}\n"
-        "Default sizes: ENTRY 5sh | H DCA 5sh | No stop-loss"
+        f"Wallet: {'READY' if live_client_ready else 'NOT READY'} | "
+        f"LIVE master: {'ON' if LIVE_MASTER_ENABLE else 'OFF'}\n"
+        f"Default ENTRY {ENTRY_ORDER_SIZE:g}sh | B/C DCA {DCA_ORDER_SIZE:g}sh\n"
+        f"Take-profit: {tp} | No stop-loss"
     )
+
     while True:
         try:
             async with session.get(
                 f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/getUpdates",
                 params={"timeout": 25, "offset": offset},
                 timeout=aiohttp.ClientTimeout(total=35),
-            ) as r:
-                data = await r.json()
+            ) as response:
+                data = await response.json()
+
             for update in data.get("result", []):
                 offset = max(offset, si(update.get("update_id")) + 1)
                 msg = update.get("message") or {}
@@ -2678,8 +3256,8 @@ async def telegram_loop():
                     continue
                 if msg.get("text"):
                     await handle_tg(msg["text"])
-        except Exception as e:
-            log.warning("Telegram polling: %s", e)
+        except Exception as exc:
+            log.warning("Telegram polling: %s", exc)
             await asyncio.sleep(2)
 
 
@@ -2695,8 +3273,9 @@ async def health(request):
         "live_master_enable": LIVE_MASTER_ENABLE,
         "live_client_ready": live_client_ready,
         "live_client_error": live_client_error,
-        "trade_symbols": TRADE_SYMBOLS,
-        "monitor_symbols": SYMBOLS,
+        "allow_multi_live_per_token": ALLOW_MULTI_LIVE_PER_TOKEN,
+        "symbols": SYMBOLS,
+        "accounts": len(STRATEGIES),
         "strategies": {
             f"{v['symbol']}_{v['code']}": {
                 "mode": strategy_mode(v["name"]),
@@ -2707,21 +3286,38 @@ async def health(request):
         "strategy_rules": {
             "first_v2_price": [V2_ELIGIBLE_PRICE_MIN, V2_ELIGIBLE_PRICE_MAX],
             "first_v2_momentum": [V2_ELIGIBLE_MOM_MIN, V2_ELIGIBLE_MOM_MAX],
-            "decision_interval_sec": DECISION_INTERVAL,
-            "momentum_lookback_sec": MOMENTUM_LOOKBACK_SEC,
-            "target_entry_price": [C_SAFE_ENTRY_PRICE_MIN, C_SAFE_ENTRY_PRICE_MAX],
-            "target_entry_momentum": [SAFE_ENTRY_MOM_MIN, SAFE_ENTRY_MOM_MAX],
-            "consensus_min_other_tokens": {
-                "G": G_CONSENSUS_MIN_OTHER_TOKENS,
-                "H": H_CONSENSUS_MIN_OTHER_TOKENS,
+            "entry_momentum": [SAFE_ENTRY_MOM_MIN, SAFE_ENTRY_MOM_MAX],
+            "A": {
+                "entry_price": [SAFE_ENTRY_PRICE_MIN, SAFE_ENTRY_PRICE_MAX],
+                "dca": False,
             },
-            "consensus_window_sec": CONSENSUS_WINDOW_SEC,
-            "H_dca": {
-                "arm_ask_lte": DCA_ARM_PRICE,
-                "buy_price": [C_DCA_MIN_BUY_PRICE, C_DCA_MAX_BUY_PRICE],
-                "rebound_momentum": [C_DCA_REBOUND_MOM_MIN, C_DCA_REBOUND_MOM_MAX],
-                "deadline_sec": DCA_DEADLINE_SEC,
+            "B": {
+                "entry_price": [SAFE_ENTRY_PRICE_MIN, SAFE_ENTRY_PRICE_MAX],
+                "dca_arm_ask_lte": DCA_ARM_PRICE,
+                "dca_buy_min": MIN_PRICE,
+                "dca_buy_max": DCA_MAX_BUY_PRICE,
+                "dca_momentum_min": DCA_REBOUND_MOM,
+                "dca_momentum_max": None,
+                "dca_deadline_sec": DCA_DEADLINE_SEC,
             },
+            "C": {
+                "entry_price": [C_SAFE_ENTRY_PRICE_MIN, C_SAFE_ENTRY_PRICE_MAX],
+                "dca_arm_ask_lte": DCA_ARM_PRICE,
+                "dca_buy_min": C_DCA_MIN_BUY_PRICE,
+                "dca_buy_max": C_DCA_MAX_BUY_PRICE,
+                "dca_momentum_min": C_DCA_REBOUND_MOM_MIN,
+                "dca_momentum_max": C_DCA_REBOUND_MOM_MAX,
+                "dca_deadline_sec": DCA_DEADLINE_SEC,
+            },
+            "E": {
+                "entry_price": [SAFE_ENTRY_PRICE_MIN, SAFE_ENTRY_PRICE_MAX],
+                "consensus_min_other_tokens": CONSENSUS_MIN_OTHER_TOKENS,
+                "consensus_window_sec": CONSENSUS_WINDOW_SEC,
+                "consensus_source": "other-token A/BASE SAFE67 PASS",
+                "dca": False,
+            },
+            "take_profit_usdc_net": TAKE_PROFIT_USDC,
+            "take_profit_fee_basis": "entry fee + estimated exit fee",
             "stop_loss": None,
         },
         "hourly_reports": False,
@@ -2747,10 +3343,11 @@ async def main():
     global session
     init_db()
     session = aiohttp.ClientSession(headers={
-        "User-Agent": f"BNBETHConsensusGH/{VERSION}",
+        "User-Agent": f"Multi7ABCEPaperLive/{VERSION}",
         "Accept": "application/json",
     })
     await init_live_client()
+
     tasks = [
         asyncio.create_task(web_server()),
         asyncio.create_task(discovery_loop()),
@@ -2760,14 +3357,18 @@ async def main():
         asyncio.create_task(telegram_loop()),
         asyncio.create_task(memory_maintenance_loop()),
     ]
+
     log.info(
-        "%s started | trade=%s | monitor=%s | G/H tight+2V2 | H safe-DCA | "
-        "window=%gs | live_master=%s | wallet=%s | trading=%s",
-        VERSION, ",".join(TRADE_SYMBOLS), ",".join(SYMBOLS), CONSENSUS_WINDOW_SEC,
+        "%s started | symbols=%s | strategies=A/B/C/E accounts=%d | TP=%s | "
+        "live_master=%s | wallet=%s | multi_live/token=%s | trading=%s",
+        VERSION, ",".join(SYMBOLS), len(STRATEGIES),
+        f"${TAKE_PROFIT_USDC:.2f} NET" if TAKE_PROFIT_USDC is not None else "OFF",
         "ON" if LIVE_MASTER_ENABLE else "OFF",
         "READY" if live_client_ready else "NOT READY",
+        "ALLOWED" if ALLOW_MULTI_LIVE_PER_TOKEN else "BLOCKED",
         "ON" if trading_enabled() else "OFF",
     )
+
     try:
         await asyncio.gather(*tasks)
     finally:
@@ -2776,6 +3377,7 @@ async def main():
         await close_live_client()
         if session:
             await session.close()
+
 
 if __name__ == "__main__":
     try:
