@@ -10,7 +10,7 @@ import time
 
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
-from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state
+from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting
 
 logging.basicConfig(
     level=logging.INFO,
@@ -20,8 +20,6 @@ log = logging.getLogger("polymarket-bot")
 
 
 async def trading_loop():
-    storage.init_db()
-    runtime_state.init_from_db()
     dry_run = runtime_state.get("dry_run")
     await telegram_notify.notify(
         f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
@@ -48,9 +46,10 @@ async def _tick():
     if settings.USE_LIVE_BOOK_STREAM:
         book_stream.subscribe([market.up_token_id, market.down_token_id])
 
-    # Периодический прогрев авторизованного HTTP-транспорта (не блокирует луп).
+    # Периодический прогрев авторизованного HTTP-транспорта — fire-and-forget,
+    # не блокирует основной цикл (метод асинхронный в polymarket-client SDK).
     if not runtime_state.get("dry_run"):
-        asyncio.get_event_loop().run_in_executor(None, polymarket_client.prewarm_transport)
+        asyncio.create_task(polymarket_client.prewarm_transport())
 
     klines = await binance_feed.get_klines(limit=max(100, settings.ATR_LOOKBACK_FOR_REGIME + settings.ATR_PERIOD + 5))
     ind = indicators.compute_indicator_snapshot(
@@ -61,8 +60,8 @@ async def _tick():
     minutes_left = max(0.0, (market.end_time - time.time()) / 60)
 
     get_book = polymarket_client.get_orderbook_cached if settings.USE_LIVE_BOOK_STREAM else polymarket_client.get_orderbook
-    up_book = get_book(market.up_token_id)
-    down_book = get_book(market.down_token_id)
+    up_book = await get_book(market.up_token_id)
+    down_book = await get_book(market.down_token_id)
 
     decision = strategy.evaluate(
         current_price=current_price,
@@ -73,7 +72,8 @@ async def _tick():
         down_book=down_book,
     )
 
-    storage.log_signal(market.slug, current_price, market.strike_price, decision)
+    storage.log_signal(market.slug, current_price, market.strike_price, decision,
+                        indicators=ind, up_book=up_book, down_book=down_book)
 
     telegram_notify.set_state_ref({
         "market_slug": market.slug,
@@ -82,20 +82,31 @@ async def _tick():
         "strike_price": round(market.strike_price, 2),
         "minutes_left": round(minutes_left, 2),
         "safety_score": decision.safety_score,
+        "up_token_id": market.up_token_id,
+        "down_token_id": market.down_token_id,
     })
 
     active_book = up_book if decision.direction == "UP" else down_book
     log.info(
-        "%s | price=%.2f strike=%.2f dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s",
+        "%s | price=%.2f strike=%.2f dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s\n"
+        "  up_token=%s\n  down_token=%s",
         market.slug, current_price, market.strike_price, decision.direction,
         minutes_left, decision.safety_score, decision.should_enter, active_book.source, decision.reasons,
+        market.up_token_id, market.down_token_id,
     )
 
     await executor.maybe_enter(market, decision)
     await executor.settle_resolved_trades()
+    await executor.label_resolved_markets(market.slug)
 
 
 async def main():
+    # Инициализация БД и настроек — до старта любых фоновых задач, которые
+    # могут к ней обращаться (иначе report_loop рискует стартовать раньше,
+    # чем появятся таблицы).
+    storage.init_db()
+    runtime_state.init_from_db()
+
     app = telegram_notify.build_app()
     async with app:
         await app.start()
@@ -105,11 +116,14 @@ async def main():
         if settings.USE_LIVE_BOOK_STREAM:
             book_stream_task = asyncio.create_task(book_stream.run_forever())
 
+        report_task = asyncio.create_task(reporting.report_loop())
+
         try:
             await trading_loop()
         finally:
             if book_stream_task:
                 book_stream_task.cancel()
+            report_task.cancel()
             await app.updater.stop()
             await app.stop()
 

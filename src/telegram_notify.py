@@ -154,6 +154,20 @@ async def _cmd_pnl(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(_stats_text())
 
 
+async def _cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    s = _state_ref
+    if not s or not s.get("up_token_id"):
+        await update.message.reply_text("Пока нет данных о текущем рынке — подожди следующего тика бота.")
+        return
+    await update.message.reply_text(
+        f"Рынок: {s.get('market_slug', '—')}\n\n"
+        f"UP token_id:\n`{s.get('up_token_id')}`\n\n"
+        f"DOWN token_id:\n`{s.get('down_token_id')}`\n\n"
+        f"Долгий тап на число — скопировать.",
+        parse_mode="Markdown",
+    )
+
+
 def _stats_text() -> str:
     today_start = int(time.time() // 86400) * 86400
     today = storage.get_pnl_summary(today_start)
@@ -262,6 +276,7 @@ def build_app() -> Application:
     _app.add_handler(CommandHandler("menu", _cmd_start_or_menu))
     _app.add_handler(CommandHandler("status", _cmd_status))
     _app.add_handler(CommandHandler("pnl", _cmd_pnl))
+    _app.add_handler(CommandHandler("token", _cmd_token))
     _app.add_handler(CallbackQueryHandler(_on_callback))
     return _app
 
@@ -272,3 +287,14 @@ async def notify(text: str) -> None:
     if _app is None:
         return
     await _app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=text)
+
+
+async def send_document(path: str, caption: str | None) -> None:
+    """Отправляет файл (например, CSV-отчёт) в чат. caption может быть None,
+    если это второй файл в паре и подпись уже была у первого."""
+    if not settings.TELEGRAM_BOT_TOKEN or not settings.TELEGRAM_CHAT_ID:
+        return
+    if _app is None:
+        return
+    with open(path, "rb") as f:
+        await _app.bot.send_document(chat_id=settings.TELEGRAM_CHAT_ID, document=f, caption=caption)
