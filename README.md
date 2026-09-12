@@ -1,457 +1,145 @@
-# MULTI7 SAFE67 A/B/C/E — PAPER/LIVE + NET TP 0.60
-
-Trading build of the uploaded MULTI7 A/B/C/E PAPER bot.
-
-Version:
-
-```text
-19.0-multi7-abce-paper-live-tp60
-```
-
-## Tokens and strategies
-
-Default tokens:
-
-```text
-BTC
-XRP
-BNB
-SOL
-ETH
-DOGE
-HYPE
-```
-
-Four strategies per token = **28 independent strategy accounts**:
-
-```text
-A
-B
-C
-E
-```
-
-Each has its own mode:
-
-```text
-PAPER
-LIVE
-OFF
-```
-
-Fresh database defaults every strategy to `PAPER`.
-Global trading starts `OFF`; use `START`.
-
-## Strategy logic preserved
-
-### A — SAFE67 BASE
-
-```text
-FIRST V2 eligible:
-price 0.55..0.75
-momentum 0.03..0.30
-
-ENTRY:
-price 0.67..0.75
-momentum 0.05..0.10
-default 5 shares
-
-No DCA
-No stop-loss
-```
-
-### B — SAFE67 old reversal DCA
-
-```text
-ENTRY:
-price 0.67..0.75
-momentum 0.05..0.10
-default 5 shares
-
-DCA arm:
-held-side ask <= 0.50
-elapsed <= 120 sec
-NO BUY on arm tick
-
-Later:
-momentum >= +0.05
-ask <= 0.60
-default +5 shares
-one DCA
-```
-
-B intentionally keeps no `0.30` floor and no `+0.15` rebound cap.
-
-### C — tighter entry + safer reversal DCA
-
-```text
-ENTRY:
-price 0.67..0.70
-momentum 0.05..0.10
-default 5 shares
-
-DCA arm:
-ask <= 0.50
-elapsed <= 120 sec
-NO BUY on arm tick
-
-Later:
-ask 0.30..0.60
-momentum +0.05..+0.15
-default +5 shares
-one DCA
-```
-
-### E — cross-token consensus
-
-```text
-target entry:
-price 0.67..0.75
-momentum 0.05..0.10
-
-confirmation:
->= 2 DISTINCT OTHER tokens
-with A/BASE SAFE67 PASS
-same direction
-previous 10 sec
-
-default ENTRY 5 shares
-No DCA
-```
-
-The target token does not count itself. One other token counts once.
-
-A signals are still evaluated as consensus sources even when A's trading mode is
-`OFF`; `OFF` blocks order execution, not signal/gate recording.
-
-No strategy switches sides and there is no stop-loss.
-
-## Default NET take-profit
-
-Default:
-
-```text
-TAKE_PROFIT_USDC=0.60
-```
-
-This is **+$0.60 NET for the whole remaining position**, not per share.
-
-The bot's threshold calculation includes:
-
-```text
-entry gross cost
-+ entry commission
-- prior exit net
-- projected current sell net
-including projected exit commission
-```
-
-Change it in hosting Environment Variables:
-
-```text
-TAKE_PROFIT_USDC=0.30
-TAKE_PROFIT_USDC=0.60
-TAKE_PROFIT_USDC=1.00
-```
-
-Disable:
-
-```text
-TAKE_PROFIT_USDC=OFF
-```
-
-or:
-
-```text
-TAKE_PROFIT_USDC=0
-```
-
-After changing an environment variable, redeploy/restart the service.
-
-For B/C after a DCA, `0.60` is still the target for the **whole remaining
-position**, including all buys and fees.
-
-### PAPER TP
-
-PAPER requires enough visible bid depth to sell the entire remaining position.
-It does not record a partial PAPER take-profit merely to hit the threshold.
-
-### LIVE TP
-
-LIVE checks the same bot-tracked NET target, freshness-checks the book and uses
-the protected real-order path:
-
-```text
-signed LIMIT -> FAK SELL
-```
-
-A genuine partial LIVE TP fill is recorded. Once a real TP has partially filled,
-TP becomes latched and the bot continues trying to flatten the bot-tracked
-remainder on later cycles.
-
-An ambiguous submission remains fail-closed; it is not blindly duplicated.
-
-`STOP` blocks new ENTRY/DCA actions, but TP monitoring continues for already
-open bot-tracked PAPER/LIVE positions.
-
-## LIVE safety
-
-Master gate:
-
-```text
-LIVE_MASTER_ENABLE=0
-```
-
-First deploy with `0`. In Telegram use:
-
-```text
-WALLET
-```
-
-Verify:
-
-```text
-SDK: READY
-Wallet: expected address
-Collateral: expected balance
-LIVE master: OFF
-```
-
-Then set:
-
-```text
-LIVE_MASTER_ENABLE=1
-```
-
-and redeploy.
-
-Every individual strategy still needs a second 60-second Telegram confirmation:
-
-```text
-MODE BTC B LIVE
-CONFIRM LIVE BTC B
-```
-
-Examples:
-
-```text
-MODE ETH C LIVE
-CONFIRM LIVE ETH C
-
-MODE SOL E LIVE
-CONFIRM LIVE SOL E
-```
-
-Switch back:
-
-```text
-MODE BTC B PAPER
-MODE BTC B OFF
-```
-
-Mode crossing PAPER <-> LIVE is blocked while that strategy holds an open
-position in the other execution mode.
-
-## Multiple LIVE strategies on one token
-
-Default:
-
-```text
-ALLOW_MULTI_LIVE_PER_TOKEN=0
-```
-
-This prevents, for example, BTC A and BTC B from both being LIVE at the same
-time. The strategies can share a signal and would otherwise send independent
-real orders.
-
-If you deliberately want several A/B/C/E strategies LIVE on the same token:
-
-```text
-ALLOW_MULTI_LIVE_PER_TOKEN=1
-```
-
-then redeploy.
-
-Different tokens can be LIVE at the same time.
-
-## Sizes
-
-Whole token:
-
-```text
-SIZE BTC 5 5
-```
-
-sets:
-
-```text
-A ENTRY = 5
-E ENTRY = 5
-B ENTRY = 5, DCA = 5
-C ENTRY = 5, DCA = 5
-```
-
-Per strategy:
-
-```text
-SIZE BTC A 5
-SIZE BTC B 5 5
-SIZE BTC C 5 5
-SIZE BTC E 5
-```
-
-Use the other token names in the same way.
-
-Sizes cannot be changed while that strategy has an open bot-tracked position.
-
-## Telegram controls
-
-```text
-START
-STOP
-MODES
-SIZES
-BALANCE
-POSITIONS
-STATISTICS
-TRADES
-WALLET
-EMERGENCY STOP
-```
-
-## LIVE execution
-
-The real-order wrapper is the same protected pattern used in the earlier
-PAPER/LIVE bot:
-
-```text
-fresh book check
-signed LIMIT order
-converted to FAK
-actual accepted fill amount persisted
-```
-
-If the response after submission is ambiguous, that market/action is marked
-fail-closed and the bot does not automatically submit a possible duplicate.
-
-LIVE settlement PnL is bot-tracked from accepted fill amounts. Winning LIVE
-shares that remain to market settlement are **not auto-redeemed** by this bot.
-
-## Hosting variables
-
-Minimum first-deploy block:
-
-```text
-TELEGRAM_BOT_TOKEN=
-TELEGRAM_CHAT_ID=
-
-PORT=8080
-DATA_DIR=/var/data
-
-POLYMARKET_PRIVATE_KEY=
-POLYMARKET_WALLET_ADDRESS=
-
-LIVE_MASTER_ENABLE=0
-ALLOW_MULTI_LIVE_PER_TOKEN=0
-
-TAKE_PROFIT_USDC=0.60
-
-PAPER_START_BALANCE=500
-ENTRY_ORDER_SIZE=5
-DCA_ORDER_SIZE=5
-```
-
-Never put the real `POLYMARKET_PRIVATE_KEY` in GitHub. Keep it only in the
-hosting Environment/Secret store.
-
-Optional:
-
-```text
-POLYMARKET_RELAYER_API_KEY=
-POLYMARKET_RELAYER_API_KEY_ADDRESS=
-```
-
-Leave them blank unless your wallet setup specifically uses them.
-
-The complete template is in `.env.example`.
-
-## Coolify
-
-A `Dockerfile` is included.
-
-Expose:
-
-```text
-8080
-```
-
-Persistent storage mount:
-
-```text
-/var/data
-```
-
-Health endpoint:
-
-```text
-/health
-```
-
-Database:
-
-```text
-/var/data/safe67_multi7_abce_paper_live_tp60.db
-```
-
-## Render
-
-Build:
-
-```text
+# Polymarket BTC 15m Up/Down Bot
+
+Бот для торговли 15-минутными рынками "Bitcoin Up or Down" на Polymarket.
+Заходит в позицию по цене 0.87–0.95, когда набор фильтров (ATR, EMA,
+время до конца рынка, ликвидность стакана) даёт достаточный "safety score".
+
+**⚠️ Это торговый бот с реальными деньгами. Рынки Up/Down устроены как
+бинарные ставки: выигрыш ограничен ценой входа, а проигрыш — это полная
+потеря ставки. Даже "безопасный" вход по 0.90 означает, что в среднем
+на дистанции нужен винрейт выше ~90%, просто чтобы выйти в ноль после
+комиссий и проскальзывания. Обязательно погоняй в `DRY_RUN=true` и
+посмотри на статистику в БД, прежде чем включать реальные сделки.**
+
+## Как это работает
+
+1. **Определение активного рынка** — вычисляем слаг рынка
+   (`btc-updown-15m-<unix_ts>`) и подтверждаем через Gamma API
+   Polymarket, получаем `condition_id` и ID токенов Up/Down.
+2. **Страйк-цена** — цена BTC на Binance в момент начала 15-минутного
+   окна (именно с ней сравнивается цена на закрытии для резолюции рынка).
+3. **Индикаторы** — ATR(14) и EMA(9/21) на 1-минутных свечах Binance:
+   - расхождение текущей цены от страйка в единицах ATR
+   - подтверждение направления трендом EMA
+   - детект аномального всплеска волатильности (риск разворота)
+4. **Safety score (0–100)** — взвешенная сумма: время до конца рынка,
+   расхождение в ATR, согласованность тренда, режим волатильности,
+   ликвидность в стакане на нужной стороне.
+5. **Вход** — только если цена ask на нужной стороне в диапазоне
+   [`MIN_ENTRY_PRICE`, `MAX_ENTRY_PRICE`] И score выше порога.
+   Ордер — FOK (Fill-Or-Kill), чтобы не оставлять зависшие ордера на
+   рынке с истекающим временем.
+6. **Резолюция** — после закрытия рынка бот сверяется с Gamma API,
+   фиксирует PnL и шлёт итог в Telegram.
+7. **Telegram** — уведомления о каждом входе/резолюции + команды
+   `/status`, `/pause`, `/resume`, `/pnl`.
+
+## Установка
+
+```bash
+git clone <твой-репозиторий>
+cd polymarket-btc-bot
+python3 -m venv venv
+source venv/bin/activate   # Windows: venv\Scripts\activate
 pip install -r requirements.txt
+cp .env.example .env
 ```
 
-Start:
+Заполни `.env`:
 
-```text
-python main.py
+- `TELEGRAM_BOT_TOKEN` — получить у [@BotFather](https://t.me/BotFather)
+- `TELEGRAM_CHAT_ID` — свой chat_id (можно узнать через [@userinfobot](https://t.me/userinfobot))
+- `POLY_PRIVATE_KEY` — приватный ключ торгового кошелька (Polygon).
+  **Используй отдельный кошелёк, не основной**, и держи ключ только в `.env`.
+- `POLY_FUNDER_ADDRESS` — если логинишься в Polymarket через email/Magic
+  или browser-wallet, а не напрямую MetaMask-адресом.
+- Перед реальными сделками на аккаунте должны быть выставлены токен-аллованcы
+  USDC → CTF Exchange контракты (см. документацию py-clob-client в README
+  репозитория [Polymarket/py-clob-client](https://github.com/Polymarket/py-clob-client) —
+  если логинился через email/Magic, это делается автоматически).
+
+## Запуск
+
+```bash
+python -m src.main
 ```
 
-Persistent disk should also be mounted at:
+Пока `DRY_RUN=true` — ордера не отправляются, только логируются сигналы в
+`data/bot.db` (таблица `signals`) и приходят уведомления с пометкой
+"DRY RUN". Это твой инструмент бэктеста: смотри реальную статистику
+срабатываний стратегии на живых данных перед тем, как включать
+`DRY_RUN=false`.
 
-```text
-/var/data
+## Структура проекта
+
+```
+config.py                  — все настройки из .env
+src/
+  binance_feed.py           — цена и свечи BTC с Binance
+  market_discovery.py       — поиск активного 15m рынка на Polymarket
+  indicators.py             — ATR, EMA, детект волатильности
+  strategy.py                — safety score и решение о входе
+  polymarket_client.py       — обёртка над py-clob-client (orderbook, ордера)
+  storage.py                  — SQLite: сигналы и сделки
+  telegram_notify.py          — уведомления и команды бота
+  executor.py                  — исполнение входа + резолюция сделок
+  main.py                      — основной цикл
 ```
 
-## Reports
+## Прогрев стакана и задержка Polymarket
 
-The hourly ZIP reporter is deliberately disabled in this LIVE trading build.
-Persistent SQLite still stores PAPER trades, LIVE orders, exits, signals,
-consensus decisions, trajectories and results.
+Изначальная версия дёргала `GET /book` REST-запросом на каждом тике —
+это лишние 100-300мс сетевого раунд-трипа именно в момент принятия
+решения, и цена в этот момент могла уже уйти. Плюс сам Polymarket
+обновляет книгу с задержкой относительно бирж вроде Binance — это
+системный лаг, который прогревом не убрать, но убрать свою собственную
+задержку поверх него — можно.
 
-## Regression
+Что добавлено (`src/book_stream.py`):
 
-Run:
+- **Живой WS-стакан.** При обнаружении рынка бот сразу подписывается на
+  оба токена (Up/Down) через `wss://ws-subscriptions-clob.polymarket.com/ws/market`
+  и держит соединение открытым весь жизненный цикл рынка. К моменту, когда
+  strategy нужна цена — она уже лежит в памяти, обновлённая пушем с сервера,
+  а не тем, что мы только что сходили и спросили. REST остаётся фолбэком,
+  если WS ещё не прогрелся или стакан протух (`is_fresh`, порог 3с).
+- **Выравнивание цены по тику.** Реальный лимит исполнения = `ask + slippage`,
+  округлённый ВНИЗ до шага цены токена (`round_price_for_buy`). Без этого
+  CLOB отклоняет ордер с неправильным шагом цены — и это происходит именно
+  в момент, когда каждая миллисекунда на счету.
+- **Прогрев авторизованного транспорта.** Периодический безобидный
+  read-only запрос баланса (`prewarm_transport`) — прогревает то же самое
+  TLS/auth-соединение, которым пойдёт реальный ордер, без торгового эффекта.
 
-```text
-python test_multi7_abce_live_tp60.py
-```
+Что **не** перенесено из старого бота, и почему: presign-прогрев (построение
+и подпись фиктивного ордера заранее) актуален для стратегий вроде
+`PRE_LEAD_SAFE` из твоего v20.13, которые гоняются за движением на 5-минутных
+рынках и решают вопрос в первые секунды после сигнала. У нашей стратегии
+окно входа — 2-9 минут из 15, так что выигрыш от presign там не критичен;
+если после недели дрен-рана окажется, что именно последние сотни
+миллисекунд решают судьбу сделок — добавить несложно, дай знать.
 
-Expected:
+## Что стоит донастроить под себя
 
-```text
-MULTI7 A/B/C/E PAPER/LIVE + NET TP60 regression: OK
-```
+- **`SAFETY_SCORE_THRESHOLD`, `ATR_DISTANCE_MULT`** — веса и пороги в
+  `strategy.py` подобраны как разумная отправная точка, а не готовый
+  Грааль. Прогони DRY_RUN минимум неделю, выгрузи `signals` из
+  `data/bot.db` и посмотри, как safety score коррелирует с реальным
+  исходом рынка — потом калибруй пороги.
+- **`MAX_OPEN_POSITIONS`** сейчас используется только как параметр
+  конфига; если хочешь торговать несколько активов (`btc,eth,sol`)
+  параллельно — вынеси `ASSET` в список и заведи по циклу на каждый.
+- **Проскальзывание** — сейчас берём `best_ask` из стакана. Если
+  ликвидность у Polymarket на конкретном рынке тонкая, добавь логику
+  усреднения по нескольким уровням стакана в `polymarket_client.get_orderbook`.
+- **Резолюция** через Gamma API — есть небольшая задержка после закрытия
+  окна, пока рынок не помечен `closed=true`. Это нормально, бот просто
+  проверяет на каждом тике и зафиксирует PnL, как только статус обновится.
 
-The regression verifies:
+## Тестирование стратегии автономно (бэктест)
 
-- 7 tokens × A/B/C/E = 28 strategies;
-- uploaded A/B/C/E entry and DCA settings;
-- B can still take the old deep rebound DCA;
-- C rejects DCA below 0.30 and rebound momentum above +0.15;
-- E still requires two other-token A/BASE confirmations;
-- `TAKE_PROFIT_USDC` defaults to 0.60 and can be changed/disabled via ENV;
-- PAPER TP does not close below +$0.60 NET and closes above it;
-- fake-SDK LIVE ENTRY uses the FAK wrapper;
-- fake-SDK LIVE TP sends a SELL FAK and fully closes;
-- multiple LIVE strategies on the same token are blocked by default.
+Таблица `signals` в SQLite копит каждый тик независимо от того, был ли
+вход — это готовый датасет для офлайн-анализа (Pandas/Jupyter): можно
+сопоставить исторические safety score с фактическим исходом рынка
+(таблица `trades` после накопления реальных/dry-run входов) и подобрать
+оптимальные пороги до того, как рисковать реальными деньгами.
