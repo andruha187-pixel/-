@@ -57,7 +57,7 @@ class Settings:
     MAX_MINUTES_LEFT: float = _get_float("MAX_MINUTES_LEFT", 9.0)
     ATR_DISTANCE_MULT: float = _get_float("ATR_DISTANCE_MULT", 1.3)
     ATR_SPIKE_MULT: float = _get_float("ATR_SPIKE_MULT", 2.2)
-    SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 70.0)
+    SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 75.0)
     MIN_BOOK_LIQUIDITY_USDC: float = _get_float("MIN_BOOK_LIQUIDITY_USDC", 25.0)
 
     # --- Латентность / исполнение (прогрев стакана и транспорта) ---
@@ -69,6 +69,14 @@ class Settings:
     TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 10.0)
     MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 1)
     DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 50.0)
+
+    # --- Масштабирование ставки по уверенности сигнала ---
+    # Ставка = TRADE_SIZE_USDC только при score >= SIZE_SCALING_MAX_SCORE.
+    # На самом пороге (score == threshold) ставка = TRADE_SIZE_USDC * MIN_FRACTION.
+    # Между ними — линейная интерполяция. Так пограничные сигналы (score чуть
+    # выше порога) автоматически получают меньшую ставку, а не полный размер.
+    SIZE_SCALING_MIN_FRACTION: float = _get_float("SIZE_SCALING_MIN_FRACTION", 0.3)
+    SIZE_SCALING_MAX_SCORE: float = _get_float("SIZE_SCALING_MAX_SCORE", 95.0)
 
     # --- Режим работы ---
     DRY_RUN: bool = _get_bool("DRY_RUN", True)          # True = только сигналы, ордера не шлём
