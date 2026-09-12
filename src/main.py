@@ -10,7 +10,7 @@ import time
 
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
-from src import polymarket_client, storage, telegram_notify, executor, book_stream
+from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,8 +21,11 @@ log = logging.getLogger("polymarket-bot")
 
 async def trading_loop():
     storage.init_db()
+    runtime_state.init_from_db()
+    dry_run = runtime_state.get("dry_run")
     await telegram_notify.notify(
-        f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if settings.DRY_RUN else 'LIVE — реальные сделки!'}"
+        f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
+        f"Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
     )
 
     while True:
@@ -46,7 +49,7 @@ async def _tick():
         book_stream.subscribe([market.up_token_id, market.down_token_id])
 
     # Периодический прогрев авторизованного HTTP-транспорта (не блокирует луп).
-    if not settings.DRY_RUN:
+    if not runtime_state.get("dry_run"):
         asyncio.get_event_loop().run_in_executor(None, polymarket_client.prewarm_transport)
 
     klines = await binance_feed.get_klines(limit=max(100, settings.ATR_LOOKBACK_FOR_REGIME + settings.ATR_PERIOD + 5))

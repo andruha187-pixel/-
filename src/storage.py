@@ -40,6 +40,11 @@ CREATE TABLE IF NOT EXISTS trades (
     pnl_usdc REAL,
     dry_run INTEGER
 );
+
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 
@@ -123,3 +128,20 @@ def get_pnl_summary(since_ts: int = 0):
         )
         count, total_pnl, wins = cur.fetchone()
         return {"trades": count or 0, "pnl_usdc": total_pnl or 0.0, "wins": wins or 0}
+
+
+# --- Настройки, управляемые из Telegram (переживают рестарт процесса) ---
+
+def get_all_settings() -> dict[str, str]:
+    with _conn() as conn:
+        cur = conn.execute("SELECT key, value FROM bot_settings")
+        return {k: v for k, v in cur.fetchall()}
+
+
+def set_setting(key: str, value) -> None:
+    with _conn() as conn:
+        conn.execute(
+            "INSERT INTO bot_settings (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, str(value)),
+        )

@@ -69,7 +69,7 @@ def get_orderbook(token_id: str, depth_levels: int = 5) -> OrderBookSnapshot:
     best_bid = float(bids[0].price) if bids else None
 
     ask_liquidity = sum(float(l.price) * float(l.size) for l in asks[:depth_levels])
-    tick = float(getattr(book, "tick_size", None) or settings.MIN_ENTRY_PRICE and 0.01)
+    tick = float(getattr(book, "tick_size", None) or 0.01)
 
     return OrderBookSnapshot(best_bid=best_bid, best_ask=best_ask, ask_liquidity_usdc=ask_liquidity,
                               tick_size=tick, source="rest")

@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from config import settings
+from src import runtime_state
 from src.polymarket_client import OrderBookSnapshot
 
 
@@ -92,8 +93,13 @@ def evaluate(
     if book.best_ask is None:
         return Decision(False, direction, None, 0.0, minutes_left, 0.0, ["нет asks в стакане"])
 
-    if not (settings.MIN_ENTRY_PRICE <= book.best_ask <= settings.MAX_ENTRY_PRICE):
-        reasons.append(f"цена {book.best_ask:.3f} вне диапазона [{settings.MIN_ENTRY_PRICE}, {settings.MAX_ENTRY_PRICE}]")
+    min_entry = runtime_state.get("min_entry_price")
+    max_entry = runtime_state.get("max_entry_price")
+    score_threshold = runtime_state.get("safety_score_threshold")
+    trade_size = runtime_state.get("trade_size_usdc")
+
+    if not (min_entry <= book.best_ask <= max_entry):
+        reasons.append(f"цена {book.best_ask:.3f} вне диапазона [{min_entry}, {max_entry}]")
 
     atr = indicators["atr"] or 1e-9
     distance_atr = abs(current_price - strike_price) / atr
@@ -102,7 +108,7 @@ def evaluate(
     distance_score = _score_distance(distance_atr)
     trend_score = _score_trend_alignment(direction, indicators["ema_fast_slope"], indicators["trend_up"])
     vol_score = _score_volatility_regime(indicators["atr_ratio_to_avg"])
-    liq_score = _score_liquidity(book, settings.TRADE_SIZE_USDC)
+    liq_score = _score_liquidity(book, trade_size)
 
     weights = {"time": 0.20, "distance": 0.30, "trend": 0.20, "volatility": 0.20, "liquidity": 0.10}
     safety_score = (
@@ -124,8 +130,8 @@ def evaluate(
     if liq_score < 50:
         reasons.append("недостаточно ликвидности в стакане")
 
-    price_in_range = settings.MIN_ENTRY_PRICE <= book.best_ask <= settings.MAX_ENTRY_PRICE
-    should_enter = price_in_range and safety_score >= settings.SAFETY_SCORE_THRESHOLD
+    price_in_range = min_entry <= book.best_ask <= max_entry
+    should_enter = price_in_range and safety_score >= score_threshold
 
     return Decision(
         should_enter=should_enter,
