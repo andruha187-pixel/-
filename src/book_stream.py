@@ -145,21 +145,16 @@ async def _sender(ws) -> None:
         await ws.send(json.dumps(payload))
 
 
-async def _pinger(ws) -> None:
-    while True:
-        await asyncio.sleep(10)
-        try:
-            await ws.send("PING")
-        except Exception:
-            return
-
-
 async def run_forever() -> None:
     """Фоновая задача: держит WS-соединение живым, переподключается при обрыве.
-    Запускать один раз при старте бота (main.py)."""
+    Запускать один раз при старте бота (main.py). Keepalive — protocol-level
+    WS ping/pong (ping_interval/ping_timeout), а не наши собственные текстовые
+    сообщения: сервер Polymarket разбирает КАЖДОЕ входящее сообщение в этом
+    канале как JSON-запрос на подписку, и любая нестандартная строка (в т.ч.
+    наш прежний текстовый "PING") валится с 1008 policy violation."""
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=None) as ws:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                 log.info("Book stream connected | subscribed=%d", len(_subscribed))
                 _ws_ready.set()
                 if _subscribed:
@@ -167,7 +162,6 @@ async def run_forever() -> None:
                         "type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True,
                     }))
                 sender_task = asyncio.create_task(_sender(ws))
-                pinger_task = asyncio.create_task(_pinger(ws))
                 try:
                     async for raw in ws:
                         if raw == "PONG":
@@ -187,7 +181,6 @@ async def run_forever() -> None:
                                 _books[asset]["tick_size"] = float(new_tick)
                 finally:
                     sender_task.cancel()
-                    pinger_task.cancel()
         except Exception as exc:  # noqa: BLE001
             log.warning("Book stream disconnected (%s), reconnecting in %ss", exc, RECONNECT_BACKOFF_SEC)
             _ws_ready.clear()

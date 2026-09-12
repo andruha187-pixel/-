@@ -65,10 +65,7 @@ async def _fetch_active_from_series() -> dict | None:
 
     now = time.time()
     for ev in events:
-        try:
-            start = int(ev["marketStartTime"]) if "marketStartTime" in ev else None
-        except (KeyError, TypeError, ValueError):
-            start = None
+        start = _parse_timestamp(ev.get("marketStartTime"))
         if start is None:
             continue
         end = start + settings.MARKET_INTERVAL_MIN * 60
@@ -77,7 +74,25 @@ async def _fetch_active_from_series() -> dict | None:
     return events[0] if events else None
 
 
-def _extract_market_fields(event: dict) -> tuple[str, list[str], int, int]:
+def _parse_timestamp(value) -> int | None:
+    """API отдаёт время то unix-секундами, то ISO-строкой ('...Z') — а иногда
+    в найденном поле вообще лежит дата создания записи, а не начала окна.
+    Разбираем оба формата, но с этим полем всё равно не доверяем слепо —
+    см. комментарий в get_active_market."""
+    if value is None:
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+        return int(datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp())
+    except (ValueError, TypeError):
+        return None
+
+
+def _extract_market_fields(event: dict) -> tuple[str, list[str], int | None, int | None]:
     """Достаём condition_id, [up_token, down_token], start/end из объекта Event -> Market."""
     market = event["markets"][0] if "markets" in event and event["markets"] else event
     condition_id = market.get("conditionId") or market.get("condition_id")
@@ -96,27 +111,34 @@ def _extract_market_fields(event: dict) -> tuple[str, list[str], int, int]:
     down_idx = next((i for i, o in enumerate(outcomes) if o.lower() == "down"), 1)
     up_token, down_token = token_ids[up_idx], token_ids[down_idx]
 
-    start_time = int(event.get("marketStartTime") or market.get("startDate") or 0)
-    end_str = event.get("endDate") or market.get("endDate")
-    end_time = start_time + settings.MARKET_INTERVAL_MIN * 60
+    start_time = _parse_timestamp(event.get("marketStartTime"))
+    end_time = _parse_timestamp(event.get("endDate") or market.get("endDate"))
 
     return condition_id, [up_token, down_token], start_time, end_time
 
 
 async def get_active_market() -> ActiveMarket:
-    start_ts, _ = _window_bounds()
+    start_ts, end_ts = _window_bounds()
     slug = _expected_slug(start_ts)
 
     event = await _fetch_event_by_slug(slug)
+    matched_by_slug = event is not None
     if event is None:
         event = await _fetch_active_from_series()
     if event is None:
         raise RuntimeError("Не удалось найти активный рынок ни по слагу, ни через серию Gamma API")
 
-    condition_id, (up_token, down_token), start_time, end_time = _extract_market_fields(event)
-    if not start_time:
-        start_time = start_ts
-        end_time = start_ts + settings.MARKET_INTERVAL_MIN * 60
+    condition_id, (up_token, down_token), api_start, api_end = _extract_market_fields(event)
+
+    if matched_by_slug:
+        # Слаг уже кодирует точное начало окна (мы сами его вычислили и по
+        # нему нашли ровно этот рынок) — это надёжнее, чем поля из API,
+        # которые на практике то в ISO, то в unix, а иногда там вообще дата
+        # создания записи, а не начала конкретного 15-минутного окна.
+        start_time, end_time = start_ts, end_ts
+    else:
+        start_time = api_start or start_ts
+        end_time = api_end or (start_time + settings.MARKET_INTERVAL_MIN * 60)
 
     strike_price = await binance_feed.get_price_at(start_time)
 
