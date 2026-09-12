@@ -47,7 +47,10 @@ class Settings:
     POLY_CHAIN_ID: int = _get_int("POLY_CHAIN_ID", 137)
     POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
     POLY_FUNDER_ADDRESS: str = os.getenv("POLY_FUNDER_ADDRESS", "")
-    # 0 = EOA/MetaMask, 1 = email/Magic wallet, 2 = browser wallet proxy
+    # ПРИМЕЧАНИЕ: с переходом на polymarket-client (актуальный официальный SDK)
+    # этот параметр больше не используется — SDK сам определяет тип кошелька
+    # (EOA/proxy/deposit wallet) через AsyncSecureClient.create(). Оставлен
+    # в конфиге на случай отката на другой клиент, полем можно не заниматься.
     POLY_SIGNATURE_TYPE: int = _get_int("POLY_SIGNATURE_TYPE", 0)
 
     # --- Стратегия входа ---
@@ -88,6 +91,10 @@ class Settings:
 
     # --- Storage ---
     DB_PATH: str = os.getenv("DB_PATH", "data/bot.db")
+
+    # --- Отчёты для анализа стратегии ---
+    REPORT_INTERVAL_HOURS: float = _get_float("REPORT_INTERVAL_HOURS", 4.0)
+    REPORTS_DIR: str = os.getenv("REPORTS_DIR", "data/reports")
 
 
 settings = Settings()
