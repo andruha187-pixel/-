@@ -50,10 +50,17 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
             f"вход заблокирован до конца дня. Поменять лимит можно в 🛑 Стоп-лосс в меню."
         )
         return
+    if storage.count_open_trades() >= settings.MAX_OPEN_POSITIONS:
+        # Общий потолок по ВСЕМ активам/таймфреймам разом — при нескольких
+        # параллельных потоках несколько сигналов могут совпасть по времени.
+        return
 
     base_size = runtime_state.get("trade_size_usdc")
     score_threshold = runtime_state.get("safety_score_threshold")
-    trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
+    if runtime_state.get("size_scaling_enabled"):
+        trade_size = _scale_trade_size(base_size, decision.safety_score, score_threshold)
+    else:
+        trade_size = base_size
     dry_run = runtime_state.get("dry_run")
 
     token_id = market.up_token_id if decision.direction == "UP" else market.down_token_id
@@ -99,15 +106,16 @@ async def maybe_enter(market: ActiveMarket, decision: Decision) -> None:
     )
 
 
-async def label_resolved_markets(current_market_slug: str) -> None:
+async def label_resolved_markets(exclude_slugs: set[str] | None = None) -> None:
     """
     Подписывает исходом ВСЕ ещё не подписанные сигналы прошлых рынков —
     основа для отчёта/анализа: без метки "что реально произошло" по
     каждому тику нельзя понять, какой сигнал был бы правильным, даже если
-    бот в тот рынок не входил. current_market_slug исключаем — его исход
-    ещё не может быть известен.
+    бот в тот рынок не входил. exclude_slugs — слаги сейчас активных
+    рынков по ВСЕМ активам/таймфреймам (их исход ещё не может быть
+    известен, спрашивать API бессмысленно).
     """
-    for slug in storage.get_markets_needing_outcome(exclude_slug=current_market_slug, limit=5):
+    for slug in storage.get_markets_needing_outcome(exclude_slugs=exclude_slugs, limit=10):
         outcome = await get_resolution(slug)
         if outcome:
             storage.label_signals_outcome(slug, outcome)
