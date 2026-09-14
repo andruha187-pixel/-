@@ -145,21 +145,33 @@ async def _sender(ws) -> None:
         await ws.send(json.dumps(payload))
 
 
-async def _pinger(ws) -> None:
-    while True:
-        await asyncio.sleep(10)
-        try:
-            await ws.send("PING")
-        except Exception:
-            return
+def _handle_message(msg: dict) -> None:
+    """Обработка ОДНОГО объекта сообщения. Вызывается и напрямую (обычный
+    dict), и поэлементно, если сервер прислал JSON-массив (см. ниже)."""
+    event_type = msg.get("event_type")
+    if event_type == "book":
+        asset = str(msg.get("asset_id") or "")
+        if asset:
+            _apply_snapshot(asset, msg)
+    elif event_type == "price_change":
+        _apply_delta(msg)
+    elif event_type == "tick_size_change":
+        asset = str(msg.get("asset_id") or "")
+        new_tick = msg.get("new_tick_size")
+        if asset in _books and new_tick:
+            _books[asset]["tick_size"] = float(new_tick)
 
 
 async def run_forever() -> None:
     """Фоновая задача: держит WS-соединение живым, переподключается при обрыве.
-    Запускать один раз при старте бота (main.py)."""
+    Запускать один раз при старте бота (main.py). Keepalive — protocol-level
+    WS ping/pong (ping_interval/ping_timeout), а не наши собственные текстовые
+    сообщения: сервер Polymarket разбирает КАЖДОЕ входящее сообщение в этом
+    канале как JSON-запрос на подписку, и любая нестандартная строка (в т.ч.
+    наш прежний текстовый "PING") валится с 1008 policy violation."""
     while True:
         try:
-            async with websockets.connect(WS_URL, ping_interval=None) as ws:
+            async with websockets.connect(WS_URL, ping_interval=20, ping_timeout=20) as ws:
                 log.info("Book stream connected | subscribed=%d", len(_subscribed))
                 _ws_ready.set()
                 if _subscribed:
@@ -167,27 +179,21 @@ async def run_forever() -> None:
                         "type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True,
                     }))
                 sender_task = asyncio.create_task(_sender(ws))
-                pinger_task = asyncio.create_task(_pinger(ws))
                 try:
                     async for raw in ws:
                         if raw == "PONG":
                             continue
-                        msg = json.loads(raw)
-                        event_type = msg.get("event_type")
-                        if event_type == "book":
-                            asset = str(msg.get("asset_id") or "")
-                            if asset:
-                                _apply_snapshot(asset, msg)
-                        elif event_type == "price_change":
-                            _apply_delta(msg)
-                        elif event_type == "tick_size_change":
-                            asset = str(msg.get("asset_id") or "")
-                            new_tick = msg.get("new_tick_size")
-                            if asset in _books and new_tick:
-                                _books[asset]["tick_size"] = float(new_tick)
+                        parsed = json.loads(raw)
+                        # Сервер иногда шлёт не один объект, а МАССИВ объектов
+                        # разом (например, снапшот сразу по нескольким
+                        # подписанным токенам при первом коннекте) — раньше
+                        # это валило .get() на list и роняло всё соединение.
+                        messages = parsed if isinstance(parsed, list) else [parsed]
+                        for msg in messages:
+                            if isinstance(msg, dict):
+                                _handle_message(msg)
                 finally:
                     sender_task.cancel()
-                    pinger_task.cancel()
         except Exception as exc:  # noqa: BLE001
             log.warning("Book stream disconnected (%s), reconnecting in %ss", exc, RECONNECT_BACKOFF_SEC)
             _ws_ready.clear()
