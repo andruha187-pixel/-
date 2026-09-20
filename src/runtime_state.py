@@ -1,17 +1,29 @@
 """
 Настройки, которые можно менять на лету из Telegram (без передеплоя):
-размер позиции, дневной стоп-лосс, порог safety score, диапазон входа,
-пауза, режим DRY_RUN/LIVE.
+активы, параметры хедж-бота (вход/хедж/ставка), дневной стоп-лосс, режим
+DRY_RUN/LIVE.
 
-Живут в памяти для быстрого доступа из strategy/executor на каждом тике,
-но каждое изменение сразу пишется в SQLite (`bot_settings`) — переживает
+Живут в памяти для быстрого доступа из hedge_bot на каждом тике, но
+каждое изменение сразу пишется в SQLite (`bot_settings`) — переживает
 рестарт процесса (важно на Render: контейнер может перезапуститься сам
 по себе, не только по твоей команде).
 """
 from __future__ import annotations
+import os
 
 from config import settings
 from src import storage
+
+
+def _get_float_env(name: str, default: float) -> float:
+    val = os.getenv(name)
+    return float(val) if val else default
+
+
+def _get_bool_env(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    return val.lower() == "true" if val else default
+
 
 _DEFAULTS = {
     "paused": False,
@@ -33,6 +45,31 @@ _DEFAULTS = {
     # по одному через Telegram, не трогая остальные и не передеплоя.
     # Хранится как строка через запятую (см. get/set_enabled_assets ниже).
     "enabled_assets": ",".join(settings.ASSETS),
+    # Режим размера ставки: "fixed" (константа в USDC, trade_size_usdc) или
+    # "percent" (доля от ТЕКУЩЕГО банка — starting_bankroll_usdc + вся
+    # реализованная прибыль/убыток с начала). Percent-режим сам сжимается
+    # при просадке и растёт при выигрышах — в отличие от fixed, который на
+    # похудевшем банке становится относительно только агрессивнее.
+    "sizing_mode": "fixed",
+    "bankroll_pct": 5.0,
+    "starting_bankroll_usdc": 60.0,
+    # Отслеживание чужого кошелька: уведомления всегда можно включить
+    # отдельно от реального копирования сделок (copytrade) — по умолчанию
+    # только уведомляем, ничего не покупаем автоматически.
+    "wallet_notify_enabled": True,
+    "wallet_copytrade_enabled": False,
+    "copytrade_size_usdc": 5.0,
+    # Хедж-бот: вход по ENTRY_PRICE, докупка противоположной стороны при
+    # достижении HEDGE_PRICE — см. src/hedge_bot.py. Пороги пришли из
+    # анализа реальных momentum-отчётов (2026-09-20): хедж на 0.90 дал
+    # положительный PnL на бэктесте, хедж на 0.70-0.85 — отрицательный,
+    # несмотря на то, что сам хедж всегда безубыточен по построению —
+    # разница в том, сколько сессий вообще НЕ доходит до точки хеджа и
+    # остаётся неприкрытой позицией (см. обсуждение в чате).
+    "hedge_bot_enabled": _get_bool_env("HEDGE_BOT_ENABLED", True),
+    "hedge_entry_price": _get_float_env("HEDGE_ENTRY_PRICE", 0.70),
+    "hedge_trigger_price": _get_float_env("HEDGE_TRIGGER_PRICE", 0.90),
+    "hedge_stake_usdc": _get_float_env("HEDGE_STAKE_USDC", 5.0),
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -48,6 +85,16 @@ _CASTERS = {
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_pct": float,
     "enabled_assets": str,
+    "sizing_mode": str,
+    "bankroll_pct": float,
+    "starting_bankroll_usdc": float,
+    "wallet_notify_enabled": lambda v: str(v).lower() == "true",
+    "wallet_copytrade_enabled": lambda v: str(v).lower() == "true",
+    "copytrade_size_usdc": float,
+    "hedge_bot_enabled": lambda v: str(v).lower() == "true",
+    "hedge_entry_price": float,
+    "hedge_trigger_price": float,
+    "hedge_stake_usdc": float,
 }
 
 _state: dict = dict(_DEFAULTS)
@@ -102,3 +149,27 @@ def toggle_asset(asset: str) -> bool:
         enabled.add(asset)
     set_enabled_assets(enabled)
     return asset in enabled
+
+
+# --- Размер ставки: fixed или % от текущего банка ---
+
+def current_bankroll() -> float:
+    """starting_bankroll_usdc + реализованная прибыль/убыток с начала.
+    Считаем ТОЛЬКО реальные (не dry-run) сделки — иначе виртуальный PnL из
+    периодов тестового прогона исказил бы размер реальных ставок (баг,
+    найденный на реальных отчётах: банк считался завышенным на сумму
+    прошлого dry-run PnL). Если сейчас DRY_RUN, наоборот, честнее было бы
+    видеть, как рос бы виртуальный банк — но раз sizing реальных денег и
+    dry-run использует один и тот же расчёт, отдаём предпочтение
+    безопасности реальных ставок."""
+    pnl = storage.get_pnl_summary(0, live_only=True)["pnl_usdc"]
+    return get("starting_bankroll_usdc") + pnl
+
+
+def compute_trade_size() -> float:
+    """Базовый размер ставки ДО масштабирования по score (см.
+    executor._scale_trade_size) — либо константа, либо доля от банка."""
+    if get("sizing_mode") == "percent":
+        bankroll = max(0.0, current_bankroll())
+        return round(bankroll * get("bankroll_pct") / 100, 2)
+    return get("trade_size_usdc")

@@ -34,32 +34,35 @@ def set_state_ref(state: dict) -> None:
 
 # ---------------------------------------------------------------- меню ----
 
+def _size_summary() -> str:
+    if runtime_state.get("sizing_mode") == "percent":
+        size_now = runtime_state.compute_trade_size()
+        return f"{runtime_state.get('bankroll_pct'):.0f}% банка (сейчас {size_now:.2f} USDC)"
+    return f"{runtime_state.get('trade_size_usdc'):.2f} USDC (фикс.)"
+
+
 def _main_menu_text() -> str:
     s = _state_ref  # dict: "asset:timeframe" -> instance state
     paused = runtime_state.get("paused")
     dry_run = runtime_state.get("dry_run")
-    pos_sl_on = runtime_state.get("position_stop_loss_enabled")
+    hedge_on = runtime_state.get("hedge_bot_enabled")
     enabled_assets = runtime_state.get_enabled_assets()
     lines = [
-        "🤖 *Polymarket Multi-Asset Bot*",
+        "🔒 *Персональный Хедж-бот*",
         "",
         f"Статус: {'⏸ на паузе' if paused else '▶️ активен'} | Режим: {'🧪 DRY RUN' if dry_run else '🔴 LIVE'}",
         f"Активы: {', '.join(a.upper() for a in sorted(enabled_assets)) or '(нет включённых)'}",
-        f"Размер позиции: {runtime_state.get('trade_size_usdc'):.0f} USDC",
+        f"Хедж-бот: {'🟢 включён' if hedge_on else '🔴 выключен'} "
+        f"(вход {runtime_state.get('hedge_entry_price'):.2f} → хедж {runtime_state.get('hedge_trigger_price'):.2f}, "
+        f"ставка {runtime_state.get('hedge_stake_usdc'):.2f} USDC)",
         f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
-        f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
-        f"Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}",
     ]
     if s:
         lines.append("")
         lines.append(f"Потоков активно: {len(s)}")
-        # Сортируем по активу, потом по таймфрейму — стабильный порядок в UI
         for key in sorted(s.keys()):
             inst = s[key]
-            lines.append(
-                f"  {inst['asset'].upper()} {inst['timeframe']}: {inst.get('direction','—')} "
-                f"score {inst.get('safety_score','—')}"
-            )
+            lines.append(f"  {inst['asset'].upper()} {inst['timeframe']}: {inst.get('market_slug','—')}")
     return "\n".join(lines)
 
 
@@ -68,17 +71,10 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
     rows = [
         [InlineKeyboardButton("▶️ Старт" if paused else "⏸ Стоп", callback_data="pause_toggle")],
         [InlineKeyboardButton("🪙 Активы", callback_data="menu:assets")],
+        [InlineKeyboardButton("🔒 Хедж-бот", callback_data="menu:hedge")],
         [
-            InlineKeyboardButton("💰 Размер позиции", callback_data="menu:size"),
             InlineKeyboardButton("🛑 Стоп-лосс/день", callback_data="menu:sl"),
-        ],
-        [
-            InlineKeyboardButton("📉 Стоп-лосс позиции", callback_data="menu:possl"),
-            InlineKeyboardButton("📈 Диапазон входа", callback_data="menu:range"),
-        ],
-        [
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-            InlineKeyboardButton("⚙️ Настройки", callback_data="menu:settings"),
         ],
         [InlineKeyboardButton(
             "🔴 Включить LIVE" if runtime_state.get("dry_run") else "🧪 Переключить в DRY RUN",
@@ -104,19 +100,116 @@ def _assets_menu_markup() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def _size_menu_markup() -> InlineKeyboardMarkup:
-    current = runtime_state.get("trade_size_usdc")
+BANKROLL_PCT_PRESETS = [3, 5, 7, 10]
+COPYTRADE_SIZE_PRESETS = [2, 5, 10, 20]
+
+
+HEDGE_STAKE_PRESETS = [2, 5, 10, 20]
+HEDGE_TRIGGER_PRESETS = [0.85, 0.88, 0.90, 0.93]
+
+
+def _hedge_menu_markup() -> InlineKeyboardMarkup:
+    enabled = runtime_state.get("hedge_bot_enabled")
+    entry = runtime_state.get("hedge_entry_price")
+    trigger = runtime_state.get("hedge_trigger_price")
+    stake = runtime_state.get("hedge_stake_usdc")
+
+    rows = [
+        [InlineKeyboardButton(
+            "🔴 Выключить хедж-бота" if enabled else "🟢 Включить хедж-бота",
+            callback_data="hedge_toggle",
+        )],
+        [InlineKeyboardButton("— Порог хеджа (сейчас {:.2f}) —".format(trigger), callback_data="noop")],
+    ]
     row = []
-    rows = []
-    for val in SIZE_PRESETS:
-        mark = "✅ " if abs(val - current) < 0.01 else ""
-        row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"size_set:{val}"))
-        if len(row) == 3:
+    for val in HEDGE_TRIGGER_PRESETS:
+        mark = "✅ " if abs(val - trigger) < 0.001 else ""
+        row.append(InlineKeyboardButton(f"{mark}{val:.2f}", callback_data=f"hedgetrigger_set:{val}"))
+        if len(row) == 2:
             rows.append(row)
             row = []
     if row:
         rows.append(row)
-    rows.append([InlineKeyboardButton("✏️ Свой размер", callback_data="size_custom")])
+    rows.append([InlineKeyboardButton("— Размер ставки —", callback_data="noop")])
+    row = []
+    for val in HEDGE_STAKE_PRESETS:
+        mark = "✅ " if abs(val - stake) < 0.01 else ""
+        row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"hedgestake_set:{val}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Свой размер ставки", callback_data="hedgestake_custom")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _wallet_menu_markup() -> InlineKeyboardMarkup:
+    notify_on = runtime_state.get("wallet_notify_enabled")
+    copy_on = runtime_state.get("wallet_copytrade_enabled")
+    size = runtime_state.get("copytrade_size_usdc")
+
+    rows = [
+        [InlineKeyboardButton(
+            "🔔 Уведомления: выкл" if not notify_on else "🔕 Уведомления: вкл",
+            callback_data="wallet_notify_toggle",
+        )],
+        [InlineKeyboardButton(
+            "🟢 Включить копитрейдинг" if not copy_on else "🔴 Выключить копитрейдинг",
+            callback_data="wallet_copytrade_toggle",
+        )],
+        [InlineKeyboardButton("— Размер копи-сделки —", callback_data="noop")],
+    ]
+    row = []
+    for val in COPYTRADE_SIZE_PRESETS:
+        mark = "✅ " if abs(val - size) < 0.01 else ""
+        row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"copysize_set:{val}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Свой размер копи-сделки", callback_data="copysize_custom")])
+    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
+    return InlineKeyboardMarkup(rows)
+
+
+def _size_menu_markup() -> InlineKeyboardMarkup:
+    mode = runtime_state.get("sizing_mode")
+    rows = [[InlineKeyboardButton(
+        "🔀 Режим: % от банка" if mode == "fixed" else "🔀 Режим: фикс. сумма",
+        callback_data="sizing_mode_toggle",
+    )]]
+
+    if mode == "percent":
+        row = []
+        for val in BANKROLL_PCT_PRESETS:
+            mark = "✅ " if abs(val - runtime_state.get("bankroll_pct")) < 0.01 else ""
+            row.append(InlineKeyboardButton(f"{mark}{val}%", callback_data=f"bankrollpct_set:{val}"))
+            if len(row) == 2:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([
+            InlineKeyboardButton("−1%", callback_data="bankrollpct_delta:-1"),
+            InlineKeyboardButton("+1%", callback_data="bankrollpct_delta:+1"),
+        ])
+        rows.append([InlineKeyboardButton("✏️ Свой стартовый банк", callback_data="startbank_custom")])
+    else:
+        current = runtime_state.get("trade_size_usdc")
+        row = []
+        for val in SIZE_PRESETS:
+            mark = "✅ " if abs(val - current) < 0.01 else ""
+            row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"size_set:{val}"))
+            if len(row) == 3:
+                rows.append(row)
+                row = []
+        if row:
+            rows.append(row)
+        rows.append([InlineKeyboardButton("✏️ Свой размер", callback_data="size_custom")])
+
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -286,31 +379,35 @@ async def _cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _stats_text() -> str:
     today_start = int(time.time() // 86400) * 86400
 
-    today = storage.get_pnl_summary(today_start)
-    total = storage.get_pnl_summary(0)
+    today = storage.get_hedge_pnl_summary(today_start)
+    total = storage.get_hedge_pnl_summary(0)
 
     lines = [
-        "📊 *Статистика*",
+        "📊 *Статистика хедж-бота*",
         "",
-        f"Сегодня: {today['trades']} сделок, PnL {today['pnl_usdc']:+.2f} USDC, побед {today['wins']}",
-        f"Всего: {total['trades']} сделок, PnL {total['pnl_usdc']:+.2f} USDC, побед {total['wins']}",
+        f"Сегодня: {today['positions']} позиций ({today['hedged']} захеджировано), "
+        f"PnL {today['pnl_usdc']:+.2f} USDC, побед {today['wins']}",
+        f"Всего: {total['positions']} позиций ({total['hedged']} захеджировано), "
+        f"PnL {total['pnl_usdc']:+.2f} USDC, побед {total['wins']}",
+        "",
+        "_PnL без учёта комиссии тейкера (7% на каждую ногу)._",
     ]
 
-    by_asset_total = storage.get_pnl_by_asset(0)
+    by_asset_total = storage.get_hedge_pnl_by_asset(0)
     if by_asset_total:
         lines.append("")
         lines.append("*По токенам (всего):*")
         for asset in sorted(by_asset_total.keys()):
             b = by_asset_total[asset]
-            lines.append(f"  {asset.upper()}: {b['trades']} сделок, PnL {b['pnl_usdc']:+.2f}, побед {b['wins']}")
+            lines.append(f"  {asset.upper()}: {b['positions']} поз., PnL {b['pnl_usdc']:+.2f}, побед {b['wins']}")
 
-    by_tf_total = storage.get_pnl_by_timeframe(0)
+    by_tf_total = storage.get_hedge_pnl_by_timeframe(0)
     if by_tf_total:
         lines.append("")
         lines.append("*По таймфреймам (всего):*")
         for label in sorted(by_tf_total.keys()):
             b = by_tf_total[label]
-            lines.append(f"  {label}: {b['trades']} сделок, PnL {b['pnl_usdc']:+.2f}, побед {b['wins']}")
+            lines.append(f"  {label}: {b['positions']} поз., PnL {b['pnl_usdc']:+.2f}, побед {b['wins']}")
 
     return "\n".join(lines)
 
@@ -361,6 +458,24 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Максимум диапазона входа: {value:.2f}", reply_markup=_range_menu_markup(),
         )
+    elif _pending_input == "starting_bankroll":
+        runtime_state.set("starting_bankroll_usdc", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Стартовый банк: {value:.2f} USDC", reply_markup=_size_menu_markup(),
+        )
+    elif _pending_input == "copytrade_size":
+        runtime_state.set("copytrade_size_usdc", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Размер копи-сделки: {value:.2f} USDC", reply_markup=_wallet_menu_markup(),
+        )
+    elif _pending_input == "hedge_stake":
+        runtime_state.set("hedge_stake_usdc", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Размер ставки хеджа: {value:.2f} USDC", reply_markup=_hedge_menu_markup(),
+        )
 
 
 # ------------------------------------------------------------- кнопки -----
@@ -375,7 +490,129 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.edit_message_text(_main_menu_text(), reply_markup=_main_menu_markup(), parse_mode="Markdown")
 
     elif data == "menu:size":
-        await query.edit_message_text("💰 Выбери размер позиции (USDC на сделку):", reply_markup=_size_menu_markup())
+        mode = runtime_state.get("sizing_mode")
+        if mode == "percent":
+            bank = runtime_state.current_bankroll()
+            size_now = runtime_state.compute_trade_size()
+            text = (
+                f"💰 Режим: % от банка\n"
+                f"Стартовый банк: {runtime_state.get('starting_bankroll_usdc'):.2f} USDC\n"
+                f"Текущий банк (старт + реализованный PnL): {bank:.2f} USDC\n"
+                f"Доля на сделку: {runtime_state.get('bankroll_pct'):.0f}% → сейчас это {size_now:.2f} USDC\n\n"
+                "Размер сам растёт на прибыли и сжимается на просадке."
+            )
+        else:
+            text = f"💰 Режим: фиксированная сумма — {runtime_state.get('trade_size_usdc'):.2f} USDC на сделку."
+        await query.edit_message_text(text, reply_markup=_size_menu_markup())
+
+    elif data == "sizing_mode_toggle":
+        new_mode = "percent" if runtime_state.get("sizing_mode") == "fixed" else "fixed"
+        runtime_state.set("sizing_mode", new_mode)
+        await query.edit_message_text(
+            f"✅ Режим размера ставки: {'% от банка' if new_mode=='percent' else 'фиксированная сумма'}",
+            reply_markup=_size_menu_markup(),
+        )
+
+    elif data.startswith("bankrollpct_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("bankroll_pct", val)
+        await query.edit_message_text(f"✅ Доля от банка: {val:.0f}%", reply_markup=_size_menu_markup())
+
+    elif data.startswith("bankrollpct_delta:"):
+        delta = float(data.split(":", 1)[1])
+        new_val = min(50.0, max(1.0, runtime_state.get("bankroll_pct") + delta))
+        runtime_state.set("bankroll_pct", new_val)
+        await query.edit_message_text(f"✅ Доля от банка: {new_val:.0f}%", reply_markup=_size_menu_markup())
+
+    elif data == "startbank_custom":
+        _pending_input = "starting_bankroll"
+        await query.edit_message_text(
+            "✏️ Напиши стартовый банк в USDC следующим сообщением, например: 60",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:size")]]),
+        )
+
+    elif data == "menu:hedge":
+        enabled = runtime_state.get("hedge_bot_enabled")
+        await query.edit_message_text(
+            f"🔒 Хедж-бот: {'🟢 включён' if enabled else '🔴 выключен'}\n"
+            f"Вход при цене {runtime_state.get('hedge_entry_price'):.2f}, хедж противоположной стороны при "
+            f"{runtime_state.get('hedge_trigger_price'):.2f}\n"
+            f"Размер ставки: {runtime_state.get('hedge_stake_usdc'):.2f} USDC\n\n"
+            "Если цена не доходит до порога хеджа — остаётся односторонняя позиция "
+            "(по нашим данным такие случаи почти всегда проигрывают). "
+            "PnL в отчётах — без учёта комиссии тейкера.",
+            reply_markup=_hedge_menu_markup(),
+        )
+
+    elif data == "hedge_toggle":
+        new_val = not runtime_state.get("hedge_bot_enabled")
+        runtime_state.set("hedge_bot_enabled", new_val)
+        await query.edit_message_text(
+            f"{'🟢 Хедж-бот включён' if new_val else '🔴 Хедж-бот выключен'}",
+            reply_markup=_hedge_menu_markup(),
+        )
+
+    elif data.startswith("hedgetrigger_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("hedge_trigger_price", val)
+        await query.edit_message_text(f"✅ Порог хеджа: {val:.2f}", reply_markup=_hedge_menu_markup())
+
+    elif data.startswith("hedgestake_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("hedge_stake_usdc", val)
+        await query.edit_message_text(f"✅ Размер ставки хеджа: {val:.2f} USDC", reply_markup=_hedge_menu_markup())
+
+    elif data == "hedgestake_custom":
+        _pending_input = "hedge_stake"
+        await query.edit_message_text(
+            "✏️ Напиши размер ставки хеджа в USDC следующим сообщением, например: 7.5",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:hedge")]]),
+        )
+
+    elif data == "menu:wallet":
+        addr = settings.WALLET_TRACK_ADDRESS
+        notify_on = runtime_state.get("wallet_notify_enabled")
+        copy_on = runtime_state.get("wallet_copytrade_enabled")
+        await query.edit_message_text(
+            f"🐋 Слежу за кошельком:\n`{addr}`\n\n"
+            f"Уведомления: {'🔔 включены' if notify_on else '🔕 выключены'}\n"
+            f"Копитрейдинг: {'🟢 включён' if copy_on else '🔴 выключен'} "
+            f"(размер: {runtime_state.get('copytrade_size_usdc'):.2f} USDC на сделку)\n\n"
+            "Копитрейдинг использует те же лимиты риска, что и основная стратегия "
+            "(дневной стоп-лосс, общий потолок открытых позиций).",
+            reply_markup=_wallet_menu_markup(),
+            parse_mode="Markdown",
+        )
+
+    elif data == "wallet_notify_toggle":
+        new_val = not runtime_state.get("wallet_notify_enabled")
+        runtime_state.set("wallet_notify_enabled", new_val)
+        await query.edit_message_text(
+            f"{'🔔 Уведомления включены' if new_val else '🔕 Уведомления выключены'}",
+            reply_markup=_wallet_menu_markup(),
+        )
+
+    elif data == "wallet_copytrade_toggle":
+        new_val = not runtime_state.get("wallet_copytrade_enabled")
+        runtime_state.set("wallet_copytrade_enabled", new_val)
+        msg = (
+            "🟢 Копитрейдинг включён — бот будет пытаться повторять его входы реальными "
+            "(или dry-run) сделками." if new_val else
+            "🔴 Копитрейдинг выключен — только уведомления, без автоматических сделок."
+        )
+        await query.edit_message_text(msg, reply_markup=_wallet_menu_markup())
+
+    elif data.startswith("copysize_set:"):
+        val = float(data.split(":", 1)[1])
+        runtime_state.set("copytrade_size_usdc", val)
+        await query.edit_message_text(f"✅ Размер копи-сделки: {val:.2f} USDC", reply_markup=_wallet_menu_markup())
+
+    elif data == "copysize_custom":
+        _pending_input = "copytrade_size"
+        await query.edit_message_text(
+            "✏️ Напиши размер копи-сделки в USDC следующим сообщением, например: 7.5",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:wallet")]]),
+        )
 
     elif data == "menu:assets":
         enabled = runtime_state.get_enabled_assets()
