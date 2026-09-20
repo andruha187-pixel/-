@@ -79,7 +79,9 @@ class Settings:
     # Ниже этой суммы даже пробовать не стоит — комиссии и слиппедж съедят
     # выгоду. Если в стакане меньше этого объёма по нужной цене — тик тихо
     # пропускается (не считается ошибкой, просто рынок сейчас неликвиден).
-    MIN_VIABLE_TRADE_USDC: float = _get_float("MIN_VIABLE_TRADE_USDC", 2.0)
+    # Реальный минимум ордера на Polymarket — $1 (не $2, как было раньше по
+    # ошибке скопировано из другого проекта).
+    MIN_VIABLE_TRADE_USDC: float = _get_float("MIN_VIABLE_TRADE_USDC", 1.0)
     DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 20.0)
 
     # --- Исследовательский модуль (momentum_tracker) ---
