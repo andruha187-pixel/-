@@ -36,6 +36,17 @@ from src.timeframes import TimeframeProfile
 
 log = logging.getLogger("hedge_bot")
 
+_last_warned_config: tuple | None = None  # чтобы не спамить одним и тем же предупреждением каждый тик
+
+
+def _hedge_leg_too_small(stake: float, entry_price: float, hedge_price: float) -> bool:
+    """Нога хеджа стоит stake*(1-hedge_price)/entry_price — если это ниже
+    минимального ордера Polymarket, хедж физически не сможет исполниться,
+    и вся позиция навсегда останется незахеджированной (ровно тот
+    убыточный сценарий, которого хедж должен избегать)."""
+    hedge_leg_cost = stake * (1 - hedge_price) / entry_price
+    return hedge_leg_cost < settings.MIN_VIABLE_TRADE_USDC
+
 
 def _daily_loss_exceeded() -> bool:
     """Полночь UTC — тот же принцип, что и у основного бота: разово в
@@ -131,11 +142,26 @@ async def _execute_hedge(market: ActiveMarket, side: str, position_id: int, entr
 
 
 async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> None:
+    global _last_warned_config
     if not runtime_state.get("hedge_bot_enabled"):
         return
 
     entry_price = runtime_state.get("hedge_entry_price")
     hedge_price = runtime_state.get("hedge_trigger_price")
+    stake = runtime_state.get("hedge_stake_usdc")
+
+    if _hedge_leg_too_small(stake, entry_price, hedge_price):
+        config_key = (stake, entry_price, hedge_price)
+        if _last_warned_config != config_key:
+            _last_warned_config = config_key
+            min_stake = settings.MIN_VIABLE_TRADE_USDC * entry_price / (1 - hedge_price)
+            await telegram_notify.notify(
+                f"⚠️ Хедж-бот: при ставке {stake:.2f}, входе {entry_price:.2f} и хедже {hedge_price:.2f} "
+                f"нога хеджа стоила бы меньше минимального ордера (${settings.MIN_VIABLE_TRADE_USDC:.2f}) — "
+                f"хедж физически не сможет исполниться. Нужна ставка от ${min_stake:.2f}. "
+                f"Новые входы приостановлены, пока не поправишь размер ставки."
+            )
+        return  # не входим вслепую без возможности потом захеджироваться
 
     sides = [
         ("UP", market.up_token_id, market.down_token_id),

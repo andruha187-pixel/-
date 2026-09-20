@@ -69,7 +69,11 @@ _DEFAULTS = {
     "hedge_bot_enabled": _get_bool_env("HEDGE_BOT_ENABLED", True),
     "hedge_entry_price": _get_float_env("HEDGE_ENTRY_PRICE", 0.70),
     "hedge_trigger_price": _get_float_env("HEDGE_TRIGGER_PRICE", 0.90),
-    "hedge_stake_usdc": _get_float_env("HEDGE_STAKE_USDC", 5.0),
+    # $10, а не $5 — при входе 0.70 и хедже на 0.90 нога хеджа стоит
+    # stake*(1-0.90)/0.70 = stake*0.143; при $5 это $0.71 (ниже минимума
+    # ордера Polymarket в $1!), хедж физически не мог бы исполниться.
+    # При $10 — уже $1.43, с запасом выше минимума.
+    "hedge_stake_usdc": _get_float_env("HEDGE_STAKE_USDC", 10.0),
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
