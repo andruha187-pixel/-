@@ -101,6 +101,27 @@ def subscribe(asset_ids: list[str]) -> None:
         pass
 
 
+def unsubscribe(asset_ids: list[str]) -> None:
+    """Убираем токены истёкших окон из подписки — без этого _subscribed
+    растёт неограниченно (каждое новое 5/15-минутное окно добавляет токены,
+    старые никогда не убирались), и если у Polymarket есть лимит на размер
+    подписки, новые токены в какой-то момент перестают получать данные
+    вообще (реальный случай, 2026-09-21: "нет цены в стакане" в 75-97%
+    проверок после ~часа работы). Шлём заново ПОЛНЫЙ желаемый список — судя
+    по формату протокола ("assets_ids" целиком, не инкремент), сервер
+    заменяет подписку целиком на переданный список, а не добавляет к ней."""
+    removed = [a for a in asset_ids if a in _subscribed]
+    if not removed:
+        return
+    for a in removed:
+        _subscribed.discard(a)
+        _books.pop(a, None)
+    try:
+        _send_queue.put_nowait({"type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True})
+    except asyncio.QueueFull:
+        pass
+
+
 def get_book(asset: str) -> dict | None:
     return _books.get(asset)
 

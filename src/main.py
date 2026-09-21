@@ -80,6 +80,13 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
     if cached is not None and time.time() < cached.end_time:
         market = cached
     else:
+        # Окно истекло (или это первый тик) — отписываемся от токенов
+        # СТАРОГО рынка для этого же потока прежде, чем подписаться на новый.
+        # Без этого _subscribed растёт неограниченно с каждым новым окном
+        # (реальный случай, 2026-09-21: "нет цены в стакане" почти всегда
+        # после ~часа работы — вероятно, упёрлись в лимит подписки).
+        if cached is not None and settings.USE_LIVE_BOOK_STREAM:
+            book_stream.unsubscribe([cached.up_token_id, cached.down_token_id])
         market = await market_discovery.get_active_market(asset, timeframe)
         _active_slugs[key] = market.slug
         _active_markets[key] = market
