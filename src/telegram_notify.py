@@ -106,6 +106,7 @@ COPYTRADE_SIZE_PRESETS = [2, 5, 10, 20]
 
 HEDGE_STAKE_PRESETS = [2, 5, 10, 20]
 HEDGE_TRIGGER_PRESETS = [0.85, 0.88, 0.90, 0.93]
+MAX_OPEN_POSITIONS_PRESETS = [6, 10, 12, 24]
 
 
 def _hedge_menu_markup() -> InlineKeyboardMarkup:
@@ -113,6 +114,7 @@ def _hedge_menu_markup() -> InlineKeyboardMarkup:
     entry = runtime_state.get("hedge_entry_price")
     trigger = runtime_state.get("hedge_trigger_price")
     stake = runtime_state.get("hedge_stake_usdc")
+    max_open = runtime_state.get("max_open_positions")
 
     rows = [
         [InlineKeyboardButton(
@@ -141,6 +143,16 @@ def _hedge_menu_markup() -> InlineKeyboardMarkup:
     if row:
         rows.append(row)
     rows.append([InlineKeyboardButton("✏️ Свой размер ставки", callback_data="hedgestake_custom")])
+    rows.append([InlineKeyboardButton(f"— Потолок позиций (сейчас {max_open}) —", callback_data="noop")])
+    row = []
+    for val in MAX_OPEN_POSITIONS_PRESETS:
+        mark = "✅ " if val == max_open else ""
+        row.append(InlineKeyboardButton(f"{mark}{val}", callback_data=f"maxopen_set:{val}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
     rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
     return InlineKeyboardMarkup(rows)
 
@@ -537,7 +549,8 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🔒 Хедж-бот: {'🟢 включён' if enabled else '🔴 выключен'}\n"
             f"Вход при цене {runtime_state.get('hedge_entry_price'):.2f}, хедж противоположной стороны при "
             f"{runtime_state.get('hedge_trigger_price'):.2f}\n"
-            f"Размер ставки: {runtime_state.get('hedge_stake_usdc'):.2f} USDC\n\n"
+            f"Размер ставки: {runtime_state.get('hedge_stake_usdc'):.2f} USDC\n"
+            f"Потолок открытых позиций: {runtime_state.get('max_open_positions')}\n\n"
             "Если цена не доходит до порога хеджа — остаётся односторонняя позиция "
             "(по нашим данным такие случаи почти всегда проигрывают). "
             "PnL в отчётах — без учёта комиссии тейкера.",
@@ -561,6 +574,11 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val = float(data.split(":", 1)[1])
         runtime_state.set("hedge_stake_usdc", val)
         await query.edit_message_text(f"✅ Размер ставки хеджа: {val:.2f} USDC", reply_markup=_hedge_menu_markup())
+
+    elif data.startswith("maxopen_set:"):
+        val = int(data.split(":", 1)[1])
+        runtime_state.set("max_open_positions", val)
+        await query.edit_message_text(f"✅ Потолок открытых позиций: {val}", reply_markup=_hedge_menu_markup())
 
     elif data == "hedgestake_custom":
         _pending_input = "hedge_stake"

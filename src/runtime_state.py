@@ -80,6 +80,11 @@ _DEFAULTS = {
     # ордера Polymarket в $1!), хедж физически не мог бы исполниться.
     # При $10 — уже $1.43, с запасом выше минимума.
     "hedge_stake_usdc": _get_float_env("HEDGE_STAKE_USDC", 10.0),
+    # Потолок ОДНОВРЕМЕННО открытых позиций по всем активам/таймфреймам —
+    # без него все 12 потоков могли бы войти разом. Дефолт берём из
+    # MAX_OPEN_POSITIONS в .env, но теперь можно менять кнопкой без
+    # передеплоя.
+    "max_open_positions": settings.MAX_OPEN_POSITIONS,
 }
 
 # Типы приведения при чтении из SQLite (там всё хранится как TEXT)
@@ -106,6 +111,7 @@ _CASTERS = {
     "hedge_entry_tolerance": float,
     "hedge_trigger_price": float,
     "hedge_stake_usdc": float,
+    "max_open_positions": int,
 }
 
 _state: dict = dict(_DEFAULTS)

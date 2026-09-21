@@ -216,7 +216,7 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
             if entry_price <= price <= entry_price + entry_tolerance:
                 if _daily_loss_exceeded():
                     continue  # дневной лимит убытка сработал — новых входов не открываем
-                if len(_open_positions) >= settings.MAX_OPEN_POSITIONS:
+                if len(_open_positions) >= runtime_state.get("max_open_positions"):
                     continue  # общий потолок одновременно открытых позиций
                 await _execute_entry(market, side, token_id, price, timeframe)
             # price > entry_price + entry_tolerance: цена уже проскочила
