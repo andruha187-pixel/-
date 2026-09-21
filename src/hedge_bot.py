@@ -182,7 +182,7 @@ async def _execute_hedge(market: ActiveMarket, side: str, position_id: int, entr
 
     tick = opp_book.tick_size or book_stream.tick_size(opposite_token_id)
     price_cap = polymarket_client.round_price_for_buy(
-        min(opp_price + settings.LIVE_ENTRY_MAX_SLIPPAGE, 0.99), tick,
+        min(opp_price + settings.HEDGE_LEG_MAX_SLIPPAGE, 0.99), tick,
     )
 
     # Хотим РОВНО entry_shares акций на другой стороне — тогда выплата
