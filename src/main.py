@@ -71,12 +71,20 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         telegram_notify.set_state_ref(_instance_state)
         return
 
-    market = await market_discovery.get_active_market(asset, timeframe)
-    _active_slugs[key] = market.slug
-    _active_markets[key] = market
-
-    if settings.USE_LIVE_BOOK_STREAM:
-        book_stream.subscribe([market.up_token_id, market.down_token_id])
+    # Рынок на протяжении всего своего окна не меняется (тот же condition_id,
+    # токены, время начала/конца) — кэшируем и спрашиваем Gamma API заново
+    # только когда окно истекло, а не на каждом тике медленного цикла (было:
+    # один и тот же рынок запрашивался каждые 3-5 секунд, до ~100 лишних
+    # запросов за один 5-минутный рынок).
+    cached = _active_markets.get(key)
+    if cached is not None and time.time() < cached.end_time:
+        market = cached
+    else:
+        market = await market_discovery.get_active_market(asset, timeframe)
+        _active_slugs[key] = market.slug
+        _active_markets[key] = market
+        if settings.USE_LIVE_BOOK_STREAM:
+            book_stream.subscribe([market.up_token_id, market.down_token_id])
 
     if not runtime_state.get("dry_run"):
         asyncio.create_task(polymarket_client.prewarm_transport())
