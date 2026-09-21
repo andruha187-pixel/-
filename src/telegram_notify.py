@@ -76,6 +76,7 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🛑 Стоп-лосс/день", callback_data="menu:sl"),
             InlineKeyboardButton("📊 Статистика", callback_data="stats"),
         ],
+        [InlineKeyboardButton("📄 Отчёт сейчас", callback_data="report_now")],
         [InlineKeyboardButton(
             "🔴 Включить LIVE" if runtime_state.get("dry_run") else "🧪 Переключить в DRY RUN",
             callback_data="mode_toggle",
@@ -740,6 +741,19 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "stats":
         await query.edit_message_text(_stats_text(), reply_markup=_main_menu_markup(), parse_mode="Markdown")
+
+    elif data == "report_now":
+        await query.edit_message_text("⏳ Формирую отчёт за период с последнего раза...")
+        from src import reporting  # локальный импорт — reporting сам импортирует этот модуль
+        try:
+            await reporting.build_and_send_report()
+            await query.message.reply_text(
+                "Готово (или нечего было отправлять, если данных не набралось).",
+                reply_markup=_main_menu_markup(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            await query.message.reply_text(f"❌ Ошибка при формировании отчёта: {exc}",
+                                            reply_markup=_main_menu_markup())
 
     elif data == "pause_toggle":
         runtime_state.set("paused", not runtime_state.get("paused"))
