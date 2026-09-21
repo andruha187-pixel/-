@@ -101,7 +101,7 @@ async def build_and_send_report() -> None:
         # таймфрейму (просто "ждём цену входа" не показываем — это норма,
         # не диагностически интересно; интересны лимиты/пропуски/сработки).
         interesting = {"missed_entry_window", "daily_loss_limit", "max_open_positions",
-                       "hedge_leg_too_small", "no_price", "entered", "hedged"}
+                       "hedge_leg_too_small", "no_price", "entered", "hedged", "already_touched_other_side"}
         lines = []
         for (asset, timeframe_label), reasons in sorted(skip_counts.items()):
             notable = {r: c for r, c in reasons.items() if r in interesting and c > 0}

@@ -916,7 +916,10 @@ async def notify(text: str) -> None:
         return
     if _app is None:
         return
-    await _app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=text)
+    # Telegram режет обычные сообщения на 4096 символов — разобьём, если
+    # длиннее (например, сводка причин пропуска по всем активам разом).
+    for i in range(0, len(text), 4000):
+        await _app.bot.send_message(chat_id=settings.TELEGRAM_CHAT_ID, text=text[i:i + 4000])
 
 
 async def send_document(path: str, caption: str | None) -> None:
@@ -926,5 +929,20 @@ async def send_document(path: str, caption: str | None) -> None:
         return
     if _app is None:
         return
+    # У подписи к документу лимит 1024 символа (не 4096, как у обычных
+    # сообщений) — если длиннее, обрезаем подпись и шлём остаток отдельным
+    # сообщением следом, а не роняем всю отправку целиком (реальный случай:
+    # сводка причин пропуска по 12 активам/таймфреймам разом легко вылезает
+    # за 1024 символа).
+    caption_limit = 1024
+    overflow = None
+    if caption and len(caption) > caption_limit:
+        cut = caption.rfind("\n", 0, caption_limit - 20)
+        if cut == -1:
+            cut = caption_limit - 20
+        caption, overflow = caption[:cut] + "\n… (продолжение ниже)", caption[cut:]
+
     with open(path, "rb") as f:
         await _app.bot.send_document(chat_id=settings.TELEGRAM_CHAT_ID, document=f, caption=caption)
+    if overflow:
+        await notify(overflow.strip())

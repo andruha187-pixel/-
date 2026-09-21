@@ -49,6 +49,17 @@ _last_warned_config: tuple | None = None  # чтобы не спамить од�
 _open_positions: dict[tuple[str, str], dict] = {}
 _positions_loaded = False
 
+# Рынки, в которые уже входили ХОТЯ БЫ ОДНОЙ стороной — включая уже
+# закрытые позиции, не только открытые. Без этого бот мог входить в ОБЕ
+# стороны одного и того же рынка в разное время (реальный случай,
+# 2026-09-21: DOWN по 0.71 проиграл -$10, позже туда же UP по 0.71-0.73
+# выиграл +$2 — но по сумме всё равно в минус, а самое главное, это
+# бессмысленно: исход у рынка один, вторая ставка гарантированно не может
+# и выиграть, и не быть при этом просто дублирующим риском). Растёт на
+# протяжении жизни процесса, но это лёгкие строки-слаги, для практических
+# масштабов работы бота (дни-недели) не проблема.
+_touched_markets: set[str] = set()
+
 # Счётчики причин пропуска в памяти — (asset, timeframe) -> {причина: счёт}.
 # НЕ пишутся в БД на каждый тик (это и вызвало проблему со "slow consumer"
 # в прошлый раз) — только читаются и сбрасываются раз в REPORT_INTERVAL_HOURS
@@ -63,6 +74,7 @@ SKIP_REASON_LABELS = {
     "max_open_positions": "потолок открытых позиций",
     "hedge_leg_too_small": "нога хеджа меньше минимума ордера",
     "waiting_for_hedge": "ждём цену хеджа",
+    "already_touched_other_side": "уже входили в этот рынок другой стороной",
     "entered": "вход выполнен",
     "hedged": "хедж выполнен",
 }
@@ -92,6 +104,7 @@ def _load_open_positions_from_db() -> None:
         _open_positions[(market_slug, side)] = {
             "position_id": pos_id, "entry_shares": entry_shares, "entry_cost": entry_cost, "status": status,
         }
+        _touched_markets.add(market_slug)
     _positions_loaded = True
 
 
@@ -151,6 +164,7 @@ async def _execute_entry(market: ActiveMarket, side: str, token_id: str, price_h
     _open_positions[(market.slug, side)] = {
         "position_id": position_id, "entry_shares": shares, "entry_cost": stake, "status": "open_unhedged",
     }
+    _touched_markets.add(market.slug)
     await telegram_notify.notify(
         f"{'🧪 [DRY RUN] ' if dry_run else ''}🔷 Хедж-бот: вход {side} по {market.slug}\n"
         f"Цена: {price_cap:.3f} | Размер: {stake:.2f} USDC | ждём {runtime_state.get('hedge_trigger_price'):.2f} для хеджа"
@@ -247,6 +261,12 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
         # этом (горячем, раз в секунду x 12 потоков) пути.
         existing = _open_positions.get((market.slug, side))
         if existing is None:
+            if market.slug in _touched_markets:
+                # Уже входили в этот рынок другой стороной (возможно, уже
+                # закрытой) — вторая сторона того же рынка гарантированно
+                # конфликтует с первой (исход один), не входим ещё раз.
+                _count(market.asset, timeframe.label, "already_touched_other_side")
+                continue
             entry_tolerance = runtime_state.get("hedge_entry_tolerance")
             if entry_price <= price <= entry_price + entry_tolerance:
                 if _daily_loss_exceeded():
