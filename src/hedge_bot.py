@@ -38,6 +38,29 @@ log = logging.getLogger("hedge_bot")
 
 _last_warned_config: tuple | None = None  # чтобы не спамить одним и тем же предупреждением каждый тик
 
+# Зеркало открытых позиций В ПАМЯТИ — (market_slug, side) -> dict с полями
+# position_id/entry_shares/entry_cost/status. Быстрый цикл (check_market,
+# раз в HEDGE_POLL_SECONDS x 12 потоков) читает ТОЛЬКО это, ни разу не
+# трогая SQLite — иначе синхронные (блокирующие) вызовы к диску на каждом
+# тике останавливают весь event loop, включая чтение WS-сокета, и сервер
+# отключает нас как "slow consumer" (реальный случай, 2026-09-21). SQLite
+# остаётся источником истины и пишется при каждом реальном изменении
+# состояния (вход/хедж/резолюция), просто не читается на каждый тик.
+_open_positions: dict[tuple[str, str], dict] = {}
+_positions_loaded = False
+
+
+def _load_open_positions_from_db() -> None:
+    """Разово при старте (и один раз после падения) — восстанавливаем
+    зеркало из БД на случай, если бот перезапустился с открытыми позициями."""
+    global _positions_loaded
+    for pos_id, market_slug, side, entry_shares, entry_cost, hedge_shares, hedge_cost, status, dry_run in \
+            storage.get_unsettled_hedge_positions():
+        _open_positions[(market_slug, side)] = {
+            "position_id": pos_id, "entry_shares": entry_shares, "entry_cost": entry_cost, "status": status,
+        }
+    _positions_loaded = True
+
 
 def _hedge_leg_too_small(stake: float, entry_price: float, hedge_price: float) -> bool:
     """Нога хеджа стоит stake*(1-hedge_price)/entry_price — если это ниже
@@ -89,9 +112,12 @@ async def _execute_entry(market: ActiveMarket, side: str, token_id: str, price_h
         order_id = polymarket_client.response_field(resp, "order_id") or str(resp)
 
     shares = stake / price_cap
-    storage.create_hedge_position(
+    position_id = storage.create_hedge_position(
         market.slug, market.asset, timeframe.label, side, price_cap, shares, stake, token_id, dry_run,
     )
+    _open_positions[(market.slug, side)] = {
+        "position_id": position_id, "entry_shares": shares, "entry_cost": stake, "status": "open_unhedged",
+    }
     await telegram_notify.notify(
         f"{'🧪 [DRY RUN] ' if dry_run else ''}🔷 Хедж-бот: вход {side} по {market.slug}\n"
         f"Цена: {price_cap:.3f} | Размер: {stake:.2f} USDC | ждём {runtime_state.get('hedge_trigger_price'):.2f} для хеджа"
@@ -138,6 +164,8 @@ async def _execute_hedge(market: ActiveMarket, side: str, position_id: int, entr
 
     hedge_shares = target_cost / price_cap
     storage.mark_hedged(position_id, price_cap, hedge_shares, target_cost, opposite_token_id)
+    if (market.slug, side) in _open_positions:
+        _open_positions[(market.slug, side)]["status"] = "hedged"
 
     await telegram_notify.notify(
         f"{'🧪 [DRY RUN] ' if dry_run else ''}🔒 Хедж-бот: зафиксирован хедж по {market.slug} ({side})\n"
@@ -147,9 +175,12 @@ async def _execute_hedge(market: ActiveMarket, side: str, position_id: int, entr
 
 
 async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> None:
-    global _last_warned_config
+    global _last_warned_config, _positions_loaded
     if not runtime_state.get("hedge_bot_enabled"):
         return
+
+    if not _positions_loaded:
+        _load_open_positions_from_db()  # разово при первом тике после старта
 
     entry_price = runtime_state.get("hedge_entry_price")
     hedge_price = runtime_state.get("hedge_trigger_price")
@@ -177,13 +208,15 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
         if price is None:
             continue
 
-        existing = storage.get_open_hedge_position(market.slug, side)
+        # Читаем ТОЛЬКО зеркало в памяти — ни одного обращения к SQLite на
+        # этом (горячем, раз в секунду x 12 потоков) пути.
+        existing = _open_positions.get((market.slug, side))
         if existing is None:
             entry_tolerance = runtime_state.get("hedge_entry_tolerance")
             if entry_price <= price <= entry_price + entry_tolerance:
                 if _daily_loss_exceeded():
                     continue  # дневной лимит убытка сработал — новых входов не открываем
-                if storage.count_open_hedge_positions() >= settings.MAX_OPEN_POSITIONS:
+                if len(_open_positions) >= settings.MAX_OPEN_POSITIONS:
                     continue  # общий потолок одновременно открытых позиций
                 await _execute_entry(market, side, token_id, price, timeframe)
             # price > entry_price + entry_tolerance: цена уже проскочила
@@ -191,10 +224,8 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
             # экономика хеджа рассчитана именно на вход около entry_price,
             # не на любую цену выше него (баг, найденный на реальных данных
             # 2026-09-20: средняя цена входа была 0.839 вместо 0.70).
-        else:
-            pos_id, entry_shares, entry_cost, status = existing
-            if status == "open_unhedged" and price >= hedge_price:
-                await _execute_hedge(market, side, pos_id, entry_shares, opposite_token_id)
+        elif existing["status"] == "open_unhedged" and price >= hedge_price:
+            await _execute_hedge(market, side, existing["position_id"], existing["entry_shares"], opposite_token_id)
 
 
 async def settle_resolved() -> None:
@@ -219,6 +250,7 @@ async def settle_resolved() -> None:
             pnl = (entry_shares * 1.0 - entry_cost) if won else -entry_cost
 
         storage.settle_hedge_position(pos_id, outcome, pnl)
+        _open_positions.pop((market_slug, side), None)  # больше не открыта — убираем из зеркала в памяти
         emoji = "🟢" if pnl > 0 else "🔴"
         await telegram_notify.notify(
             f"{emoji} Хедж-бот: {market_slug} ({side}) зарезолвился {outcome}. "

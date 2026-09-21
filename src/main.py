@@ -84,17 +84,7 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         _active_slugs[key] = market.slug
         _active_markets[key] = market
         if settings.USE_LIVE_BOOK_STREAM:
-            # Держим WS только на токенах ТЕКУЩИХ активных рынков.
-            # Раньше subscribe() лишь добавлял токены и никогда не удалял
-            # старые, поэтому через несколько часов подписка разрасталась
-            # до сотен стаканов и Polymarket рвал сокет с 1013 slow consumer.
-            now = time.time()
-            active_token_ids: set[str] = set()
-            for active_market in _active_markets.values():
-                if now < active_market.end_time:
-                    active_token_ids.add(active_market.up_token_id)
-                    active_token_ids.add(active_market.down_token_id)
-            book_stream.replace_subscriptions(active_token_ids)
+            book_stream.subscribe([market.up_token_id, market.down_token_id])
 
     if not runtime_state.get("dry_run"):
         asyncio.create_task(polymarket_client.prewarm_transport())
