@@ -68,6 +68,12 @@ _DEFAULTS = {
     # остаётся неприкрытой позицией (см. обсуждение в чате).
     "hedge_bot_enabled": _get_bool_env("HEDGE_BOT_ENABLED", True),
     "hedge_entry_price": _get_float_env("HEDGE_ENTRY_PRICE", 0.70),
+    # Насколько выше hedge_entry_price ещё можно входить — если цена уже
+    # проскочила дальше (типично на 5m между тиками), пропускаем это окно,
+    # не гонимся: экономика хеджа рассчитана на вход БЛИЗКО к 0.70, не на
+    # произвольную цену выше (найдено на реальных данных 2026-09-20:
+    # средняя цена входа была 0.839 вместо 0.70 без этого ограничения).
+    "hedge_entry_tolerance": _get_float_env("HEDGE_ENTRY_TOLERANCE", 0.03),
     "hedge_trigger_price": _get_float_env("HEDGE_TRIGGER_PRICE", 0.90),
     # $10, а не $5 — при входе 0.70 и хедже на 0.90 нога хеджа стоит
     # stake*(1-0.90)/0.70 = stake*0.143; при $5 это $0.71 (ниже минимума
@@ -97,6 +103,7 @@ _CASTERS = {
     "copytrade_size_usdc": float,
     "hedge_bot_enabled": lambda v: str(v).lower() == "true",
     "hedge_entry_price": float,
+    "hedge_entry_tolerance": float,
     "hedge_trigger_price": float,
     "hedge_stake_usdc": float,
 }

@@ -3,15 +3,24 @@
 стратегию, без основной сигнальной торговли (strategy.py/executor.py
 здесь физически нет, это не форк-переключатель, а осознанно урезанный
 проект). Работает сразу на двух таймфреймах (5m и 15m по умолчанию) —
-один независимый асинхронный поток на каждую пару (актив, таймфрейм).
+на каждую пару (актив, таймфрейм) заведено ДВА независимых цикла:
 
-На каждом тике потока:
-1. Находим активный рынок, тянем цену/индикаторы с Binance (нужны для
-   RSI/MACD/Bollinger в momentum_tracker).
-2. momentum_tracker.check_market — пишет контрольные точки цены
-   (0.70-0.95) с полным снимком индикаторов, НИЧЕГО не покупая.
-3. hedge_bot.check_market — реальная торговля: вход на hedge_entry_price,
-   докупка противоположной стороны на hedge_trigger_price.
+1. "Медленный" (_instance_loop, раз в timeframe.poll_interval_seconds —
+   3-5с): находит активный рынок через Gamma API, подписывает WS-стакан,
+   считает индикаторы с Binance для momentum_tracker. Внешние запросы —
+   намеренно не чаще этого интервала, иначе рискуем упереться в лимиты
+   Gamma/Binance API без реальной пользы.
+2. "Быстрый" (_price_watch_loop, раз в HEDGE_POLL_SECONDS — по умолчанию
+   1с): читает уже живой WS-стакан (book_stream — обновляется в реальном
+   времени независимо от нашего интервала опроса) и проверяет условия
+   входа/хеджа для hedge_bot. НЕ делает внешних запросов вообще — только
+   память и локальная SQLite, поэтому частить его почти бесплатно.
+
+Раньше это была ОДНА проверка раз в 3-5 секунд, из-за чего цена могла
+"проскочить" вход на 0.70 и попасться боту уже на 0.80-0.90 (реальный
+случай из отчёта 2026-09-20: средняя цена входа была 0.839 вместо 0.70).
+Разделение решает это по-настоящему, а не через допуск HEDGE_ENTRY_TOLERANCE
+(тот остаётся как подстраховка на случай совсем резких скачков).
 
 Общие фоновые задачи (не привязаны к конкретному потоку):
 - settlement_loop: резолюция хедж-позиций и разметка исходов momentum-
@@ -26,6 +35,7 @@ import time
 from config import settings
 from src import market_discovery
 from src import polymarket_client, storage, telegram_notify, book_stream, runtime_state, reporting, momentum_tracker, hedge_bot
+from src.market_discovery import ActiveMarket
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -38,6 +48,11 @@ log = logging.getLogger("hedge-bot")
 # settlement_loop, чтобы не спрашивать Gamma API про рынки, которые
 # заведомо ещё не могли зарезолвиться.
 _active_slugs: dict[str, str] = {}
+
+# Кэш последнего найденного активного рынка на пару (актив, таймфрейм) —
+# читает быстрый _price_watch_loop, чтобы не дёргать Gamma API сам.
+# Валиден, пока не истёк market.end_time — обновляется медленным циклом.
+_active_markets: dict[str, ActiveMarket] = {}
 
 # Последнее состояние каждого потока — для общего статуса в /menu.
 _instance_state: dict[str, dict] = {}
@@ -58,6 +73,7 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
 
     market = await market_discovery.get_active_market(asset, timeframe)
     _active_slugs[key] = market.slug
+    _active_markets[key] = market
 
     if settings.USE_LIVE_BOOK_STREAM:
         book_stream.subscribe([market.up_token_id, market.down_token_id])
@@ -87,11 +103,6 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         except Exception as exc:  # noqa: BLE001 — исследовательский модуль не должен ронять хедж-бота
             log.warning("Ошибка momentum_tracker для %s: %s", market.slug, exc)
 
-    try:
-        await hedge_bot.check_market(market, timeframe)
-    except Exception as exc:  # noqa: BLE001
-        log.warning("Ошибка hedge_bot для %s: %s", market.slug, exc)
-
 
 async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
     key = f"{asset}:{timeframe.label}"
@@ -115,6 +126,21 @@ async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
 
         sleep_for = timeframe.poll_interval_seconds if consecutive_failures < 10 else 600
         await asyncio.sleep(sleep_for)
+
+
+async def _price_watch_loop(asset: str, timeframe: TimeframeProfile) -> None:
+    """Быстрый цикл только для hedge_bot — без внешних запросов, только
+    чтение уже живого WS-стакана и локальной БД, поэтому частить его почти
+    бесплатно (в отличие от _instance_loop, который дёргает Gamma/Binance)."""
+    key = f"{asset}:{timeframe.label}"
+    while True:
+        market = _active_markets.get(key)
+        if market is not None and runtime_state.is_asset_enabled(asset) and time.time() < market.end_time:
+            try:
+                await hedge_bot.check_market(market, timeframe)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Ошибка hedge_bot (быстрый цикл) для %s: %s", market.slug, exc)
+        await asyncio.sleep(settings.HEDGE_POLL_SECONDS)
 
 
 async def settlement_loop() -> None:
@@ -175,9 +201,14 @@ async def main():
             for asset in settings.ASSETS
             for timeframe in TIMEFRAMES
         ]
+        price_watch_tasks = [
+            asyncio.create_task(_price_watch_loop(asset, timeframe))
+            for asset in settings.ASSETS
+            for timeframe in TIMEFRAMES
+        ]
 
         try:
-            await asyncio.gather(*instance_tasks)
+            await asyncio.gather(*instance_tasks, *price_watch_tasks)
         finally:
             if book_stream_task:
                 book_stream_task.cancel()

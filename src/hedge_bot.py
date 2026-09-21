@@ -107,19 +107,24 @@ async def _execute_hedge(market: ActiveMarket, side: str, position_id: int, entr
     if opp_price is None:
         return  # нет стакана на другой стороне прямо сейчас — попробуем на следующем тике
 
+    tick = opp_book.tick_size or book_stream.tick_size(opposite_token_id)
+    price_cap = polymarket_client.round_price_for_buy(
+        min(opp_price + settings.LIVE_ENTRY_MAX_SLIPPAGE, 0.99), tick,
+    )
+
     # Хотим РОВНО entry_shares акций на другой стороне — тогда выплата
-    # фиксирована (entry_shares x $1) независимо от исхода.
-    target_cost = entry_shares * opp_price
+    # фиксирована (entry_shares x $1) независимо от исхода. Считаем нужную
+    # сумму ПО ЦЕНЕ С УЧЁТОМ ПРОСКАЛЬЗЫВАНИЯ (price_cap), а не по цене ДО
+    # него (opp_price) — иначе получим меньше акций, чем entry_shares, и
+    # гарантия равной прибыли в обоих исходах перестаёт выполняться (баг,
+    # найденный на реальных данных 2026-09-20: hedge_shares систематически
+    # оказывались меньше entry_shares).
+    target_cost = entry_shares * price_cap
     available = opp_book.ask_liquidity_usdc
     if available < settings.MIN_VIABLE_TRADE_USDC:
         return
     if available < target_cost:
         target_cost = round(available * 0.9, 2)  # неполный хедж лучше, чем никакого
-
-    tick = opp_book.tick_size or book_stream.tick_size(opposite_token_id)
-    price_cap = polymarket_client.round_price_for_buy(
-        min(opp_price + settings.LIVE_ENTRY_MAX_SLIPPAGE, 0.99), tick,
-    )
 
     if not dry_run:
         if not settings.POLY_PRIVATE_KEY:
@@ -174,12 +179,18 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
 
         existing = storage.get_open_hedge_position(market.slug, side)
         if existing is None:
-            if price >= entry_price:
+            entry_tolerance = runtime_state.get("hedge_entry_tolerance")
+            if entry_price <= price <= entry_price + entry_tolerance:
                 if _daily_loss_exceeded():
                     continue  # дневной лимит убытка сработал — новых входов не открываем
                 if storage.count_open_hedge_positions() >= settings.MAX_OPEN_POSITIONS:
                     continue  # общий потолок одновременно открытых позиций
                 await _execute_entry(market, side, token_id, price, timeframe)
+            # price > entry_price + entry_tolerance: цена уже проскочила
+            # мимо входа за один тик (типично на 5m) — не гонимся за ней,
+            # экономика хеджа рассчитана именно на вход около entry_price,
+            # не на любую цену выше него (баг, найденный на реальных данных
+            # 2026-09-20: средняя цена входа была 0.839 вместо 0.70).
         else:
             pos_id, entry_shares, entry_cost, status = existing
             if status == "open_unhedged" and price >= hedge_price:
