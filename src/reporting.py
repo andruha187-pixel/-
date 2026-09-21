@@ -15,7 +15,7 @@ import os
 import time
 
 from config import settings
-from src import storage, telegram_notify
+from src import storage, telegram_notify, hedge_bot
 
 _LAST_REPORT_KEY = "last_report_ts"
 
@@ -46,8 +46,9 @@ async def build_and_send_report() -> None:
 
     momentum = storage.get_momentum_since(since_ts) if settings.MOMENTUM_TRACKER_ENABLED else []
     hedge_positions = storage.get_hedge_positions_since(since_ts)
+    skip_counts = hedge_bot.get_and_reset_skip_counts()
 
-    if not momentum and not hedge_positions:
+    if not momentum and not hedge_positions and not skip_counts:
         _set_last_report_ts(now_ts)
         return
 
@@ -82,6 +83,37 @@ async def build_and_send_report() -> None:
             f"без хеджа: {len(closed) - hedged_count}) | PnL: {pnl_sum:+.2f} USDC (без учёта комиссии)"
         )
         await telegram_notify.send_document(hedge_path, hedge_caption)
+
+    # Причины пропуска каждого рынка — счётчики накапливались в памяти
+    # (hedge_bot._skip_counts), не на каждый тик в БД (иначе вернули бы
+    # проблему со "slow consumer" из-за блокировки event loop). Показывает,
+    # почему конкретный актив/таймфрейм не входил: ждёт цену, упёрся в
+    # лимит, проскочил окно и т.д. — то, чего раньше не было видно вообще.
+    if skip_counts:
+        skip_rows = []
+        for (asset, timeframe_label), reasons in sorted(skip_counts.items()):
+            for reason, count in sorted(reasons.items(), key=lambda x: -x[1]):
+                skip_rows.append((asset, timeframe_label, hedge_bot.SKIP_REASON_LABELS.get(reason, reason), count))
+        skip_path = f"{base}_skip_reasons.csv"
+        _write_csv(skip_path, ["asset", "timeframe", "reason", "count"], skip_rows)
+
+        # В подпись — только самое частое НЕ-тривиальное по каждому активу/
+        # таймфрейму (просто "ждём цену входа" не показываем — это норма,
+        # не диагностически интересно; интересны лимиты/пропуски/сработки).
+        interesting = {"missed_entry_window", "daily_loss_limit", "max_open_positions",
+                       "hedge_leg_too_small", "no_price", "entered", "hedged"}
+        lines = []
+        for (asset, timeframe_label), reasons in sorted(skip_counts.items()):
+            notable = {r: c for r, c in reasons.items() if r in interesting and c > 0}
+            if notable:
+                parts = ", ".join(f"{hedge_bot.SKIP_REASON_LABELS[r]}: {c}" for r, c in
+                                   sorted(notable.items(), key=lambda x: -x[1]))
+                lines.append(f"  {asset.upper()} {timeframe_label}: {parts}")
+        skip_caption = (
+            f"📋 Причины (не)входа {from_label} → {to_label}\n" +
+            ("\n".join(lines) if lines else "  Ничего примечательного — либо везде тихо ждём цену, либо не было тиков.")
+        )
+        await telegram_notify.send_document(skip_path, skip_caption)
 
     _set_last_report_ts(now_ts)
 

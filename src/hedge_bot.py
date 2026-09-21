@@ -49,6 +49,39 @@ _last_warned_config: tuple | None = None  # чтобы не спамить од�
 _open_positions: dict[tuple[str, str], dict] = {}
 _positions_loaded = False
 
+# Счётчики причин пропуска в памяти — (asset, timeframe) -> {причина: счёт}.
+# НЕ пишутся в БД на каждый тик (это и вызвало проблему со "slow consumer"
+# в прошлый раз) — только читаются и сбрасываются раз в REPORT_INTERVAL_HOURS
+# из reporting.py, чтобы попасть в 4-часовой отчёт.
+_skip_counts: dict[tuple[str, str], dict[str, int]] = {}
+
+SKIP_REASON_LABELS = {
+    "no_price": "нет цены в стакане",
+    "waiting_for_entry": "ждём цену входа",
+    "missed_entry_window": "цена проскочила мимо входа",
+    "daily_loss_limit": "дневной лимит убытка",
+    "max_open_positions": "потолок открытых позиций",
+    "hedge_leg_too_small": "нога хеджа меньше минимума ордера",
+    "waiting_for_hedge": "ждём цену хеджа",
+    "entered": "вход выполнен",
+    "hedged": "хедж выполнен",
+}
+
+
+def _count(asset: str, timeframe_label: str, reason: str) -> None:
+    key = (asset, timeframe_label)
+    bucket = _skip_counts.setdefault(key, {})
+    bucket[reason] = bucket.get(reason, 0) + 1
+
+
+def get_and_reset_skip_counts() -> dict[tuple[str, str], dict[str, int]]:
+    """Вызывается из reporting.py раз в REPORT_INTERVAL_HOURS — забирает
+    накопленное и обнуляет счётчики для следующего периода."""
+    global _skip_counts
+    snapshot = _skip_counts
+    _skip_counts = {}
+    return snapshot
+
 
 def _load_open_positions_from_db() -> None:
     """Разово при старте (и один раз после падения) — восстанавливаем
@@ -187,6 +220,7 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
     stake = runtime_state.get("hedge_stake_usdc")
 
     if _hedge_leg_too_small(stake, entry_price, hedge_price):
+        _count(market.asset, timeframe.label, "hedge_leg_too_small")
         config_key = (stake, entry_price, hedge_price)
         if _last_warned_config != config_key:
             _last_warned_config = config_key
@@ -206,6 +240,7 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
     for side, token_id, opposite_token_id in sides:
         price = book_stream.best_ask(token_id)
         if price is None:
+            _count(market.asset, timeframe.label, "no_price")
             continue
 
         # Читаем ТОЛЬКО зеркало в памяти — ни одного обращения к SQLite на
@@ -215,17 +250,27 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
             entry_tolerance = runtime_state.get("hedge_entry_tolerance")
             if entry_price <= price <= entry_price + entry_tolerance:
                 if _daily_loss_exceeded():
+                    _count(market.asset, timeframe.label, "daily_loss_limit")
                     continue  # дневной лимит убытка сработал — новых входов не открываем
                 if len(_open_positions) >= runtime_state.get("max_open_positions"):
+                    _count(market.asset, timeframe.label, "max_open_positions")
                     continue  # общий потолок одновременно открытых позиций
+                _count(market.asset, timeframe.label, "entered")
                 await _execute_entry(market, side, token_id, price, timeframe)
-            # price > entry_price + entry_tolerance: цена уже проскочила
-            # мимо входа за один тик (типично на 5m) — не гонимся за ней,
-            # экономика хеджа рассчитана именно на вход около entry_price,
-            # не на любую цену выше него (баг, найденный на реальных данных
-            # 2026-09-20: средняя цена входа была 0.839 вместо 0.70).
+            elif price > entry_price + entry_tolerance:
+                # Цена уже проскочила мимо входа за один тик (типично на 5m) —
+                # не гонимся за ней, экономика хеджа рассчитана именно на вход
+                # около entry_price, не на любую цену выше него (баг, найденный
+                # на реальных данных 2026-09-20: средняя цена входа была 0.839
+                # вместо 0.70).
+                _count(market.asset, timeframe.label, "missed_entry_window")
+            else:
+                _count(market.asset, timeframe.label, "waiting_for_entry")
         elif existing["status"] == "open_unhedged" and price >= hedge_price:
+            _count(market.asset, timeframe.label, "hedged")
             await _execute_hedge(market, side, existing["position_id"], existing["entry_shares"], opposite_token_id)
+        elif existing["status"] == "open_unhedged":
+            _count(market.asset, timeframe.label, "waiting_for_hedge")
 
 
 async def settle_resolved() -> None:
