@@ -90,6 +90,12 @@ class Settings:
     # 0.70/0.75/.../0.95. См. src/momentum_tracker.py.
     MOMENTUM_TRACKER_ENABLED: bool = _get_bool("MOMENTUM_TRACKER_ENABLED", True)
 
+    # Как часто проверять вход/хедж по уже живому WS-стакану — не требует
+    # внешних запросов (только память + локальная БД), поэтому можно
+    # часто. 1 секунда — разумный компромисс между реакцией и нагрузкой на
+    # event loop при 12 параллельных потоках (6 активов x 2 таймфрейма).
+    HEDGE_POLL_SECONDS: float = _get_float("HEDGE_POLL_SECONDS", 1.0)
+
     # --- Масштабирование ставки по уверенности сигнала ---
     # Ставка = TRADE_SIZE_USDC только при score >= SIZE_SCALING_MAX_SCORE.
     # На самом пороге (score == threshold) ставка = TRADE_SIZE_USDC * MIN_FRACTION.
