@@ -202,9 +202,18 @@ async def run_forever() -> None:
                 sender_task = asyncio.create_task(_sender(ws))
                 try:
                     async for raw in ws:
-                        if raw == "PONG":
+                        if not raw or raw == "PONG":
                             continue
-                        parsed = json.loads(raw)
+                        try:
+                            parsed = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError) as exc:
+                            # Одно кривое/пустое сообщение НЕ должно рвать всё
+                            # соединение — раньше именно так и происходило:
+                            # json.loads("") -> исключение -> вылет из async for
+                            # -> полный реконнект каждые несколько секунд, и в
+                            # моменты разрыва бот не видел цену вообще.
+                            log.debug("Пропускаю нераспарсенное сообщение стакана (%s): %r", exc, raw[:200])
+                            continue
                         # Сервер иногда шлёт не один объект, а МАССИВ объектов
                         # разом (например, снапшот сразу по нескольким
                         # подписанным токенам при первом коннекте) — раньше
