@@ -101,6 +101,27 @@ def subscribe(asset_ids: list[str]) -> None:
         pass
 
 
+def unsubscribe(asset_ids: list[str]) -> None:
+    """Убираем токены истёкших окон из подписки — без этого _subscribed
+    растёт неограниченно (каждое новое 5/15-минутное окно добавляет токены,
+    старые никогда не убирались), и если у Polymarket есть лимит на размер
+    подписки, новые токены в какой-то момент перестают получать данные
+    вообще (реальный случай, 2026-09-21: "нет цены в стакане" в 75-97%
+    проверок после ~часа работы). Шлём заново ПОЛНЫЙ желаемый список — судя
+    по формату протокола ("assets_ids" целиком, не инкремент), сервер
+    заменяет подписку целиком на переданный список, а не добавляет к ней."""
+    removed = [a for a in asset_ids if a in _subscribed]
+    if not removed:
+        return
+    for a in removed:
+        _subscribed.discard(a)
+        _books.pop(a, None)
+    try:
+        _send_queue.put_nowait({"type": "market", "assets_ids": list(_subscribed), "custom_feature_enabled": True})
+    except asyncio.QueueFull:
+        pass
+
+
 def get_book(asset: str) -> dict | None:
     return _books.get(asset)
 
@@ -125,6 +146,27 @@ def ask_liquidity_usdc(asset: str, depth_levels: int = 5) -> float:
         return 0.0
     top = sorted(b["asks"].items())[:depth_levels]
     return sum(price * size for price, size in top)
+
+
+def book_imbalance(asset: str, depth_levels: int = 10) -> float | None:
+    """
+    Дисбаланс стакана: доля объёма на покупку (bid) от общего объёма
+    (bid+ask) в первых depth_levels уровнях. >0.5 — давление вверх
+    (больше желающих купить, чем продать по видимым ценам), <0.5 — вниз.
+    Используется в momentum_tracker как один из индикаторов возможного
+    продолжения движения цены — сырой сигнал давления, которого нет ни
+    в ATR/EMA (это про историю цены), ни в объёме свечи Binance (это
+    вообще про другой рынок, BTC/USDT, а не про сам контракт Polymarket).
+    """
+    b = _books.get(asset)
+    if not b or (not b.get("bids") and not b.get("asks")):
+        return None
+    bid_vol = sum(size for _, size in sorted(b.get("bids", {}).items(), reverse=True)[:depth_levels])
+    ask_vol = sum(size for _, size in sorted(b.get("asks", {}).items())[:depth_levels])
+    total = bid_vol + ask_vol
+    if total <= 0:
+        return None
+    return bid_vol / total
 
 
 def tick_size(asset: str) -> float:
@@ -181,9 +223,18 @@ async def run_forever() -> None:
                 sender_task = asyncio.create_task(_sender(ws))
                 try:
                     async for raw in ws:
-                        if raw == "PONG":
+                        if not raw or raw == "PONG":
                             continue
-                        parsed = json.loads(raw)
+                        try:
+                            parsed = json.loads(raw)
+                        except (json.JSONDecodeError, ValueError) as exc:
+                            # Одно кривое/пустое сообщение НЕ должно рвать всё
+                            # соединение — раньше именно так и происходило:
+                            # json.loads("") -> исключение -> вылет из async for
+                            # -> полный реконнект каждые несколько секунд, и в
+                            # моменты разрыва бот не видел цену вообще.
+                            log.debug("Пропускаю нераспарсенное сообщение стакана (%s): %r", exc, raw[:200])
+                            continue
                         # Сервер иногда шлёт не один объект, а МАССИВ объектов
                         # разом (например, снапшот сразу по нескольким
                         # подписанным токенам при первом коннекте) — раньше
