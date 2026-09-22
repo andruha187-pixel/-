@@ -1,29 +1,44 @@
 """
-Хедж-стратегия, откалиброванная на реальных momentum-отчётах (2026-09-20):
+Take-profit стратегия (переход с хеджа на продажу — 2026-09-22):
 1. Как только цена стороны рынка впервые достигает HEDGE_ENTRY_PRICE
    (по умолчанию 0.70) — покупаем эту сторону.
 2. Если цена продолжает расти и достигает HEDGE_TRIGGER_PRICE (0.90) до
-   конца окна — докупаем ПРОТИВОПОЛОЖНУЮ сторону в таком количестве акций,
-   чтобы держать РОВНО одинаковое число акций с обеих сторон. При равном
-   числе акций выплата фиксирована (ровно это число акций × $1) независимо
-   от исхода — значит, и прибыль (выплата минус суммарные затраты)
-   одинакова в обоих исходах, то есть зафиксирована.
-3. Если цена НЕ доходит до HEDGE_TRIGGER_PRICE — остаёмся с односторонней
-   позицией. Это не мелочь: по нашим данным именно эти случаи почти
-   гарантированно проигрывают (застрявшая сторона выигрывает в ~4.5%
-   случаев) — учитывай это в размере ставки.
+   конца окна — ПРОДАЁМ уже купленную позицию (тот же токен) по текущей
+   рыночной цене, фиксируя прибыль. Позиция закрывается сразу, ждать
+   резолюции рынка не нужно.
+3. Если цена НЕ доходит до HEDGE_TRIGGER_PRICE — остаёмся с открытой
+   позицией до резолюции рынка. Это не мелочь: по нашим данным именно
+   такие случаи почти гарантированно проигрывают (~4.5% винрейт) —
+   учитывай это в размере ставки.
+
+Раньше (до 2026-09-22) на шаге 2 докупалась ПРОТИВОПОЛОЖНАЯ сторона в
+таком же количестве акций (хедж) — математически это даёт РОВНО ТУ ЖЕ
+прибыль (проверено на 1126 momentum-сессиях, числа идентичны с точностью
+до цента, включая комиссию — она тоже симметрична: price*(1-price) не
+меняется от замены p на 1-p). Перешли на продажу по двум причинам:
+- Физически исключает целый класс багов с перепутанным токеном —
+  продать можно только то, что реально держишь, перепутать нечего
+  (реальный случай: у HYPE иногда up_token_id совпадал с down_token_id,
+  и "хедж" покупал ту же сторону повторно — реальные убытки, 2026-09-21).
+- Проще: не нужно отслеживать вторую ногу, считать "равные акции",
+  ждать резолюции для финального расчёта — прибыль известна сразу же
+  при продаже.
 
 Порог 0.90 (не 0.70-0.85) выбран по факту бэктеста на реальных отчётах:
-чем позже хеджируешь, тем больше гарантированная маржа с каждого
-успешного хеджа, и это перевешивает потери от возросшего числа случаев,
-где хедж вообще не срабатывает. См. обсуждение в чате от 2026-09-20 —
-на четырёх отчётах (366 сессий) хедж на 0.90 дал +$29.45, на 0.70-0.85 —
-убыток, несмотря на то что сам хедж каждый раз безубыточен по построению.
+чем позже фиксируешь прибыль, тем больше гарантированная маржа с каждой
+успешной сделки, и это перевешивает потери от возросшего числа случаев,
+где цена вообще не доходит до порога. См. обсуждение в чате от
+2026-09-20 — на четырёх отчётах (366 сессий) порог 0.90 дал +$29.45, на
+0.70-0.85 — убыток, несмотря на то что зафиксированная сделка каждый раз
+безубыточна по построению.
 
 ВАЖНО про комиссию: pnl_usdc здесь считается БЕЗ вычета комиссии тейкера
-(7% для крипторынков на КАЖДУЮ ногу) — так же, как и у основной стратегии
-в этом боте. Реальный итог на кошельке будет чуть хуже, чем показывают
-отчёты. См. обсуждение комиссий в README.
+(7% для крипторынков на КАЖДУЮ ногу — вход и продажа отдельно, хотя
+эффективная комиссия от суммы сделки заметно ниже 7% у краёв диапазона
+цены — ближе к 2% на входе ~0.70, ~0.7% на выходе ~0.90; ставка 7% —
+это коэффициент в формуле fee=shares×0.07×price×(1-price), а не доля от
+суммы сделки напрямую). Реальный итог на кошельке будет чуть хуже, чем
+показывают отчёты. См. обсуждение комиссий в README.
 """
 from __future__ import annotations
 import logging
@@ -108,15 +123,6 @@ def _load_open_positions_from_db() -> None:
     _positions_loaded = True
 
 
-def _hedge_leg_too_small(stake: float, entry_price: float, hedge_price: float) -> bool:
-    """Нога хеджа стоит stake*(1-hedge_price)/entry_price — если это ниже
-    минимального ордера Polymarket, хедж физически не сможет исполниться,
-    и вся позиция навсегда останется незахеджированной (ровно тот
-    убыточный сценарий, которого хедж должен избегать)."""
-    hedge_leg_cost = stake * (1 - hedge_price) / entry_price
-    return hedge_leg_cost < settings.MIN_VIABLE_TRADE_USDC
-
-
 def _daily_loss_exceeded() -> bool:
     """Полночь UTC — тот же принцип, что и у основного бота: разово в
     сутки сбрасывается счётчик, чтобы не копить убыток бесконечно."""
@@ -171,53 +177,52 @@ async def _execute_entry(market: ActiveMarket, side: str, token_id: str, price_h
     )
 
 
-async def _execute_hedge(market: ActiveMarket, side: str, position_id: int, entry_shares: float,
-                          opposite_token_id: str) -> None:
+async def _execute_take_profit(market: ActiveMarket, side: str, position_id: int, entry_shares: float,
+                                token_id: str) -> None:
+    """
+    Продаём УЖЕ КУПЛЕННУЮ позицию (тот же token_id, что при входе) по текущей
+    рыночной цене — не докупаем противоположную сторону. Математически это
+    даёт РОВНО ТУ ЖЕ прибыль, что и хедж (проверено на 1126 momentum-сессиях
+    — числа идентичны), но проще и физически исключает целый класс багов
+    (перепутанный токен противоположной стороны — реальный случай с HYPE,
+    2026-09-21): продать можно только то, что реально держишь, перепутать
+    нечего. Плюс позиция закрывается СРАЗУ, не нужно ждать резолюции рынка.
+    """
     dry_run = runtime_state.get("dry_run")
 
-    opp_book = await polymarket_client.get_orderbook_cached(opposite_token_id, depth_levels=10)
-    opp_price = opp_book.best_ask
-    if opp_price is None:
-        return  # нет стакана на другой стороне прямо сейчас — попробуем на следующем тике
+    book = await polymarket_client.get_orderbook_cached(token_id, depth_levels=10)
+    ref_price = book.best_bid
+    if ref_price is None:
+        return  # нет биды прямо сейчас (некому продать) — попробуем на следующем тике
 
-    tick = opp_book.tick_size or book_stream.tick_size(opposite_token_id)
-    price_cap = polymarket_client.round_price_for_buy(
-        min(opp_price + settings.HEDGE_LEG_MAX_SLIPPAGE, 0.99), tick,
-    )
+    # Защита от проскальзывания на продаже — не продаём дешевле этой цены.
+    min_price = round(max(ref_price - settings.HEDGE_LEG_MAX_SLIPPAGE, 0.01), 3)
 
-    # Хотим РОВНО entry_shares акций на другой стороне — тогда выплата
-    # фиксирована (entry_shares x $1) независимо от исхода. Считаем нужную
-    # сумму ПО ЦЕНЕ С УЧЁТОМ ПРОСКАЛЬЗЫВАНИЯ (price_cap), а не по цене ДО
-    # него (opp_price) — иначе получим меньше акций, чем entry_shares, и
-    # гарантия равной прибыли в обоих исходах перестаёт выполняться (баг,
-    # найденный на реальных данных 2026-09-20: hedge_shares систематически
-    # оказывались меньше entry_shares).
-    target_cost = entry_shares * price_cap
-    available = opp_book.ask_liquidity_usdc
-    if available < settings.MIN_VIABLE_TRADE_USDC:
-        return
-    if available < target_cost:
-        target_cost = round(available * 0.9, 2)  # неполный хедж лучше, чем никакого
-
+    order_id = "dry-run"
     if not dry_run:
         if not settings.POLY_PRIVATE_KEY:
-            await telegram_notify.notify("❌ Хедж-бот: LIVE включён, но POLY_PRIVATE_KEY не задан — хедж пропущен.")
+            await telegram_notify.notify("❌ Хедж-бот: LIVE включён, но POLY_PRIVATE_KEY не задан — продажа пропущена.")
             return
         try:
-            resp = await polymarket_client.place_buy_order(opposite_token_id, price_cap, target_cost, tick)
+            resp = await polymarket_client.place_sell_order(token_id, entry_shares, min_price)
         except Exception as exc:  # noqa: BLE001
-            await telegram_notify.notify(f"❌ Хедж-бот: ошибка хеджа ({market.slug}): {exc}")
+            await telegram_notify.notify(f"❌ Хедж-бот: ошибка продажи ({market.slug}): {exc}")
             return
+        order_id = polymarket_client.response_field(resp, "order_id") or str(resp)
 
-    hedge_shares = target_cost / price_cap
-    storage.mark_hedged(position_id, price_cap, hedge_shares, target_cost, opposite_token_id)
-    if (market.slug, side) in _open_positions:
-        _open_positions[(market.slug, side)]["status"] = "hedged"
+    proceeds = entry_shares * ref_price
+    entry_cost = _open_positions.get((market.slug, side), {}).get("entry_cost", 0.0)
+    pnl = proceeds - entry_cost
 
+    storage.mark_hedged(position_id, ref_price, entry_shares, proceeds, token_id)
+    storage.settle_hedge_position(position_id, "SOLD", pnl)
+    _open_positions.pop((market.slug, side), None)  # закрыта сразу — убираем из зеркала
+
+    emoji = "🟢" if pnl > 0 else "🔴"
     await telegram_notify.notify(
-        f"{'🧪 [DRY RUN] ' if dry_run else ''}🔒 Хедж-бот: зафиксирован хедж по {market.slug} ({side})\n"
-        f"Докупили противоположную сторону по {price_cap:.3f}, {hedge_shares:.2f} акций "
-        f"(на входе было {entry_shares:.2f}) — прибыль зафиксирована независимо от исхода."
+        f"{'🧪 [DRY RUN] ' if dry_run else ''}{emoji} Хедж-бот: закрыта позиция {market.slug} ({side})\n"
+        f"Продали по {ref_price:.3f}, выручка {proceeds:.2f} USDC (вход был {entry_cost:.2f}) — "
+        f"PnL: {pnl:+.2f} USDC, зафиксировано, ждать резолюции не нужно."
     )
 
 
@@ -230,22 +235,8 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
         _load_open_positions_from_db()  # разово при первом тике после старта
 
     entry_price = runtime_state.get("hedge_entry_price")
-    hedge_price = runtime_state.get("hedge_trigger_price")
+    take_profit_price = runtime_state.get("hedge_trigger_price")
     stake = runtime_state.get("hedge_stake_usdc")
-
-    if _hedge_leg_too_small(stake, entry_price, hedge_price):
-        _count(market.asset, timeframe.label, "hedge_leg_too_small")
-        config_key = (stake, entry_price, hedge_price)
-        if _last_warned_config != config_key:
-            _last_warned_config = config_key
-            min_stake = settings.MIN_VIABLE_TRADE_USDC * entry_price / (1 - hedge_price)
-            await telegram_notify.notify(
-                f"⚠️ Хедж-бот: при ставке {stake:.2f}, входе {entry_price:.2f} и хедже {hedge_price:.2f} "
-                f"нога хеджа стоила бы меньше минимального ордера (${settings.MIN_VIABLE_TRADE_USDC:.2f}) — "
-                f"хедж физически не сможет исполниться. Нужна ставка от ${min_stake:.2f}. "
-                f"Новые входы приостановлены, пока не поправишь размер ставки."
-            )
-        return  # не входим вслепую без возможности потом захеджироваться
 
     sides = [
         ("UP", market.up_token_id, market.down_token_id),
@@ -279,16 +270,16 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
                 await _execute_entry(market, side, token_id, price, timeframe)
             elif price > entry_price + entry_tolerance:
                 # Цена уже проскочила мимо входа за один тик (типично на 5m) —
-                # не гонимся за ней, экономика хеджа рассчитана именно на вход
+                # не гонимся за ней, экономика рассчитана именно на вход
                 # около entry_price, не на любую цену выше него (баг, найденный
                 # на реальных данных 2026-09-20: средняя цена входа была 0.839
                 # вместо 0.70).
                 _count(market.asset, timeframe.label, "missed_entry_window")
             else:
                 _count(market.asset, timeframe.label, "waiting_for_entry")
-        elif existing["status"] == "open_unhedged" and price >= hedge_price:
+        elif existing["status"] == "open_unhedged" and price >= take_profit_price:
             _count(market.asset, timeframe.label, "hedged")
-            await _execute_hedge(market, side, existing["position_id"], existing["entry_shares"], opposite_token_id)
+            await _execute_take_profit(market, side, existing["position_id"], existing["entry_shares"], token_id)
         elif existing["status"] == "open_unhedged":
             _count(market.asset, timeframe.label, "waiting_for_hedge")
 

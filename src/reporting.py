@@ -79,8 +79,8 @@ async def build_and_send_report() -> None:
         pnl_sum = sum(row[storage.HEDGE_COLUMNS.index("pnl_usdc")] or 0 for row in closed)
         hedge_caption = (
             f"🔒 Хедж-бот {from_label} → {to_label}\n"
-            f"Позиций закрыто: {len(closed)} (захеджировано: {hedged_count}, "
-            f"без хеджа: {len(closed) - hedged_count}) | PnL: {pnl_sum:+.2f} USDC (без учёта комиссии)"
+            f"Позиций закрыто: {len(closed)} (с прибылью продано: {hedged_count}, "
+            f"держали до резолюции: {len(closed) - hedged_count}) | PnL: {pnl_sum:+.2f} USDC (без учёта комиссии)"
         )
         await telegram_notify.send_document(hedge_path, hedge_caption)
 

@@ -43,8 +43,8 @@ from src.timeframes import TimeframeProfile
 
 log = logging.getLogger("momentum_tracker")
 
-MOMENTUM_MIN_PRICE = 0.70
-MOMENTUM_MAX_PRICE = 0.95
+MOMENTUM_MIN_PRICE = settings.MOMENTUM_MIN_PRICE
+MOMENTUM_MAX_PRICE = settings.MOMENTUM_MAX_PRICE
 MOMENTUM_STEP = 0.05
 
 # (market_slug, side) -> наивысшая уже залогированная контрольная точка

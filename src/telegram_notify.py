@@ -106,7 +106,7 @@ COPYTRADE_SIZE_PRESETS = [2, 5, 10, 20]
 
 
 HEDGE_STAKE_PRESETS = [2, 5, 10, 20]
-HEDGE_TRIGGER_PRESETS = [0.85, 0.88, 0.90, 0.93]
+HEDGE_TRIGGER_PRESETS = [0.85, 0.90, 0.93, 0.95]
 MAX_OPEN_POSITIONS_PRESETS = [6, 10, 12, 24]
 
 
@@ -122,7 +122,7 @@ def _hedge_menu_markup() -> InlineKeyboardMarkup:
             "🔴 Выключить хедж-бота" if enabled else "🟢 Включить хедж-бота",
             callback_data="hedge_toggle",
         )],
-        [InlineKeyboardButton("— Порог хеджа (сейчас {:.2f}) —".format(trigger), callback_data="noop")],
+        [InlineKeyboardButton("— Порог продажи (сейчас {:.2f}) —".format(trigger), callback_data="noop")],
     ]
     row = []
     for val in HEDGE_TRIGGER_PRESETS:
@@ -398,9 +398,9 @@ def _stats_text() -> str:
     lines = [
         "📊 *Статистика хедж-бота*",
         "",
-        f"Сегодня: {today['positions']} позиций ({today['hedged']} захеджировано), "
+        f"Сегодня: {today['positions']} позиций ({today['hedged']} продано с прибылью), "
         f"PnL {today['pnl_usdc']:+.2f} USDC, побед {today['wins']}",
-        f"Всего: {total['positions']} позиций ({total['hedged']} захеджировано), "
+        f"Всего: {total['positions']} позиций ({total['hedged']} продано с прибылью), "
         f"PnL {total['pnl_usdc']:+.2f} USDC, побед {total['wins']}",
         "",
         "_PnL без учёта комиссии тейкера (7% на каждую ногу)._",
@@ -548,11 +548,11 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         enabled = runtime_state.get("hedge_bot_enabled")
         await query.edit_message_text(
             f"🔒 Хедж-бот: {'🟢 включён' if enabled else '🔴 выключен'}\n"
-            f"Вход при цене {runtime_state.get('hedge_entry_price'):.2f}, хедж противоположной стороны при "
+            f"Вход при цене {runtime_state.get('hedge_entry_price'):.2f}, продажа с прибылью при "
             f"{runtime_state.get('hedge_trigger_price'):.2f}\n"
             f"Размер ставки: {runtime_state.get('hedge_stake_usdc'):.2f} USDC\n"
             f"Потолок открытых позиций: {runtime_state.get('max_open_positions')}\n\n"
-            "Если цена не доходит до порога хеджа — остаётся односторонняя позиция "
+            "Если цена не доходит до порога продажи — держим позицию до резолюции рынка "
             "(по нашим данным такие случаи почти всегда проигрывают). "
             "PnL в отчётах — без учёта комиссии тейкера.",
             reply_markup=_hedge_menu_markup(),
@@ -569,7 +569,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data.startswith("hedgetrigger_set:"):
         val = float(data.split(":", 1)[1])
         runtime_state.set("hedge_trigger_price", val)
-        await query.edit_message_text(f"✅ Порог хеджа: {val:.2f}", reply_markup=_hedge_menu_markup())
+        await query.edit_message_text(f"✅ Порог продажи: {val:.2f}", reply_markup=_hedge_menu_markup())
 
     elif data.startswith("hedgestake_set:"):
         val = float(data.split(":", 1)[1])
