@@ -96,14 +96,20 @@ CREATE TABLE IF NOT EXISTS hedge_positions (
     status TEXT,          -- 'open_unhedged' | 'hedged' | 'closed'
     outcome TEXT,
     pnl_usdc REAL,
-    dry_run INTEGER
+    dry_run INTEGER,
+    min_price_seen REAL   -- минимальная цена, которую видела открытая позиция
+                            -- за всё время (для анализа стоп-лосса задним числом)
 );
 """
 
 HEDGE_COLUMNS = [
     "id", "ts", "market_slug", "asset", "timeframe", "side", "entry_price", "entry_shares",
     "entry_cost", "entry_token_id", "hedge_price", "hedge_shares", "hedge_cost", "hedge_token_id",
-    "hedge_ts", "status", "outcome", "pnl_usdc", "dry_run",
+    "hedge_ts", "status", "outcome", "pnl_usdc", "dry_run", "min_price_seen",
+]
+
+_HEDGE_POSITIONS_MIGRATIONS = [
+    ("min_price_seen", "REAL"),
 ]
 
 
@@ -142,12 +148,20 @@ def mark_hedged(position_id: int, hedge_price: float, hedge_shares: float, hedge
         )
 
 
-def settle_hedge_position(position_id: int, outcome: str, pnl_usdc: float) -> None:
+def settle_hedge_position(position_id: int, outcome: str, pnl_usdc: float,
+                           min_price_seen: float | None = None) -> None:
     with _conn() as conn:
-        conn.execute(
-            "UPDATE hedge_positions SET status = 'closed', outcome = ?, pnl_usdc = ? WHERE id = ?",
-            (outcome, pnl_usdc, position_id),
-        )
+        if min_price_seen is not None:
+            conn.execute(
+                "UPDATE hedge_positions SET status = 'closed', outcome = ?, pnl_usdc = ?, "
+                "min_price_seen = ? WHERE id = ?",
+                (outcome, pnl_usdc, min_price_seen, position_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE hedge_positions SET status = 'closed', outcome = ?, pnl_usdc = ? WHERE id = ?",
+                (outcome, pnl_usdc, position_id),
+            )
 
 
 def get_unsettled_hedge_positions():
@@ -283,6 +297,10 @@ def init_db():
         for col, sql_type in _TRADES_MIGRATIONS:
             if col not in existing_trades:
                 conn.execute(f"ALTER TABLE trades ADD COLUMN {col} {sql_type}")
+        existing_hedge = {row[1] for row in conn.execute("PRAGMA table_info(hedge_positions)")}
+        for col, sql_type in _HEDGE_POSITIONS_MIGRATIONS:
+            if col not in existing_hedge:
+                conn.execute(f"ALTER TABLE hedge_positions ADD COLUMN {col} {sql_type}")
 
 
 def log_signal(market_slug: str, current_price: float, strike_price: float, decision,

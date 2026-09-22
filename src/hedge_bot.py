@@ -130,6 +130,11 @@ def _load_open_positions_from_db() -> None:
             storage.get_unsettled_hedge_positions():
         _open_positions[(market_slug, side)] = {
             "position_id": pos_id, "entry_shares": entry_shares, "entry_cost": entry_cost, "status": status,
+            # После рестарта историю "минимума с начала жизни позиции" мы
+            # теряем — берём цену входа как отправную точку (пессимистично
+            # недооценит просадку, если она уже была ДО рестарта, это
+            # известное и приемлемое ограничение исследовательского учёта).
+            "min_price_seen": entry_cost / entry_shares if entry_shares else None,
         }
         _touched_markets.add(market_slug)
     _positions_loaded = True
@@ -188,6 +193,7 @@ async def _execute_entry(market: ActiveMarket, side: str, token_id: str, price_h
     )
     _open_positions[(market.slug, side)] = {
         "position_id": position_id, "entry_shares": shares, "entry_cost": stake, "status": "open_unhedged",
+        "min_price_seen": price_cap,  # исследовательское наблюдение — не торгуем на этом, только считаем
     }
     _touched_markets.add(market.slug)
     await telegram_notify.notify(
@@ -248,11 +254,13 @@ async def _execute_take_profit(market: ActiveMarket, side: str, position_id: int
 
     _last_sell_failure.pop(key, None)
     proceeds = entry_shares * ref_price
-    entry_cost = _open_positions.get((market.slug, side), {}).get("entry_cost", 0.0)
+    pos_state = _open_positions.get((market.slug, side), {})
+    entry_cost = pos_state.get("entry_cost", 0.0)
+    min_price_seen = pos_state.get("min_price_seen")
     pnl = proceeds - entry_cost
 
     storage.mark_hedged(position_id, ref_price, entry_shares, proceeds, token_id)
-    storage.settle_hedge_position(position_id, "SOLD", pnl)
+    storage.settle_hedge_position(position_id, "SOLD", pnl, min_price_seen)
     _open_positions.pop((market.slug, side), None)  # закрыта сразу — убираем из зеркала
 
     emoji = "🟢" if pnl > 0 else "🔴"
@@ -314,11 +322,31 @@ async def check_market(market: ActiveMarket, timeframe: TimeframeProfile) -> Non
                 _count(market.asset, timeframe.label, "missed_entry_window")
             else:
                 _count(market.asset, timeframe.label, "waiting_for_entry")
-        elif existing["status"] == "open_unhedged" and price >= take_profit_price:
-            _count(market.asset, timeframe.label, "hedged")
-            await _execute_take_profit(market, side, existing["position_id"], existing["entry_shares"], token_id)
         elif existing["status"] == "open_unhedged":
-            _count(market.asset, timeframe.label, "waiting_for_hedge")
+            # Для решения "продавать" используем best_bid (что реально
+            # получим), а не best_ask (что заплатили бы за покупку) — иначе
+            # при широком спреде триггер срабатывает раньше, чем цена
+            # реальной продажи туда доходит (реальный случай, 2026-09-22:
+            # цель 0.95, а продажи срабатывали в диапазоне 0.84-0.97 —
+            # средняя маржа 29.8% вместо ожидаемых 35.7%).
+            sell_price = book_stream.best_bid(token_id)
+
+            # Исследовательское наблюдение (не торгуем на этом): держим
+            # минимальную цену, которую видела позиция за всё время жизни —
+            # чтобы потом честно посчитать, помог бы стоп-лосс на каком-то
+            # уровне или только резал бы позиции, которые в итоге
+            # отыгрались бы обратно. Чтение из памяти, не пишем в БД на
+            # каждый тик — запись случится один раз при закрытии позиции.
+            if sell_price is not None:
+                prev_min = existing.get("min_price_seen")
+                if prev_min is None or sell_price < prev_min:
+                    existing["min_price_seen"] = sell_price
+
+            if sell_price is not None and sell_price >= take_profit_price:
+                _count(market.asset, timeframe.label, "hedged")
+                await _execute_take_profit(market, side, existing["position_id"], existing["entry_shares"], token_id)
+            else:
+                _count(market.asset, timeframe.label, "waiting_for_hedge")
 
 
 async def settle_resolved() -> None:
@@ -342,7 +370,8 @@ async def settle_resolved() -> None:
         else:  # open_unhedged — не успели захеджировать до резолюции
             pnl = (entry_shares * 1.0 - entry_cost) if won else -entry_cost
 
-        storage.settle_hedge_position(pos_id, outcome, pnl)
+        min_price_seen = _open_positions.get((market_slug, side), {}).get("min_price_seen")
+        storage.settle_hedge_position(pos_id, outcome, pnl, min_price_seen)
         _open_positions.pop((market_slug, side), None)  # больше не открыта — убираем из зеркала в памяти
         emoji = "🟢" if pnl > 0 else "🔴"
         await telegram_notify.notify(
