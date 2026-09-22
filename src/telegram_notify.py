@@ -133,6 +133,7 @@ def _hedge_menu_markup() -> InlineKeyboardMarkup:
             row = []
     if row:
         rows.append(row)
+    rows.append([InlineKeyboardButton("✏️ Свой порог продажи", callback_data="hedgetrigger_custom")])
     rows.append([InlineKeyboardButton("— Размер ставки —", callback_data="noop")])
     row = []
     for val in HEDGE_STAKE_PRESETS:
@@ -489,6 +490,13 @@ async def _on_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"✅ Размер ставки хеджа: {value:.2f} USDC", reply_markup=_hedge_menu_markup(),
         )
+    elif _pending_input == "hedge_trigger":
+        value = min(0.99, max(runtime_state.get("hedge_entry_price") + 0.01, value))
+        runtime_state.set("hedge_trigger_price", value)
+        _pending_input = None
+        await update.message.reply_text(
+            f"✅ Порог продажи: {value:.2f}", reply_markup=_hedge_menu_markup(),
+        )
 
 
 # ------------------------------------------------------------- кнопки -----
@@ -570,6 +578,13 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val = float(data.split(":", 1)[1])
         runtime_state.set("hedge_trigger_price", val)
         await query.edit_message_text(f"✅ Порог продажи: {val:.2f}", reply_markup=_hedge_menu_markup())
+
+    elif data == "hedgetrigger_custom":
+        _pending_input = "hedge_trigger"
+        await query.edit_message_text(
+            "✏️ Напиши порог продажи следующим сообщением (число от 0 до 1), например: 0.92",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:hedge")]]),
+        )
 
     elif data.startswith("hedgestake_set:"):
         val = float(data.split(":", 1)[1])

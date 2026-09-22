@@ -53,6 +53,18 @@ log = logging.getLogger("hedge_bot")
 
 _last_warned_config: tuple | None = None  # чтобы не спамить одним и тем же предупреждением каждый тик
 
+# (market_slug, side) -> unix-время последней неудачной попытки продажи —
+# защита от бесконечного ретрая каждую секунду при повторяющейся ошибке.
+_last_sell_failure: dict[tuple[str, str], float] = {}
+
+# То же самое, но для входа — реальный случай, 2026-09-22: FOK-ордер на
+# HYPE не мог исполниться целиком (недостаточно ликвидности по нужной
+# цене), а позиция так и не создавалась (ордер падал ДО записи в
+# _open_positions/_touched_markets) — значит на следующем тике условие
+# входа снова выполнялось, и бот пытался заново каждую секунду, спамя
+# одной и той же ошибкой.
+_last_entry_failure: dict[tuple[str, str], float] = {}
+
 # Зеркало открытых позиций В ПАМЯТИ — (market_slug, side) -> dict с полями
 # position_id/entry_shares/entry_cost/status. Быстрый цикл (check_market,
 # раз в HEDGE_POLL_SECONDS x 12 потоков) читает ТОЛЬКО это, ни разу не
@@ -133,6 +145,11 @@ def _daily_loss_exceeded() -> bool:
 
 async def _execute_entry(market: ActiveMarket, side: str, token_id: str, price_hint: float,
                           timeframe: TimeframeProfile) -> None:
+    key = (market.slug, side)
+    last_fail = _last_entry_failure.get(key)
+    if last_fail is not None and time.time() - last_fail < 15:
+        return
+
     dry_run = runtime_state.get("dry_run")
     stake = runtime_state.get("hedge_stake_usdc")
 
@@ -159,10 +176,12 @@ async def _execute_entry(market: ActiveMarket, side: str, token_id: str, price_h
         try:
             resp = await polymarket_client.place_buy_order(token_id, price_cap, stake, tick)
         except Exception as exc:  # noqa: BLE001
-            await telegram_notify.notify(f"❌ Хедж-бот: ошибка входа ({market.slug}): {exc}")
+            _last_entry_failure[key] = time.time()
+            await telegram_notify.notify(f"❌ Хедж-бот: ошибка входа ({market.slug}): {exc}\nПовторю через 15с.")
             return
         order_id = polymarket_client.response_field(resp, "order_id") or str(resp)
 
+    _last_entry_failure.pop(key, None)
     shares = stake / price_cap
     position_id = storage.create_hedge_position(
         market.slug, market.asset, timeframe.label, side, price_cap, shares, stake, token_id, dry_run,
@@ -190,13 +209,29 @@ async def _execute_take_profit(market: ActiveMarket, side: str, position_id: int
     """
     dry_run = runtime_state.get("dry_run")
 
+    # Если недавно уже не удалось продать эту позицию — не долбим API и не
+    # спамим одной и той же ошибкой каждую секунду, даём паузу перед
+    # повторной попыткой (реальный случай, 2026-09-21: округление цены до
+    # 3 знаков вместо 2 роняло ордер на LIVE, и бот ретраил его каждую
+    # секунду бесконечно — сотни одинаковых сообщений об ошибке).
+    key = (market.slug, side)
+    last_fail = _last_sell_failure.get(key)
+    if last_fail is not None and time.time() - last_fail < 15:
+        return
+
     book = await polymarket_client.get_orderbook_cached(token_id, depth_levels=10)
     ref_price = book.best_bid
     if ref_price is None:
         return  # нет биды прямо сейчас (некому продать) — попробуем на следующем тике
 
+    tick = book.tick_size or book_stream.tick_size(token_id)
     # Защита от проскальзывания на продаже — не продаём дешевле этой цены.
-    min_price = round(max(ref_price - settings.HEDGE_LEG_MAX_SLIPPAGE, 0.01), 3)
+    # Выравниваем по шагу тика ВНИЗ (округление до N знаков без привязки к
+    # тику — та самая причина бага выше: Polymarket требует цену, кратную
+    # tick_size, не просто "не больше 2 знаков после запятой").
+    min_price = polymarket_client.round_price_for_buy(
+        max(ref_price - settings.HEDGE_LEG_MAX_SLIPPAGE, 0.01), tick,
+    )
 
     order_id = "dry-run"
     if not dry_run:
@@ -206,10 +241,12 @@ async def _execute_take_profit(market: ActiveMarket, side: str, position_id: int
         try:
             resp = await polymarket_client.place_sell_order(token_id, entry_shares, min_price)
         except Exception as exc:  # noqa: BLE001
-            await telegram_notify.notify(f"❌ Хедж-бот: ошибка продажи ({market.slug}): {exc}")
+            _last_sell_failure[key] = time.time()
+            await telegram_notify.notify(f"❌ Хедж-бот: ошибка продажи ({market.slug}): {exc}\nПовторю через 15с.")
             return
         order_id = polymarket_client.response_field(resp, "order_id") or str(resp)
 
+    _last_sell_failure.pop(key, None)
     proceeds = entry_shares * ref_price
     entry_cost = _open_positions.get((market.slug, side), {}).get("entry_cost", 0.0)
     pnl = proceeds - entry_cost
