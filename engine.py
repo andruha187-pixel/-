@@ -121,7 +121,7 @@ class Engine:
         return None
 
     def binance_move_bps(self, a, secs=5):
-        b = self.bn.buckets[a].as_list(30)
+        b = self.bn.buckets[a].as_list(int(secs) + 30)
         if len(b) < 2:
             return 0.0
         p0 = price_before(b, time.time() - secs)
@@ -213,6 +213,14 @@ class Engine:
         tgt = {"up": fu - S.min_edge / 2 - skew, "dn": (1 - fu) - S.min_edge / 2 + skew}
         out = {}
         spent = w["cost_up"] + w["cost_dn"]
+        # направленная защита: BTC падает → Up дешевеет и наш бид по Up «подбирают» (и наоборот)
+        falling = None
+        if S.side_guard_bps > 0:
+            mv = self.binance_move_bps(a, S.side_guard_sec)
+            if mv <= -S.side_guard_bps:
+                falling = "up"
+            elif mv >= S.side_guard_bps:
+                falling = "dn"
         free = self.cash - self.reserved()
         for side, other in (("up", "dn"), ("dn", "up")):
             q_s, q_o = w[f"qty_{side}"], w[f"qty_{other}"]
@@ -227,6 +235,10 @@ class Engine:
                 bound = S.hedge_max_pair - avg_o
                 price = min(max(price, bk[side]["bid"] + TICK), bound)
                 hedging = True
+            if side == falling and not hedging:
+                self._skip(a, f"защита стороны {side}")
+                out[side] = None
+                continue
             price = min(price, bk[side]["ask"] - TICK)       # только мейкер (post-only)
             price = min(price, bk[side]["bid"] + (TICK if S.improve >= 1 else 0))
             price = fl(price)

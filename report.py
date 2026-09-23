@@ -54,6 +54,15 @@ def build(settings, engine, since_hours=None):
             if len(mo):
                 L.append(f"Markout {lab}: средний {mo.mean()*100:+.2f}¢ (мед. {mo.median()*100:+.2f}¢), "
                          f"против нас в {_p((mo < 0).mean())} филлов")
+        hedge = np.where(f["side"] == "up", f["net_before"] < 0, f["net_before"] > 0)
+        for flag, lab in ((False, "открывающие"), (True, "выравнивающие")):
+            mo = (f.loc[hedge == flag, "mid60"] - f.loc[hedge == flag, "price"]).dropna()
+            if len(mo):
+                L.append(f"Markout 60с, {lab} филлы: {mo.mean()*100:+.2f}¢ ({len(mo)} шт)")
+        for k, g in f.groupby("kind"):
+            mo = (g["mid60"] - g["price"]).dropna()
+            if len(mo):
+                L.append(f"Markout 60с, исполнение «{k}»: {mo.mean()*100:+.2f}¢ ({len(mo)} шт)")
         fe = (f["fair"] - f["price"]).dropna()
         if len(fe):
             L.append(f"Цена филла vs справедливая: в среднем {fe.mean()*100:+.2f}¢ в нашу пользу")
