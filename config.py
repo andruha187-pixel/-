@@ -35,7 +35,7 @@ HIST_CONTROL_STEP = _i("HIST_CONTROL_STEP", 30)
 ROLE_BACKFILL_LAST = _i("ROLE_BACKFILL_LAST", 1500)          # скольким последним сделкам определить maker/taker
 
 # Анализ
-ANALYSIS_MAX_CONTROLS = _i("ANALYSIS_MAX_CONTROLS", 80000)
+ANALYSIS_MAX_CONTROLS = _i("ANALYSIS_MAX_CONTROLS", 50000)
 
 DB_PATH = os.getenv("DB_PATH", "data/profiler.db")
 OUT_DIR = os.getenv("OUT_DIR", "data/reports")

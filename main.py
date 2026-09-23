@@ -1,8 +1,9 @@
 import asyncio
+import json
 import logging
+import sys
 import time
 
-import analyze
 import db
 from backfill import run_backfill
 from config import ASSETS, REPORT_HOURS, WALLET
@@ -30,9 +31,20 @@ async def main():
             return
         async with report_lock:
             await tg.send("🧮 Собираю отчёт…")
+            # Отдельный процесс: если анализу не хватит памяти, убьют его, а не весь бот
             try:
-                path, caption, _ = await asyncio.to_thread(analyze.build_report)  # CPU — не в event loop
-                await tg.send_file(path, caption)
+                p = await asyncio.create_subprocess_exec(
+                    sys.executable, "-u", "report_cli.py",
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+                out, err = await p.communicate()
+                if p.returncode == 0:
+                    res = json.loads(out.decode().strip().splitlines()[-1])
+                    await tg.send_file(res["path"], res["caption"])
+                elif p.returncode in (-9, 137):
+                    await tg.send("⚠️ Отчёту не хватило памяти (процесс убит системой). "
+                                  "Бот продолжает работать. Уменьши ANALYSIS_MAX_CONTROLS или подними план Render.")
+                else:
+                    await tg.send("⚠️ Ошибка отчёта:\n" + err.decode()[-1500:])
             except Exception as e:
                 log.exception("report")
                 await tg.send(f"⚠️ Ошибка отчёта: {e}")
@@ -70,11 +82,13 @@ async def main():
 
     async def backfill_task():
         await asyncio.sleep(10)
-        try:
-            await run_backfill(tg)
-        except Exception as e:
-            log.exception("backfill")
-            await tg.send(f"⚠️ Backfill упал: {e}. Перезапуск продолжит с того же места.")
+        while True:  # повторные проходы добирают новые окна и те, что упали по сети
+            try:
+                await run_backfill(tg)
+            except Exception as e:
+                log.exception("backfill")
+                await tg.send(f"⚠️ Backfill упал: {e}. Следующий проход продолжит с того же места.")
+            await asyncio.sleep(1800)
 
     await tg.send(f"🔎 Профайлер запущен\nЦель: {WALLET}\nАктивы: {', '.join(ASSETS)}\n"
                   f"Команды: /report /status /last")

@@ -34,11 +34,7 @@ def _jl(x):
     return x or []
 
 
-async def gamma_market(slug):
-    d = await get_json(f"{GAMMA}/markets", {"slug": slug}, quiet=True)
-    if not d:
-        return None
-    m = d[0] if isinstance(d, list) else d
+def _parse_market(m, slug):
     toks = _jl(m.get("clobTokenIds"))
     outs = [str(o).lower() for o in _jl(m.get("outcomes"))]
     prices = _jl(m.get("outcomePrices"))
@@ -59,6 +55,29 @@ async def gamma_market(slug):
     if up and up == dn:  # известный баг API (видели на HYPE)
         up = dn = None
     return {"slug": slug, "up": up, "dn": dn, "closed": bool(m.get("closed")), "winner": winner}
+
+
+async def gamma_market(slug):
+    """dict — нашли; {} — рынок точно не существует; None — сеть/лимиты (повторить позже)."""
+    net_fail = False
+    for url, params in ((f"{GAMMA}/markets", {"slug": slug}),
+                        (f"{GAMMA}/markets", {"slug": slug, "closed": "true"}),
+                        (f"{GAMMA}/events", {"slug": slug})):
+        d = await get_json(url, params, quiet=True)
+        if d is None:
+            net_fail = True
+            continue
+        items = d if isinstance(d, list) else [d]
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            ms = it.get("markets") if "markets" in it else [it]
+            for m in ms or []:
+                if m.get("slug") in (slug, None) or len(ms) == 1:
+                    r = _parse_market(m, slug)
+                    if r["up"]:
+                        return r
+    return None if net_fail else {}
 
 
 async def prices_history(token, start, end):

@@ -21,6 +21,7 @@ from wallet_watch import activity_to_row, role_backfill
 
 log = logging.getLogger("backfill")
 OFFSET_CAP = 2500
+FAIL = {"net": 0, "missing": 0}
 
 
 async def fetch_range(a, b):
@@ -98,7 +99,12 @@ def hist_feat(start, t, b, k1t, k1, h_up, h_dn, res):
 async def process_window(slug, k1t, k1, traded):
     asset, start = parse_slug(slug)
     gm = await gamma_market(slug)
-    if not gm or not gm["up"]:
+    if gm is None:          # сеть/лимит — оставляем в очереди, не помечаем «нет данных»
+        FAIL["net"] += 1
+        await asyncio.sleep(2)
+        return
+    if not gm:
+        FAIL["missing"] += 1
         db.execute("UPDATE windows SET hist_done=2 WHERE slug=?", (slug,))
         return
     db.upsert_window(slug, asset, start, gm["up"], gm["dn"], gm["winner"])
@@ -152,7 +158,10 @@ async def run_backfill(tg):
             db.meta_set("bf_until", day)
         n = db.query("SELECT COUNT(*) FROM trades")[0][0]
         await tg.send(f"✅ История событий загружена: {n} записей (+{total} за этот проход)")
-    # 2) окна
+    # 2) окна (разово возвращаем в очередь окна, ошибочно помеченные «нет данных» старой версией)
+    if db.meta_get("reset_h2_v2") != "1":
+        db.execute("UPDATE windows SET hist_done=0 WHERE hist_done=2")
+        db.meta_set("reset_h2_v2", "1")
     rows = db.query("SELECT DISTINCT slug FROM trades WHERE slug LIKE '%-updown-15m-%'")
     traded = set()
     for (slug,) in rows:
@@ -180,12 +189,15 @@ async def run_backfill(tg):
     if not todo:
         await role_backfill(ROLE_BACKFILL_LAST)
         return
-    await tg.send(f"⏳ Восстанавливаю рыночный контекст: {len(todo_t)} окон с его сделками + "
+    loud = len(todo) >= 20
+    if loud:
+        await tg.send(f"⏳ Восстанавливаю рыночный контекст: {len(todo_t)} окон с его сделками + "
                   f"{len(todo_nt)} контрольных. Это долго (десятки минут), бот при этом уже следит вживую.")
     # 3) 1m свечи оптом для ТА
     k1d = {}
+    kl_since = min(parse_slug(s)[1] for s, _ in todo) - 86400  # только нужный диапазон — экономим память
     for a in ASSETS:
-        k1d[a] = parse_klines(await bulk_klines(a, "1m", since - 86400, now))
+        k1d[a] = parse_klines(await bulk_klines(a, "1m", kl_since, now))
     k1t = {a: [c[0] for c in k1d[a]] for a in ASSETS}
     sem = asyncio.Semaphore(BACKFILL_CONCURRENCY)
     done = 0
@@ -206,4 +218,7 @@ async def run_backfill(tg):
         await asyncio.gather(*(one(s, tr) for s, tr in todo[i:i + 100]))
     await role_backfill(ROLE_BACKFILL_LAST)
     db.meta_set("bf_done_ts", int(time.time()))
-    await tg.send("✅ Исторический контекст готов. Жми /report — первый полный разбор стратегии.")
+    left = db.query("SELECT COUNT(*) FROM windows WHERE hist_done=0")[0][0]
+    if loud:
+        await tg.send(f"✅ Проход по истории завершён. Сетевых сбоев: {FAIL['net']}, рынков не найдено: "
+                  f"{FAIL['missing']}, осталось в очереди: {left}. Жми /report.")

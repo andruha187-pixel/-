@@ -32,27 +32,59 @@ def _expand(df):
     return pd.concat([df.drop(columns=["feat"]), f], axis=1)
 
 
+BASE_COLS = "ts,type,asset,slug,outcome,side,price,size,usdc,role"
+CAT = ["type", "asset", "slug", "outcome", "side", "role"]
+
+
+def _compact(df):
+    for c in CAT:
+        if c in df:
+            df[c] = df[c].astype("category")
+    for c in ("price", "size", "usdc"):
+        if c in df:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float32")
+    return df
+
+
+def con_path():
+    return DB_PATH
+
+
 def load():
+    """Экономно по памяти: сырые сделки без JSON-признаков, признаки — только там, где нужны."""
     con = sqlite3.connect(DB_PATH)
-    tr = _expand(pd.read_sql("SELECT * FROM trades", con))
-    wn = pd.read_sql("SELECT * FROM windows", con)
+    # первый вход в каждую сторону каждого окна — с признаками
+    first = _expand(pd.read_sql(
+        "SELECT t.ts,t.type,t.asset,t.slug,t.outcome,t.side,t.price,t.size,t.usdc,t.role,t.feat FROM trades t "
+        "JOIN (SELECT slug, outcome, MIN(ts) m FROM trades WHERE type='TRADE' AND side='BUY' GROUP BY slug, outcome) f "
+        "ON t.slug=f.slug AND t.outcome=f.outcome AND t.ts=f.m WHERE t.type='TRADE' AND t.side='BUY' "
+        "GROUP BY t.slug, t.outcome", con))
+    # выборка всех покупок с признаками (для раздела «направление»)
+    n = con.execute("SELECT COUNT(*) FROM trades WHERE type='TRADE' AND side='BUY' AND length(feat)>40").fetchone()[0]
+    k = max(1, int(np.ceil(n / 25000)))
+    buys_f = _expand(pd.read_sql(
+        "SELECT ts,slug,outcome,price,feat FROM trades WHERE type='TRADE' AND side='BUY' AND length(feat)>40 "
+        "AND abs(random()) % ? = 0", con, params=(k,)))
+    # свежие сделки для CSV
+    recent = _expand(pd.read_sql(
+        f"SELECT {BASE_COLS},tx,feat FROM trades WHERE ts > ? ORDER BY ts DESC LIMIT 60000",
+        con, params=(time.time() - 3 * 86400,)))
+    wn = pd.read_sql("SELECT slug, asset, start, winner FROM windows", con)
     parts = []
     for src in ("live", "hist"):
         n = con.execute("SELECT COUNT(*) FROM snapshots WHERE src=?", (src,)).fetchone()[0]
-        if n > ANALYSIS_MAX_CONTROLS:
-            q = "SELECT * FROM snapshots WHERE src=? AND abs(random()) % ? = 0"
-            parts.append(pd.read_sql(q, con, params=(src, int(np.ceil(n / ANALYSIS_MAX_CONTROLS)))))
-        else:
-            parts.append(pd.read_sql("SELECT * FROM snapshots WHERE src=?", con, params=(src,)))
+        k = max(1, int(np.ceil(n / ANALYSIS_MAX_CONTROLS)))
+        parts.append(pd.read_sql("SELECT * FROM snapshots WHERE src=? AND abs(random()) % ? = 0",
+                                 con, params=(src, k)))
     con.close()
-    sn = pd.concat(parts, ignore_index=True)
-    sn = _expand(sn)
+    sn = _expand(pd.concat(parts, ignore_index=True))
     if "ts" in sn:
         sn["ts"] = pd.to_numeric(sn["ts"], errors="coerce")
-    for c in ("price", "size", "usdc", "ts"):
-        if c in tr:
-            tr[c] = pd.to_numeric(tr[c], errors="coerce")
-    return tr, wn, sn
+    for d in (first, buys_f, recent):
+        for c in ("price", "size", "usdc", "ts"):
+            if c in d:
+                d[c] = pd.to_numeric(d[c], errors="coerce")
+    return con_path(), first, buys_f, recent, wn, sn
 
 
 # ---------------- нормализация «в сторону выбранного исхода» ----------------
@@ -98,43 +130,31 @@ def sidefy(df, is_up):
 
 
 # ---------------- PnL по окнам ----------------
-def window_pnl(tr, wn):
-    t = tr[tr["slug"].fillna("").str.contains("-updown-15m-")].sort_values("ts")
-    rows = []
-    for slug, g in t.groupby("slug"):
-        cash, sh, buy_usd, nb, ns = 0.0, {"up": 0.0, "down": 0.0}, 0.0, 0, 0
-        cost = {"up": 0.0, "down": 0.0}
-        qty = {"up": 0.0, "down": 0.0}
-        for r in g.itertuples(index=False):
-            sz, us, oc = (r.size or 0.0), (r.usdc or 0.0), (r.outcome or "")
-            if r.type == "TRADE" and oc in sh:
-                if r.side == "BUY":
-                    cash -= us
-                    sh[oc] += sz
-                    buy_usd += us
-                    nb += 1
-                    cost[oc] += us
-                    qty[oc] += sz
-                elif r.side == "SELL":
-                    cash += us
-                    sh[oc] -= sz
-                    ns += 1
-            elif r.type == "MERGE":
-                cash += us
-                sh["up"] -= sz
-                sh["down"] -= sz
-            elif r.type == "SPLIT":
-                cash -= us
-                sh["up"] += sz
-                sh["down"] += sz
-        rows.append({"slug": slug, "cash": cash, "sh_up": sh["up"], "sh_down": sh["down"], "buy_usd": buy_usd,
-                     "n_buys": nb, "n_sells": ns, "avg_up": cost["up"] / qty["up"] if qty["up"] else np.nan,
-                     "avg_dn": cost["down"] / qty["down"] if qty["down"] else np.nan,
-                     "qty_up": qty["up"], "qty_dn": qty["down"],
-                     "merged": int((g["type"] == "MERGE").any())})
-    pw = pd.DataFrame(rows)
+UD = "slug LIKE '%-updown-15m-%'"
+
+
+def window_pnl(con, wn):
+    """Агрегация прямо в SQLite — Python не держит миллион строк в памяти."""
+    pw = pd.read_sql(f"""
+      SELECT slug,
+        SUM(CASE WHEN type='TRADE' AND side='BUY' THEN -usdc WHEN type='TRADE' AND side='SELL' THEN usdc
+                 WHEN type='MERGE' THEN usdc WHEN type='SPLIT' THEN -usdc ELSE 0 END) cash,
+        SUM(CASE WHEN type='TRADE' AND outcome='up' THEN (CASE side WHEN 'BUY' THEN size WHEN 'SELL' THEN -size ELSE 0 END)
+                 WHEN type='MERGE' THEN -size WHEN type='SPLIT' THEN size ELSE 0 END) sh_up,
+        SUM(CASE WHEN type='TRADE' AND outcome='down' THEN (CASE side WHEN 'BUY' THEN size WHEN 'SELL' THEN -size ELSE 0 END)
+                 WHEN type='MERGE' THEN -size WHEN type='SPLIT' THEN size ELSE 0 END) sh_down,
+        SUM(CASE WHEN type='TRADE' AND side='BUY' THEN usdc ELSE 0 END) buy_usd,
+        SUM(type='TRADE' AND side='BUY') n_buys, SUM(type='TRADE' AND side='SELL') n_sells,
+        SUM(CASE WHEN type='TRADE' AND side='BUY' AND outcome='up' THEN size ELSE 0 END) qty_up,
+        SUM(CASE WHEN type='TRADE' AND side='BUY' AND outcome='down' THEN size ELSE 0 END) qty_dn,
+        SUM(CASE WHEN type='TRADE' AND side='BUY' AND outcome='up' THEN usdc ELSE 0 END) cost_up,
+        SUM(CASE WHEN type='TRADE' AND side='BUY' AND outcome='down' THEN usdc ELSE 0 END) cost_dn,
+        SUM(type='MERGE') merged
+      FROM trades WHERE {UD} GROUP BY slug""", con)
     if pw.empty:
         return pw
+    pw["avg_up"] = pw["cost_up"] / pw["qty_up"].replace(0, np.nan)
+    pw["avg_dn"] = pw["cost_dn"] / pw["qty_dn"].replace(0, np.nan)
     pw = pw.merge(wn[["slug", "asset", "start", "winner"]], on="slug", how="left")
     pw["payout"] = np.where(pw["winner"] == "up", pw["sh_up"],
                             np.where(pw["winner"] == "down", pw["sh_down"], np.nan))
@@ -142,6 +162,16 @@ def window_pnl(tr, wn):
     pw["both_sides"] = (pw["qty_up"] > 0) & (pw["qty_dn"] > 0)
     pw["pair_cost"] = pw["avg_up"] + pw["avg_dn"]
     return pw
+
+
+def wq(vals, weights, q):
+    """Квантиль по гистограмме (значение, количество)."""
+    v, w = np.asarray(vals, float), np.asarray(weights, float)
+    if not len(v) or w.sum() == 0:
+        return np.nan
+    o = np.argsort(v)
+    c = np.cumsum(w[o]) / w.sum()
+    return float(v[o][np.searchsorted(c, q)])
 
 
 # ---------------- статистика ----------------
@@ -226,19 +256,19 @@ def tree_rules(E, C, title):
     return "\n".join(lines) + "\n", pd.DataFrame(rr)
 
 
-def entries_controls(tr, sn, src):
-    buys = tr[(tr["type"] == "TRADE") & (tr["side"] == "BUY") & tr["outcome"].isin(["up", "down"])]
-    if "src" not in buys:
-        return pd.DataFrame(), pd.DataFrame(), buys.iloc[:0]
-    e = buys[buys["src"] == src].sort_values("ts").drop_duplicates(["slug", "outcome"], keep="first")
+def entries_controls(first, sn, src):
+    """first — первый вход в каждую сторону окна (с признаками)."""
+    if first.empty or "src" not in first:
+        return pd.DataFrame(), pd.DataFrame(), first.iloc[:0]
+    e = first[(first["src"] == src) & first["outcome"].isin(["up", "down"])]
     E = sidefy(e, e["outcome"] == "up")
     c = sn[sn["src"] == src] if "src" in sn else sn.iloc[:0]
     if c.empty:
         return E, pd.DataFrame(), e
-    first = buys.groupby(["slug", "outcome"])["ts"].min().to_dict()
+    fmap = first.set_index(["slug", "outcome"])["ts"].to_dict()
     Cs = []
     for side in ("up", "down"):
-        fe = pd.Series([first.get((s, side), np.nan) for s in c["slug"]], index=c.index, dtype=float)
+        fe = pd.Series([fmap.get((s, side), np.nan) for s in c["slug"]], index=c.index, dtype=float)
         keep = fe.isna() | (pd.to_numeric(c["ts"]) < fe - DECISION_LAG_SEC - 10)
         cc = c[keep]
         Cs.append(sidefy(cc, np.full(len(cc), side == "up")))
@@ -252,25 +282,31 @@ def _pct(x):
 # ---------------- отчёт ----------------
 def build_report():
     t0 = time.time()
-    tr, wn, sn = load()
+    _, first, buys_f, recent, wn, sn = load()
+    con = sqlite3.connect(DB_PATH)
+    q = lambda sql, *p: con.execute(sql, p).fetchall()
     L = [f"# Профиль кошелька {WALLET}", f"Сгенерировано: {time.strftime('%Y-%m-%d %H:%M UTC', time.gmtime())}", ""]
     csvs = {}
-    if tr.empty:
+    n_all = q("SELECT COUNT(*) FROM trades")[0][0]
+    if not n_all:
+        con.close()
         return _write(L + ["Сделок пока нет."], csvs, "Сделок пока нет.")
-
-    tr["dt"] = pd.to_datetime(tr["ts"], unit="s", utc=True)
-    L += ["## 1. Обзор",
-          f"Период: {tr['dt'].min():%Y-%m-%d} → {tr['dt'].max():%Y-%m-%d}",
-          "События по типам: " + ", ".join(f"{k}={v}" for k, v in tr["type"].value_counts().items()), ""]
-    ud = tr[tr["slug"].fillna("").str.contains("-updown-15m-")]
-    other = tr[(tr["type"] == "TRADE") & ~tr.index.isin(ud.index)]
-    L.append(f"Сделок в 15m Up/Down: {int((ud['type']=='TRADE').sum())}; в других рынках: {len(other)}")
-    if len(other):
-        L.append("Другие рынки (топ): " + ", ".join(f"{k}({v})" for k, v in other["slug"].value_counts().head(8).items()))
-    L.append("По активам: " + ", ".join(f"{k}={v}" for k, v in ud[ud["type"] == "TRADE"]["asset"].value_counts().items()))
+    t_min, t_max = q("SELECT MIN(ts), MAX(ts) FROM trades")[0]
+    fmt = lambda x: time.strftime("%Y-%m-%d", time.gmtime(x))
+    L += ["## 1. Обзор", f"Период: {fmt(t_min)} → {fmt(t_max)}",
+          "События по типам: " + ", ".join(f"{k}={v}" for k, v in q("SELECT type, COUNT(*) FROM trades GROUP BY type ORDER BY 2 DESC")), ""]
+    n_ud = q(f"SELECT COUNT(*) FROM trades WHERE type='TRADE' AND {UD}")[0][0]
+    other = q(f"SELECT slug, COUNT(*) FROM trades WHERE type='TRADE' AND NOT ({UD}) GROUP BY slug ORDER BY 2 DESC LIMIT 8")
+    n_oth = q(f"SELECT COUNT(*) FROM trades WHERE type='TRADE' AND NOT ({UD})")[0][0]
+    L.append(f"Сделок в 15m Up/Down: {n_ud}; в других рынках: {n_oth}")
+    if other:
+        L.append("Другие рынки (топ): " + ", ".join(f"{k}({v})" for k, v in other))
+    L.append("По активам: " + ", ".join(f"{k}={v}" for k, v in q(f"SELECT asset, COUNT(*) FROM trades WHERE type='TRADE' AND {UD} GROUP BY asset")))
+    mv = q(f"SELECT strftime('%Y-%m', ts, 'unixepoch'), COUNT(*), ROUND(SUM(usdc)) FROM trades WHERE type='TRADE' AND {UD} GROUP BY 1")
+    L.append("Оборот по месяцам: " + ", ".join(f"{m}: {n} сделок/${v:,.0f}" for m, n, v in mv))
 
     # --- PnL
-    pw = window_pnl(tr, wn)
+    pw = window_pnl(con, wn)
     res = pw.dropna(subset=["pnl"]) if not pw.empty else pw
     L += ["", "## 2. Результат (пересчёт по окнам, до резолва)"]
     if not res.empty:
@@ -278,72 +314,87 @@ def build_report():
                  f"Плюсовых окон: {_pct((res['pnl'] > 0).mean())}. Оборот покупок: ${res['buy_usd'].sum():,.0f}. "
                  f"ROI на оборот: {_pct(res['pnl'].sum() / max(res['buy_usd'].sum(), 1))}")
         by = res.groupby("asset")["pnl"].agg(["sum", "count", lambda s: (s > 0).mean()])
-        for a, r in by.iterrows():
-            L.append(f"- {a}: ${r['sum']:,.0f} за {int(r['count'])} окон, плюсовых {_pct(r.iloc[2])}")
+        for a_, r in by.iterrows():
+            L.append(f"- {a_}: ${r['sum']:,.0f} за {int(r['count'])} окон, плюсовых {_pct(r.iloc[2])}")
         res2 = res.copy()
         res2["month"] = pd.to_datetime(res2["start"], unit="s").dt.strftime("%Y-%m")
-        L.append("По месяцам: " + ", ".join(f"{m}: ${v:,.0f}" for m, v in res2.groupby("month")["pnl"].sum().items()))
-        csvs["windows_pnl.csv"] = pw
+        L.append("PnL по месяцам: " + ", ".join(f"{m}: ${v:,.0f}" for m, v in res2.groupby("month")["pnl"].sum().items()))
+        # чем заработаны деньги: гарантированная часть (пары) против направленной
+        pr = res.copy()
+        pr["pairs"] = np.minimum(pr["qty_up"], pr["qty_dn"])
+        pr["locked"] = pr["pairs"] * (1 - pr["pair_cost"].fillna(1))
+        L.append(f"Из PnL: «запертая» маржа пар Up+Down ≈ ${pr['locked'].sum():,.0f}, "
+                 f"остальное — направленная часть (перекос позиции) ≈ ${res['pnl'].sum() - pr['locked'].sum():,.0f}")
     else:
         L.append(f"Победители окон ещё не подтянуты (окон со сделками: {len(pw)}). "
                  "PnL появится после этапа «Восстанавливаю рыночный контекст».")
+    if not pw.empty:
+        csvs["windows_pnl.csv"] = pw
 
     # --- Почерк
-    t = ud[ud["type"] == "TRADE"].copy()
-    b = t[t["side"] == "BUY"]
     L += ["", "## 3. Почерк (как он торгует технически)"]
     verdict = []
     if not pw.empty:
         bs = pw["both_sides"].mean()
         pc = pw.loc[pw["both_sides"], "pair_cost"]
         L.append(f"Окон, где покупал ОБЕ стороны: {_pct(bs)}; средняя стоимость пары Up+Down: "
-                 f"{pc.mean():.3f} (медиана {pc.median():.3f})" if len(pc) else f"Окон с обеими сторонами: {_pct(bs)}")
-        L.append(f"MERGE (сливает пары в $1): {int((tr['type']=='MERGE').sum())}, REDEEM: {int((tr['type']=='REDEEM').sum())}, "
+                 f"{pc.mean():.3f} (медиана {pc.median():.3f}); пар дороже $1: {_pct((pc > 1).mean())}"
+                 if len(pc) else f"Окон с обеими сторонами: {_pct(bs)}")
+        imb = (pw["qty_up"] - pw["qty_dn"]).abs() / (pw["qty_up"] + pw["qty_dn"]).replace(0, np.nan)
+        L.append(f"Перекос позиции в окне |Up−Down|/(Up+Down): медиана {_pct(imb.median())}, p90 {_pct(imb.quantile(.9))}")
+        L.append(f"MERGE: {int(pw['merged'].sum())}, REDEEM: {q('SELECT COUNT(*) FROM trades WHERE type=?', 'REDEEM')[0][0]}, "
                  f"окон с продажами до конца: {_pct((pw['n_sells'] > 0).mean())}")
         if bs > 0.5 and len(pc) and pc.median() < 1:
-            verdict.append("АРБИТРАЖ ПОЛНОГО СЕТА: покупает Up+Down суммарно дешевле $1")
-    if "role" in t and t["role"].notna().any():
-        rv = t["role"].value_counts(normalize=True)
-        L.append("Роль в сделках (on-chain): " + ", ".join(f"{k} {_pct(v)}" for k, v in rv.items()))
-        if rv.get("maker", 0) > 0.6:
+            verdict.append("НАБОР ОБЕИХ СТОРОН ДЕШЕВЛЕ $1 (арбитраж/мейкинг вокруг 0.50)")
+        fpw = pw["n_buys"] + pw["n_sells"]
+        L.append(f"Филлов на окно: медиана {fpw.median():.0f}, p90 {fpw.quantile(.9):.0f}, макс {fpw.max():.0f}")
+    rv = q("SELECT role, COUNT(*) FROM trades WHERE type='TRADE' AND role IS NOT NULL GROUP BY role")
+    if rv:
+        tot = sum(v for _, v in rv)
+        L.append("Роль в сделках (on-chain): " + ", ".join(f"{k} {_pct(v / tot)}" for k, v in rv))
+        mk = sum(v for k, v in rv if k == "maker") / tot
+        if mk > 0.6:
             verdict.append("МАРКЕТ-МЕЙКЕР: в основном исполняются его лимитки")
-    if len(t):
-        fpw = t.groupby("slug").size()
-        L.append(f"Филлов на окно: медиана {fpw.median():.0f}, p90 {fpw.quantile(.9):.0f}, макс {fpw.max()}")
-        gaps = t.sort_values("ts").groupby("slug")["ts"].diff().dropna()
-        if len(gaps):
-            L.append(f"Интервал между филлами внутри окна: медиана {gaps.median():.0f}с; в ту же секунду: {_pct((gaps == 0).mean())}")
-        sz = t["size"].round(2).value_counts(normalize=True).head(6)
-        L.append("Самые частые размеры (шт): " + ", ".join(f"{k:g} ({_pct(v)})" for k, v in sz.items()))
-        L.append(f"Сумма филла: медиана ${t['usdc'].median():.2f}, p90 ${t['usdc'].quantile(.9):.2f}, макс ${t['usdc'].max():.0f}")
-        pb = pd.cut(b["price"], [0, .1, .2, .3, .4, .5, .6, .7, .8, .85, .9, .95, .97, .99, 1.0])
-        L.append("")
-        L.append("**Цена покупки → доля объёма и винрейт филла (исход = победитель):**")
-        bb = b.merge(wn[["slug", "winner"]], on="slug", how="left")
-        bb["won"] = np.where(bb["winner"].isna(), np.nan, (bb["outcome"] == bb["winner"]).astype(float))
-        bb["bucket"] = pd.cut(bb["price"], pb.cat.categories)
-        g = bb.groupby("bucket", observed=True).agg(n=("price", "size"), usd=("usdc", "sum"),
-                                                     win=("won", "mean"), avgp=("price", "mean"))
+    gh = q(f"SELECT g, COUNT(*) FROM (SELECT ts - LAG(ts) OVER (PARTITION BY slug ORDER BY ts) g FROM trades "
+           f"WHERE type='TRADE' AND {UD}) WHERE g IS NOT NULL GROUP BY g")
+    if gh:
+        gv, gw = zip(*gh)
+        L.append(f"Интервал между филлами внутри окна: медиана {wq(gv, gw, .5):.0f}с; "
+                 f"в ту же секунду: {_pct(sum(w for v, w in gh if v == 0) / sum(gw))}")
+    sz = q(f"SELECT ROUND(size,2), COUNT(*) FROM trades WHERE type='TRADE' AND {UD} GROUP BY 1 ORDER BY 2 DESC LIMIT 6")
+    if sz:
+        L.append("Самые частые размеры (шт): " + ", ".join(f"{k:g} ({_pct(v / n_ud)})" for k, v in sz))
+    uh = q(f"SELECT ROUND(usdc,1), COUNT(*) FROM trades WHERE type='TRADE' AND {UD} GROUP BY 1")
+    if uh:
+        uv, uw = zip(*uh)
+        L.append(f"Сумма филла: медиана ${wq(uv, uw, .5):.2f}, p90 ${wq(uv, uw, .9):.2f}, макс ${max(uv):.0f}")
+    g = pd.read_sql(f"""SELECT MIN(CAST(t.price*20 AS INT), 19) b, COUNT(*) n, SUM(t.usdc) usd, AVG(t.price) avgp,
+          AVG(CASE WHEN w.winner IS NULL THEN NULL WHEN t.outcome=w.winner THEN 1.0 ELSE 0.0 END) win
+        FROM trades t LEFT JOIN windows w ON t.slug=w.slug
+        WHERE t.type='TRADE' AND t.side='BUY' AND t.{UD} GROUP BY 1 ORDER BY 1""", con)
+    if len(g):
         g["edge"] = g["win"] - g["avgp"]
-        for k, r in g.iterrows():
-            L.append(f"- {k}: {int(r['n'])} филлов, ${r['usd']:,.0f}, винрейт {_pct(r['win'])}, "
-                     f"ср.цена {r['avgp']:.3f}, реальный edge {r['edge']*100:+.1f}пп" if pd.notna(r['win']) else
-                     f"- {k}: {int(r['n'])} филлов, ${r['usd']:,.0f}")
-        csvs["price_buckets.csv"] = g.reset_index()
-        if "sec_left" in b:
-            sl = pd.to_numeric(b["sec_left"], errors="coerce")
-            cut = pd.cut(sl, [-1e9, 0, 30, 60, 120, 180, 300, 450, 600, 900],
-                         labels=["до старта", "0-30", "30-60", "60-120", "120-180", "180-300", "300-450",
-                                 "450-600", "600-900"])
-            L.append("Когда покупает (сек до конца окна): " +
-                     ", ".join(f"{k}: {_pct(v)}" for k, v in cut.value_counts(normalize=True).sort_index().items()))
-        if "window_offset" in b:
-            L.append(f"Покупки НЕ в текущем окне (заранее): {_pct(b['window_offset'].notna().mean())}")
+        L += ["", "**Цена покупки → винрейт филла и реальный edge (винрейт − средняя цена):**"]
+        for r in g.itertuples():
+            rng = f"{r.b/20:.2f}-{(r.b+1)/20:.2f}"
+            L.append(f"- {rng}: {r.n} филлов, ${r.usd:,.0f}, винрейт {_pct(r.win)}, ср.цена {r.avgp:.3f}, "
+                     f"edge {r.edge*100:+.1f}пп" if pd.notna(r.win) else f"- {rng}: {r.n} филлов, ${r.usd:,.0f}")
+        csvs["price_buckets.csv"] = g
+    tl = q(f"""SELECT CASE WHEN sl<=0 THEN 'после конца' WHEN sl<=60 THEN '0-60' WHEN sl<=180 THEN '60-180'
+               WHEN sl<=300 THEN '180-300' WHEN sl<=600 THEN '300-600' WHEN sl<=900 THEN '600-900' ELSE 'до старта' END,
+               COUNT(*) FROM (SELECT CAST(substr(slug, -10) AS INTEGER) + 900 - ts sl FROM trades
+               WHERE type='TRADE' AND side='BUY' AND {UD}) GROUP BY 1""")
+    if tl:
+        tot = sum(v for _, v in tl)
+        order = ["до старта", "600-900", "300-600", "180-300", "60-180", "0-60", "после конца"]
+        d_ = dict(tl)
+        L.append("Когда покупает (сек до конца окна): " + ", ".join(f"{k}: {_pct(d_[k] / tot)}" for k in order if k in d_))
+    con.close()
 
     # --- Направление
     L += ["", "## 4. Логика направления (какую сторону берёт)"]
     for src in ("live", "hist"):
-        bs_ = b[b["src"] == src] if "src" in b else b.iloc[:0]
+        bs_ = buys_f[buys_f["src"] == src] if "src" in buys_f else buys_f.iloc[:0]
         if len(bs_) < 10:
             continue
         S = sidefy(bs_, bs_["outcome"] == "up")
@@ -361,7 +412,7 @@ def build_report():
         L.append("- " + "; ".join(parts))
         if "my_delta_bps" in S and not any(v.startswith("ПОЗДНИЙ") for v in verdict):
             al = (S["my_delta_bps"] > 0).mean()
-            if al > 0.85 and b["price"].median() > 0.75:
+            if al > 0.85 and bs_["price"].median() > 0.75:
                 verdict.append("ПОЗДНИЙ ФАВОРИТ: докупает уже выигрывающую сторону по высокой цене")
             m5 = (S.get("my_ret5s_bps", pd.Series(dtype=float)) > 0).mean()
             if m5 > 0.7 and not any(v.startswith("ЛАТЕНТ") for v in verdict):
@@ -373,7 +424,7 @@ def build_report():
              "выбранного исхода (my_delta_bps>0 = цена на стороне его ставки).")
     for src, title in (("live", "Живые данные (полный набор: стакан PM, Chainlink, биржи)"),
                        ("hist", "История (Binance 1s + цены PM)")):
-        E, C, _ = entries_controls(tr, sn, src)
+        E, C, _ = entries_controls(first, sn, src)
         if E.empty or C.empty:
             L.append(f"\n### {title}\nПока нет данных.")
             continue
@@ -392,24 +443,28 @@ def build_report():
     L += ["", "## 6. Гипотеза стиля (автоматически)"]
     L += [f"- {v}" for v in verdict] or ["- Однозначного паттерна нет — нужна ручная разборка CSV."]
 
-    # --- CSV входов
-    keep = [c for c in ["dt", "ts", "source", "type", "asset", "slug", "outcome", "side", "price", "size", "usdc",
-                        "role", "tx"] if c in tr]
-    ent = tr[keep].copy()
-    if len(b):
-        S = sidefy(b, b["outcome"] == "up")
-        ent = ent.join(S, how="left")
-    raw = [c for c in tr.columns if c not in ent.columns and c not in ("key", "detected_ts")]
-    ent = ent.join(tr[raw], how="left").sort_values("ts")
-    csvs["trades_enriched.csv"] = ent
-    csvs["trades_last_4h.csv"] = ent[ent["ts"] > time.time() - 4 * 3600]
+    # --- CSV: свежие сделки (3 дня) с признаками + первые входы за всю историю
+    def _enrich(df):
+        if df.empty:
+            return df
+        df = df.copy()
+        df["dt"] = pd.to_datetime(df["ts"], unit="s", utc=True)
+        bm = (df["type"] == "TRADE") & (df["side"] == "BUY") & df["outcome"].isin(["up", "down"])
+        if bm.any():
+            sd = sidefy(df[bm], df.loc[bm, "outcome"] == "up")
+            df = df.join(sd[[c for c in sd.columns if c not in df.columns]], how="left")
+        return df.sort_values("ts")
+    rec = _enrich(recent)
+    csvs["trades_last_3d.csv"] = rec
+    csvs["trades_last_4h.csv"] = rec[rec["ts"] > time.time() - 4 * 3600] if len(rec) else rec
+    csvs["first_entries_all.csv"] = _enrich(first)
     L.append(f"\n_Анализ занял {time.time()-t0:.0f}с_")
 
     head = [f"🧬 Профиль {WALLET[:8]}…", L[4] if len(L) > 4 else ""]
     if not res.empty:
         head.append(f"PnL по окнам: ${res['pnl'].sum():,.0f}, окон {len(res)}, плюсовых {_pct((res['pnl'] > 0).mean())}")
     head += [f"• {v}" for v in verdict] or ["• Стиль пока не определён"]
-    head.append(f"Сделок за 4ч: {len(csvs['trades_last_4h.csv'])}")
+    head.append(f"Сделок за 4ч: {len(csvs['trades_last_4h.csv'])}, всего событий: {n_all}")
     return _write(L, csvs, "\n".join(head))
 
 
