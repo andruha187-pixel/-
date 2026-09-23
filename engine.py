@@ -49,6 +49,7 @@ class Engine:
         self.recent_t = deque(maxlen=400)  # (ts, token, size) для дедупа зеркальных сделок
         self.cash = store.get("cash", S.bankroll)
         self.stats = {"kills": 0, "ticks": 0, "quoting_ticks": 0, "skip": {}}
+        self.last_reason = {}
         for slug, a, st, qu, qd, cu, cd, k in store.q(
                 "SELECT slug,asset,start,qty_up,qty_dn,cost_up,cost_dn,kills FROM windows WHERE settled_ts IS NULL"):
             self.win[slug] = {"slug": slug, "asset": a, "start": st, "qty_up": qu, "qty_dn": qd,
@@ -70,24 +71,54 @@ class Engine:
                         self.sigma[a] = s
             await asyncio.sleep(30)
 
-    def fair_up(self, a, m, now):
-        st = m["start"]
+    def open_price(self, a, m):
+        """Цена для победы: Chainlink на старте окна; если точки нет — ближайшая в ±30с;
+        если и её нет — Binance на старте × текущий курс Chainlink/Binance."""
         op = self.open_px.get(m["slug"])
-        if op is None:
-            op = self.cl.at_or_after(a, st)
-            if op:
-                self.open_px[m["slug"]] = op
+        if op:
+            return op
+        st = m["start"]
+        op = self.cl.at_or_after(a, st) or self.cl.nearest(a, st, 30)
+        if not op:
+            b = self.bn.buckets[a].as_list(1800)
+            bn_open = price_before(b, st + 1) if b and b[0][0] <= st else None
+            cl_h = self.cl.h.get(a)
+            if bn_open and cl_h:
+                cs, cp = cl_h[-1]
+                bn_c = price_before(b, cs + 1)
+                if bn_c:
+                    op = bn_open * cp / bn_c
+        if op:
+            self.open_px[m["slug"]] = op
+        return op
+
+    def fair_up(self, a, m, now, why=None):
+        op = self.open_price(a, m)
         cl_hist = self.cl.h.get(a)
-        if not (op and cl_hist and self.sigma.get(a)):
-            return None
+        if not op:
+            return self._nofair(why, "нет цены открытия окна")
+        if not cl_hist:
+            return self._nofair(why, "нет Chainlink")
+        if not self.sigma.get(a):
+            return self._nofair(why, "нет волатильности (Binance REST)")
         cl_sec, cl_px = cl_hist[-1]
-        # Chainlink обновляется с задержкой — доводим его до текущего Binance
-        b = self.bn.buckets[a].as_list(120)
+        # Chainlink обновляется с задержкой (или поток отстал) — доводим до текущего Binance
+        b = self.bn.buckets[a].as_list(1800)
         bn_now = b[-1][1] if b else None
         bn_then = price_before(b, cl_sec + 1) if b else None
-        ref = cl_px * (bn_now / bn_then) if bn_now and bn_then else cl_px
-        f = fair_block(ref, op, self.sigma[a], st + 900 - now)
+        if not (bn_now and bn_then):
+            if now - cl_sec > 10:
+                return self._nofair(why, "нет Binance")
+            ref = cl_px
+        else:
+            ref = cl_px * (bn_now / bn_then)
+        f = fair_block(ref, op, self.sigma[a], m["start"] + 900 - now)
         return f.get("fair_up")
+
+    def _nofair(self, why, reason):
+        if why is not None:
+            why.append(reason)
+        return None
 
     def binance_move_bps(self, a, secs=5):
         b = self.bn.buckets[a].as_list(30)
@@ -131,11 +162,13 @@ class Engine:
             w = self.wstate(m)
             self.book_fills(a, m, w, now)
             reason = self.can_quote(a, m, now)
-            fu = self.fair_up(a, m, now) if not reason else None
+            why = []
+            fu = self.fair_up(a, m, now, why) if not reason else None
             if not reason and fu is None:
-                reason = "нет справедливой цены"
+                reason = why[0] if why else "нет справедливой цены"
             if not reason and not (S.fair_min <= fu <= 1 - S.fair_min):
                 reason = "исход почти решён"
+            self.last_reason[a] = reason or f"котирует (fair Up {fu:.2f})"
             if reason:
                 self._skip(a, reason)
                 self.orders.pop((a, "up"), None)

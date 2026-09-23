@@ -64,7 +64,19 @@ class BinanceStream:
                 s = await session()
                 async with s.ws_connect(url, heartbeat=20, max_msg_size=0) as ws:
                     log.info("Binance WS connected")
-                    async for msg in ws:
+                    t_conn = time.time()
+                    while True:
+                        try:
+                            msg = await ws.receive(timeout=5)
+                        except asyncio.TimeoutError:
+                            msg = None
+                        if time.time() - max(self.last_msg, t_conn) > 20:
+                            log.warning("Binance WS: 20с без данных — переподключаюсь")
+                            break
+                        if msg is None:
+                            continue
+                        if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR, aiohttp.WSMsgType.CLOSE):
+                            break
                         if msg.type != aiohttp.WSMsgType.TEXT:
                             continue
                         try:
@@ -110,6 +122,14 @@ class Chainlink:
                 return v if s - sec <= tol else None
         return None
 
+    def nearest(self, a, sec, tol=30):
+        best = None
+        for s, v in self.h.get(a, ()):
+            d = abs(s - sec)
+            if d <= tol and (best is None or d < best[0]):
+                best = (d, v)
+        return best[1] if best else None
+
     def _handle(self, raw):
         if not raw or raw[0] not in "{[":
             return
@@ -144,11 +164,23 @@ class Chainlink:
                     await ws.send_json(sub)
                     log.info("RTDS Chainlink connected")
                     ping = asyncio.create_task(_pinger(ws, 5))
+                    t_conn = time.time()
                     try:
-                        async for msg in ws:
+                        while True:
+                            try:
+                                msg = await ws.receive(timeout=5)
+                            except asyncio.TimeoutError:
+                                msg = None
+                            # RTDS иногда «замолкает» без закрытия соединения — рвём сами
+                            if time.time() - max(self.last_msg, t_conn) > 20:
+                                log.warning("RTDS: 20с без цен Chainlink — переподключаюсь")
+                                break
+                            if msg is None:
+                                continue
                             if msg.type == aiohttp.WSMsgType.TEXT:
                                 self._handle(msg.data)
-                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                            elif msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR,
+                                              aiohttp.WSMsgType.CLOSE):
                                 break
                     finally:
                         ping.cancel()
@@ -274,7 +306,11 @@ class PMBook:
                     log.info("PM WS connected, %d tokens", len(toks))
                     ping = asyncio.create_task(_pinger(ws, 10))
                     try:
+                        t_conn = time.time()
                         while not self._changed.is_set():
+                            if time.time() - max(self.last_msg, t_conn) > 30:
+                                log.warning("PM WS: 30с тишины — переподключаюсь")
+                                break
                             try:
                                 msg = await ws.receive(timeout=1.0)
                             except asyncio.TimeoutError:
