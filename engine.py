@@ -50,10 +50,13 @@ class Engine:
         self.cash = store.get("cash", S.bankroll)
         self.stats = {"kills": 0, "ticks": 0, "quoting_ticks": 0, "skip": {}}
         self.last_reason = {}
-        for slug, a, st, qu, qd, cu, cd, k in store.q(
-                "SELECT slug,asset,start,qty_up,qty_dn,cost_up,cost_dn,kills FROM windows WHERE settled_ts IS NULL"):
+        for slug, a, st, qu, qd, cu, cd, k, fq, fcash, fcost in store.q(
+                "SELECT slug,asset,start,qty_up,qty_dn,cost_up,cost_dn,kills,flat_qty,flat_cash,flat_cost "
+                "FROM windows WHERE settled_ts IS NULL"):
             self.win[slug] = {"slug": slug, "asset": a, "start": st, "qty_up": qu, "qty_dn": qd,
                               "cost_up": cu, "cost_dn": cd, "kills": k}
+            if fq:
+                self.win[slug].update(flat_done=True, flat_cash=fcash or 0.0, flat_cost=fcost or 0.0)
         pm.listeners.append(self.on_trade)
 
     # ---------- данные ----------
@@ -169,6 +172,8 @@ class Engine:
             if not reason and not (S.fair_min <= fu <= 1 - S.fair_min):
                 reason = "исход почти решён"
             self.last_reason[a] = reason or f"котирует (fair Up {fu:.2f})"
+            if reason in ("конец окна", "исход почти решён"):
+                self.flatten(a, m, w, now, reason)
             if reason:
                 self._skip(a, reason)
                 self.orders.pop((a, "up"), None)
@@ -273,6 +278,37 @@ class Engine:
         q = self.pm.level(tok, price, "b") * self.S.queue_mult
         self.orders[(a, side)] = Order(m["slug"], tok, price, size, q, now)
 
+    # ---------- сброс перекоса ----------
+    def flatten(self, a, m, w, now, why):
+        """Перекос в конце почти всегда оказывается на проигравшей стороне (её набрали, пока она падала).
+        Продаём лишние шт тейкером по лучшему биду с комиссией. Делаем один раз за окно."""
+        S = self.S
+        if S.flatten < 1 or w.get("flat_done"):
+            return
+        net = w["qty_up"] - w["qty_dn"]
+        if abs(net) < S.flatten_min_imb:
+            return
+        side = "up" if net > 0 else "dn"
+        top = self.pm.top(m[side])
+        if not top or not top.get("bid"):
+            return
+        qty = min(abs(net), top.get("bsz5") or abs(net))
+        px = top["bid"]
+        fee = S.fee_rate * qty * px * (1 - px)
+        cash_in = qty * px - fee
+        avg = w[f"cost_{side}"] / w[f"qty_{side}"] if w[f"qty_{side}"] else 0
+        w[f"qty_{side}"] -= qty
+        w[f"cost_{side}"] -= qty * avg          # себестоимость проданных уходит из позиции
+        w["flat_cash"] = cash_in
+        w["flat_cost"] = qty * avg
+        w["flat_done"] = True
+        self.cash += cash_in
+        store.put("cash", self.cash)
+        store.x("UPDATE windows SET qty_up=?,qty_dn=?,cost_up=?,cost_dn=?,flat_side=?,flat_qty=?,flat_px=?,"
+                "flat_cash=?,flat_cost=?,flat_reason=? WHERE slug=?",
+                (w["qty_up"], w["qty_dn"], w["cost_up"], w["cost_dn"], side, qty, px, cash_in, qty * avg, why,
+                 w["slug"]))
+
     # ---------- симуляция исполнения ----------
     def book_fills(self, a, m, w, now):
         for side in ("up", "dn"):
@@ -376,7 +412,7 @@ class Engine:
                 if not winner:
                     continue
                 payout = w["qty_up"] if winner == "up" else w["qty_dn"]
-                pnl = payout - w["cost_up"] - w["cost_dn"]
+                pnl = payout - w["cost_up"] - w["cost_dn"] + w.get("flat_cash", 0) - w.get("flat_cost", 0)
                 self.cash += payout
                 store.put("cash", self.cash)
                 wk = "up" if winner == "up" else "dn"

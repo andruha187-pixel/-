@@ -18,6 +18,11 @@ CREATE TABLE IF NOT EXISTS windows(slug TEXT PRIMARY KEY, asset TEXT, start INTE
   kills INTEGER DEFAULT 0, winner TEXT, payout REAL, pnl REAL, settled_ts REAL);
 CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT);
 """)
+for _col in ("flat_side TEXT", "flat_qty REAL", "flat_px REAL", "flat_cash REAL", "flat_cost REAL", "flat_reason TEXT"):
+    try:
+        _c.execute(f"ALTER TABLE windows ADD COLUMN {_col}")
+    except sqlite3.OperationalError:
+        pass
 
 
 def q(sql, a=()):

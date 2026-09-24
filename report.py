@@ -86,6 +86,13 @@ def build(settings, engine, since_hours=None):
         g = ws.groupby(cut, observed=True)["pnl"].agg(["count", "sum", "mean"])
         L.append("PnL по перекосу: " + "; ".join(f"{k}: {int(r['count'])} окон, ${r['sum']:,.2f} (ср ${r['mean']:.2f})"
                                                   for k, r in g.iterrows()))
+        if "flat_qty" in ws and ws["flat_qty"].notna().any():
+            fw = ws[ws["flat_qty"].notna()]
+            won_side = np.where(fw["winner"] == "up", "up", "dn")
+            hold = (fw["flat_qty"] * (fw["flat_side"] == won_side)).sum()
+            L.append(f"Сброс перекоса: {len(fw)} окон, продали {fw['flat_qty'].sum():.0f} шт за ${fw['flat_cash'].sum():.2f} "
+                     f"(ср. цена {fw['flat_px'].mean():.2f}); если бы держали до конца — получили бы ${hold:.2f}. "
+                     f"Эффект сброса: ${fw['flat_cash'].sum() - hold:+.2f}")
         ws["hour"] = pd.to_datetime(ws["start"], unit="s").dt.hour
         hh = ws.groupby("hour")["pnl"].sum()
         L.append("PnL по часам UTC: " + ", ".join(f"{h}:{v:+.1f}" for h, v in hh.items()))
