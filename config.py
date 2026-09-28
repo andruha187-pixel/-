@@ -1,17 +1,126 @@
-"""Инфраструктурные настройки (env). Торговые параметры — в settings.py, меняются из Telegram."""
+"""
+Централизованная конфигурация бота. Все настройки берутся из переменных
+окружения (.env), см. .env.example. Ничего не хардкодим — особенно ключи.
+"""
 import os
+from dataclasses import dataclass, field
+from dotenv import load_dotenv
 
-ASSETS = [a.strip().lower() for a in os.getenv("DATA_ASSETS", "btc,eth").split(",") if a.strip()]
-TG_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "")
-DB_PATH = os.getenv("DB_PATH", "data/maker.db")
-OUT_DIR = os.getenv("OUT_DIR", "data/reports")
-MODE = os.getenv("MODE", "DRY_RUN")  # LIVE пока не реализован намеренно
+load_dotenv()
 
-GAMMA = "https://gamma-api.polymarket.com"
-PM_WS = os.getenv("PM_WS", "wss://ws-subscriptions-clob.polymarket.com/ws/market")
-RTDS_WS = os.getenv("RTDS_WS", "wss://ws-live-data.polymarket.com")
-BINANCE_REST = os.getenv("BINANCE_REST", "https://api.binance.com")
-BINANCE_WS = os.getenv("BINANCE_WS", "wss://stream.binance.com:9443")
-BINANCE_SYM = {"btc": "BTCUSDT", "eth": "ETHUSDT", "sol": "SOLUSDT",
-               "xrp": "XRPUSDT", "bnb": "BNBUSDT", "hype": "HYPEUSDT"}
+
+def _get_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _get_float(name: str, default: float) -> float:
+    val = os.getenv(name)
+    return float(val) if val else default
+
+
+def _get_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    return int(val) if val else default
+
+
+@dataclass
+class Settings:
+    # --- Активы ---
+    # Список торгуемых монет через запятую — на каждую заводится независимый
+    # поток по каждому таймфрейму (см. src/timeframes.py).
+    ASSETS: list = field(default_factory=lambda: [
+        a.strip().lower() for a in os.getenv("ASSETS", "btc,eth,sol,bnb,hype,xrp").split(",") if a.strip()
+    ])
+
+    # --- Binance (источник цены/индикаторов) ---
+    BINANCE_BASE_URL: str = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
+    # Фьючерсный хост — фолбэк для монет без спотовой пары на Binance (HYPE
+    # на споте под вопросом на момент написания; на фьючерсах есть точно).
+    BINANCE_FUTURES_URL: str = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
+    ATR_LOOKBACK_FOR_REGIME: int = _get_int("ATR_LOOKBACK_FOR_REGIME", 60)
+
+    # --- Polymarket / CLOB ---
+    POLY_HOST: str = os.getenv("POLY_HOST", "https://clob.polymarket.com")
+    GAMMA_HOST: str = os.getenv("GAMMA_HOST", "https://gamma-api.polymarket.com")
+    POLY_CHAIN_ID: int = _get_int("POLY_CHAIN_ID", 137)
+    POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
+    POLY_FUNDER_ADDRESS: str = os.getenv("POLY_FUNDER_ADDRESS", "")
+    # ПРИМЕЧАНИЕ: с переходом на polymarket-client (актуальный официальный SDK)
+    # этот параметр больше не используется — SDK сам определяет тип кошелька
+    # (EOA/proxy/deposit wallet) через AsyncSecureClient.create(). Оставлен
+    # в конфиге на случай отката на другой клиент, полем можно не заниматься.
+    POLY_SIGNATURE_TYPE: int = _get_int("POLY_SIGNATURE_TYPE", 0)
+
+    # --- Стратегия входа (общее для всех активов/таймфреймов) ---
+    MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.90)
+    MAX_ENTRY_PRICE: float = _get_float("MAX_ENTRY_PRICE", 0.95)
+    SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 88.0)
+    MIN_BOOK_LIQUIDITY_USDC: float = _get_float("MIN_BOOK_LIQUIDITY_USDC", 25.0)
+    # Минимальное расстояние цены от страйка в % от цены (0 = фильтр выключен).
+    # Зачем: расхождение в ATR обманчиво в тихом рынке — при маленьком ATR
+    # "3-4 ATR" это всего $40-70 для BTC, и за 5-7 минут до конца 15m-рынка
+    # такое расстояние легко съедается. Бэктест 15m BTC (25-28.09, 139 рынков):
+    # без фильтра −$17, с минимумом ~$60 (0.07% при BTC ~84k) — +$38, из 4
+    # проигрышей остался 1. На 5m фильтр ничего не дал (там вход за 1.5-3 мин),
+    # поэтому для 5m по умолчанию выключен. Меняется из Telegram (⚙️ Настройки).
+    MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.0)
+
+    # --- Латентность / исполнение (прогрев стакана и транспорта) ---
+    USE_LIVE_BOOK_STREAM: bool = _get_bool("USE_LIVE_BOOK_STREAM", True)
+    LIVE_ENTRY_MAX_SLIPPAGE: float = _get_float("LIVE_ENTRY_MAX_SLIPPAGE", 0.01)
+    MAX_ENTRY_EXECUTION_PRICE: float = _get_float("MAX_ENTRY_EXECUTION_PRICE", 0.97)
+
+    # --- Управление капиталом ---
+    # Дефолты откалиброваны под небольшой депозит (~$60) — см. обсуждение
+    # в README: фиксированный (не растущий в % от банка) размер ставки,
+    # чтобы не разгонять риск компаундингом на непроверенной вживую
+    # стратегии. Меняй TRADE_SIZE_USDC пропорционально своему реальному
+    # депозиту — это НЕ универсальная константа.
+    TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 2.0)
+    # Общий потолок ОДНОВРЕМЕННО открытых позиций по ВСЕМ активам/таймфреймам
+    # разом — без этого при 12 параллельных потоках (6 монет x 2 таймфрейма)
+    # можно случайно открыть 12 позиций разом, если все совпадут по времени.
+    MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 2)
+    # Ниже этой суммы даже пробовать не стоит — комиссии и слиппедж съедят
+    # выгоду. Если в стакане меньше этого объёма по нужной цене — тик тихо
+    # пропускается (не считается ошибкой, просто рынок сейчас неликвиден).
+    MIN_VIABLE_TRADE_USDC: float = _get_float("MIN_VIABLE_TRADE_USDC", 2.0)
+    DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 6.0)
+
+    # --- Исследовательский модуль (momentum_tracker) ---
+    # Не торгует — просто пишет, при каких условиях (RSI/MACD/дисбаланс
+    # стакана/и т.д.) цена стороны контракта проходит контрольные точки
+    # 0.70/0.75/.../0.95. См. src/momentum_tracker.py.
+    MOMENTUM_TRACKER_ENABLED: bool = _get_bool("MOMENTUM_TRACKER_ENABLED", True)
+
+    # --- Масштабирование ставки по уверенности сигнала ---
+    # Ставка = TRADE_SIZE_USDC только при score >= SIZE_SCALING_MAX_SCORE.
+    # На самом пороге (score == threshold) ставка = TRADE_SIZE_USDC * MIN_FRACTION.
+    # Между ними — линейная интерполяция. Так пограничные сигналы (score чуть
+    # выше порога) автоматически получают меньшую ставку, а не полный размер.
+    SIZE_SCALING_MIN_FRACTION: float = _get_float("SIZE_SCALING_MIN_FRACTION", 0.3)
+    SIZE_SCALING_MAX_SCORE: float = _get_float("SIZE_SCALING_MAX_SCORE", 95.0)
+
+    # --- Режим работы ---
+    DRY_RUN: bool = _get_bool("DRY_RUN", True)          # True = только сигналы, ордера не шлём
+
+    # --- Telegram ---
+    TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
+    # --- Storage ---
+    DB_PATH: str = os.getenv("DB_PATH", "data/bot.db")
+
+    # --- Отчёты для анализа стратегии ---
+    REPORT_INTERVAL_HOURS: float = _get_float("REPORT_INTERVAL_HOURS", 4.0)
+    REPORTS_DIR: str = os.getenv("REPORTS_DIR", "data/reports")
+
+    # --- Отслеживание чужого кошелька (уведомления + опциональный копитрейдинг) ---
+    WALLET_TRACK_ADDRESS: str = os.getenv("WALLET_TRACK_ADDRESS", "0x4707b735acce66b2ccb5600086de2329685cd1ce")
+    WALLET_TRACK_POLL_SECONDS: int = _get_int("WALLET_TRACK_POLL_SECONDS", 3)
+
+
+settings = Settings()
