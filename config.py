@@ -32,7 +32,7 @@ class Settings:
     # Список торгуемых монет через запятую — на каждую заводится независимый
     # поток по каждому таймфрейму (см. src/timeframes.py).
     ASSETS: list = field(default_factory=lambda: [
-        a.strip().lower() for a in os.getenv("ASSETS", "btc,eth,sol,bnb,hype,xrp").split(",") if a.strip()
+        a.strip().lower() for a in os.getenv("ASSETS", "btc").split(",") if a.strip()
     ])
 
     # --- Binance (источник цены/индикаторов) ---
@@ -66,6 +66,12 @@ class Settings:
     # без фильтра −$17, с минимумом ~$60 (0.07% при BTC ~84k) — +$38, из 4
     # проигрышей остался 1. На 5m фильтр ничего не дал (там вход за 1.5-3 мин),
     # поэтому для 5m по умолчанию выключен. Меняется из Telegram (⚙️ Настройки).
+    # --- Chainlink (цена, по которой Polymarket решает исход) ---
+    # Если цена Chainlink недоступна/устарела — входить нельзя (True) или
+    # торговать по Binance, как основной бот (False).
+    CHAINLINK_REQUIRED: bool = _get_bool("CHAINLINK_REQUIRED", True)
+    CHAINLINK_MAX_AGE_SEC: float = _get_float("CHAINLINK_MAX_AGE_SEC", 5.0)
+
     MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.0)
 
     # --- Латентность / исполнение (прогрев стакана и транспорта) ---
