@@ -75,7 +75,7 @@ def _main_menu_text() -> str:
     pos_sl_on = runtime_state.get("position_stop_loss_enabled")
     enabled_assets = runtime_state.get_enabled_assets()
     lines = [
-        "🤖 *Polymarket Multi-Asset Bot*",
+        "🤖 *Polymarket 5m Chainlink Bot*",
         "",
         f"Статус: {'⏸ на паузе' if paused else '▶️ активен'} | Режим: {'🧪 DRY RUN' if dry_run else '🔴 LIVE'}",
         f"Активы: {', '.join(a.upper() for a in sorted(enabled_assets)) or '(нет включённых)'}",
@@ -94,7 +94,7 @@ def _main_menu_text() -> str:
             inst = s[key]
             lines.append(
                 f"  {inst['asset'].upper()} {inst['timeframe']}: {inst.get('direction','—')} "
-                f"score {inst.get('safety_score','—')}"
+                f"score {inst.get('safety_score','—')} | цена: {inst.get('price_source','—')}"
             )
     return "\n".join(lines)
 

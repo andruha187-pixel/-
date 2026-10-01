@@ -18,7 +18,7 @@ import time
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
 from src.market_discovery import ActiveMarket
-from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot
+from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot, chainlink_feed
 from src.timeframes import TIMEFRAMES, TimeframeProfile
 
 logging.basicConfig(
@@ -37,6 +37,9 @@ _active_slugs: dict[str, str] = {}
 # один и тот же рынок запрашивался каждые 3-5 секунд, до ~100 лишних
 # запросов за один 5-минутный рынок).
 _active_markets: dict[str, ActiveMarket] = {}
+
+# Страйк по Chainlink для каждого рынка (slug -> цена оракула на старт окна).
+_cl_strikes: dict[str, float] = {}
 
 # Последнее состояние каждого потока — для команды /token и общего статуса.
 _instance_state: dict[str, dict] = {}
@@ -84,7 +87,31 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
     ind = indicators.compute_indicator_snapshot(
         klines, timeframe.atr_period, timeframe.ema_fast, timeframe.ema_slow, timeframe.atr_lookback_for_regime,
     )
-    current_price = ind["close"]
+    binance_price = ind["close"]
+
+    # Цена и страйк по Chainlink — по ним Polymarket решает исход. Binance
+    # остаётся только для индикаторов (ATR/EMA/MACD) и как запасной вариант.
+    if market.slug not in _cl_strikes:
+        cl_strike = chainlink_feed.price_at(asset, market.start_time)
+        if cl_strike is not None:
+            _cl_strikes[market.slug] = cl_strike
+            if len(_cl_strikes) > 200:
+                for old in list(_cl_strikes)[:100]:
+                    _cl_strikes.pop(old, None)
+    cl_strike = _cl_strikes.get(market.slug)
+    cl_price, cl_age = chainlink_feed.latest(asset)
+    cl_problem = None
+    if cl_strike is None:
+        cl_problem = "нет цены Chainlink на старт окна (бот запущен посреди окна или поток не подключён)"
+    elif cl_price is None:
+        cl_problem = "нет текущей цены Chainlink"
+    elif cl_age > settings.CHAINLINK_MAX_AGE_SEC:
+        cl_problem = f"цена Chainlink устарела ({cl_age:.0f} с)"
+
+    if cl_problem is None:
+        current_price, strike_price, price_source = cl_price, cl_strike, "chainlink"
+    else:
+        current_price, strike_price, price_source = binance_price, market.strike_price, "binance"
 
     minutes_left = max(0.0, (market.end_time - time.time()) / 60)
 
@@ -94,7 +121,7 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
 
     decision = strategy.evaluate(
         current_price=current_price,
-        strike_price=market.strike_price,
+        strike_price=strike_price,
         minutes_left=minutes_left,
         indicators=ind,
         up_book=up_book,
@@ -105,8 +132,14 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         atr_spike_mult=timeframe.atr_spike_mult,
     )
 
-    storage.log_signal(market.slug, current_price, market.strike_price, decision,
-                        indicators=ind, up_book=up_book, down_book=down_book)
+    if cl_problem is not None and settings.CHAINLINK_REQUIRED:
+        decision.should_enter = False
+        decision.reasons.append(cl_problem)
+
+    storage.log_signal(market.slug, current_price, strike_price, decision,
+                        indicators=ind, up_book=up_book, down_book=down_book,
+                        price_source=price_source, binance_price=binance_price,
+                        binance_strike=market.strike_price)
 
     _instance_state[key] = {
         "market_slug": market.slug,
@@ -114,7 +147,8 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
         "timeframe": timeframe.label,
         "direction": decision.direction,
         "current_price": round(current_price, 2),
-        "strike_price": round(market.strike_price, 2),
+        "strike_price": round(strike_price, 2),
+        "price_source": price_source,
         "minutes_left": round(minutes_left, 2),
         "safety_score": decision.safety_score,
         "up_token_id": market.up_token_id,
@@ -124,8 +158,8 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
 
     active_book = up_book if decision.direction == "UP" else down_book
     log.info(
-        "%s | price=%.4f strike=%.4f dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s",
-        market.slug, current_price, market.strike_price, decision.direction,
+        "%s | %s price=%.2f strike=%.2f (binance %.2f/%.2f) dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s",
+        market.slug, price_source, current_price, strike_price, binance_price, market.strike_price, decision.direction,
         minutes_left, decision.safety_score, decision.should_enter, active_book.source, decision.reasons,
     )
 
@@ -221,9 +255,12 @@ async def main():
         await telegram_notify.notify(
             f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
             f"Активы: {assets_line}\nТаймфреймы: {timeframes_line}\n"
+            f"Цена и страйк: Chainlink (как у Polymarket), Binance — только индикаторы\n"
             f"Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
             f"{forced_note}"
         )
+
+        chainlink_task = asyncio.create_task(chainlink_feed.run_forever())
 
         book_stream_task = None
         if settings.USE_LIVE_BOOK_STREAM:
@@ -244,6 +281,7 @@ async def main():
         finally:
             if book_stream_task:
                 book_stream_task.cancel()
+            chainlink_task.cancel()
             report_task.cancel()
             settlement_task.cancel()
             wallet_tracker_task.cancel()

@@ -188,6 +188,9 @@ _SIGNALS_MIGRATIONS = [
     ("timeframe", "TEXT"),
     ("macd_histogram", "REAL"),
     ("macd_bullish", "INTEGER"),
+    ("price_source", "TEXT"),      # "chainlink" | "binance" (запасной)
+    ("binance_price", "REAL"),
+    ("binance_strike", "REAL"),
 ]
 
 _TRADES_MIGRATIONS = [
@@ -221,7 +224,9 @@ def init_db():
 
 
 def log_signal(market_slug: str, current_price: float, strike_price: float, decision,
-               indicators: dict | None = None, up_book=None, down_book=None) -> None:
+               indicators: dict | None = None, up_book=None, down_book=None,
+               price_source: str | None = None, binance_price: float | None = None,
+               binance_strike: float | None = None) -> None:
     """
     indicators/up_book/down_book необязательны (обратная совместимость), но
     без них отчёт для анализа будет неполным — main.py всегда должен их
@@ -237,8 +242,8 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 atr, atr_ratio_to_avg, ema_fast, ema_slow, ema_fast_slope, trend_up,
                 time_score, distance_score, trend_score, vol_score, liq_score,
                 ask_liquidity_usdc, up_best_ask, down_best_ask, book_source, asset, timeframe,
-                macd_histogram, macd_bullish)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                macd_histogram, macd_bullish, price_source, binance_price, binance_strike)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(time.time()), market_slug, current_price, strike_price, decision.direction,
                 decision.entry_price, decision.safety_score, decision.minutes_left,
@@ -257,6 +262,7 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 asset, timeframe_label,
                 indicators.get("macd_histogram"),
                 int(indicators.get("macd_bullish")) if indicators.get("macd_bullish") is not None else None,
+                price_source, binance_price, binance_strike,
             ),
         )
 
@@ -413,7 +419,7 @@ SIGNALS_COLUMNS = [
     "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow", "ema_fast_slope", "trend_up",
     "time_score", "distance_score", "trend_score", "vol_score", "liq_score",
     "ask_liquidity_usdc", "up_best_ask", "down_best_ask", "book_source", "outcome",
-    "macd_histogram", "macd_bullish",
+    "macd_histogram", "macd_bullish", "price_source", "binance_price", "binance_strike",
 ]
 
 TRADES_COLUMNS = [
