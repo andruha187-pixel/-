@@ -32,7 +32,7 @@ class Settings:
     # Список торгуемых монет через запятую — на каждую заводится независимый
     # поток по каждому таймфрейму (см. src/timeframes.py).
     ASSETS: list = field(default_factory=lambda: [
-        a.strip().lower() for a in os.getenv("ASSETS", "btc,eth,sol,bnb,hype,xrp").split(",") if a.strip()
+        a.strip().lower() for a in os.getenv("ASSETS", "btc").split(",") if a.strip()
     ])
 
     # --- Binance (источник цены/индикаторов) ---
@@ -66,30 +66,13 @@ class Settings:
     # без фильтра −$17, с минимумом ~$60 (0.07% при BTC ~84k) — +$38, из 4
     # проигрышей остался 1. На 5m фильтр ничего не дал (там вход за 1.5-3 мин),
     # поэтому для 5m по умолчанию выключен. Меняется из Telegram (⚙️ Настройки).
-    # --- Стратегия «ранний импульс» (15m) — см. src/strategy.py ---
-    MOMENTUM_MIN_PRICE: float = _get_float("MOMENTUM_MIN_PRICE", 0.78)
-    MOMENTUM_MAX_PRICE: float = _get_float("MOMENTUM_MAX_PRICE", 0.88)
-    # Только первые 2.5 минуты окна: дальше перекос цены исчезает (см. strategy.py).
-    MOMENTUM_MIN_MINUTES_LEFT: float = _get_float("MOMENTUM_MIN_MINUTES_LEFT", 12.5)
-    # Спред = ask(UP) + ask(DOWN) − 1. Шире — цена «рваная», входы хуже.
-    MOMENTUM_MAX_SPREAD: float = _get_float("MOMENTUM_MAX_SPREAD", 0.015)
-    # Пауза на важную статистику США (см. src/news_calendar.py). Время — по
-    # Нью-Йорку, через запятую. 08:30 — NFP, CPI, PPI, заявки на пособие,
-    # розничные продажи, ВВП. Пропускается рынок, внутри окна которого
-    # выходит новость (для 15m — рынок, который в это время начинается).
-    NEWS_PAUSE_ET_TIMES: list = field(default_factory=lambda: [
-        x.strip() for x in os.getenv("NEWS_PAUSE_ET_TIMES", "08:30").split(",") if x.strip()
-    ])
-    # Разовые события по Нью-Йорку, "ГГГГ-ММ-ДД ЧЧ:ММ" через запятую: решения
-    # ФРС (14:00) и пресс-конференция (14:30). На 2027 год — дописать сюда же.
-    NEWS_PAUSE_ET_DATETIMES: list = field(default_factory=lambda: [
-        x.strip() for x in os.getenv(
-            "NEWS_PAUSE_ET_DATETIMES",
-            "2026-10-28 14:00,2026-10-28 14:30,2026-12-09 14:00,2026-12-09 14:30",
-        ).split(",") if x.strip()
-    ])
+    # --- Chainlink (цена, по которой Polymarket решает исход) ---
+    # Если цена Chainlink недоступна/устарела — входить нельзя (True) или
+    # торговать по Binance, как основной бот (False).
+    CHAINLINK_REQUIRED: bool = _get_bool("CHAINLINK_REQUIRED", True)
+    CHAINLINK_MAX_AGE_SEC: float = _get_float("CHAINLINK_MAX_AGE_SEC", 5.0)
 
-    MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.07)
+    MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.0)
 
     # --- Латентность / исполнение (прогрев стакана и транспорта) ---
     USE_LIVE_BOOK_STREAM: bool = _get_bool("USE_LIVE_BOOK_STREAM", True)
