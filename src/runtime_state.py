@@ -23,6 +23,17 @@ _DEFAULTS = {
     "max_entry_price": settings.MAX_ENTRY_PRICE,
     # Мин. расстояние цены от страйка, % от цены (0 = выкл) — см. config.py.
     "min_distance_pct": settings.MIN_DISTANCE_PCT,
+    # "classic" — старая логика (score + 0.90–0.95 ближе к концу окна);
+    # "momentum" — ранний импульс: покупаем лидера, как только его цена
+    # впервые в [mom_min_price, mom_max_price], пока до конца >= mom_min_minutes_left.
+    "strategy_mode": "momentum",
+    "mom_min_price": settings.MOMENTUM_MIN_PRICE,
+    "mom_max_price": settings.MOMENTUM_MAX_PRICE,
+    "mom_min_minutes_left": settings.MOMENTUM_MIN_MINUTES_LEFT,
+    "mom_max_spread": settings.MOMENTUM_MAX_SPREAD,
+    # Пропуск рынков, в окно которых попадает выход статистики США / решение
+    # ФРС (только для «раннего импульса») — см. src/news_calendar.py.
+    "news_pause_enabled": True,
     # Версия применённого набора рекомендованных настроек (см. RECOMMENDED ниже).
     "preset_version": 0,
     # По умолчанию выключено: каждая прошедшая порог сделка идёт полным
@@ -75,6 +86,12 @@ _CASTERS = {
     "max_entry_price": float,
     "min_distance_pct": float,
     "preset_version": int,
+    "strategy_mode": str,
+    "mom_min_price": float,
+    "mom_max_price": float,
+    "mom_min_minutes_left": float,
+    "mom_max_spread": float,
+    "news_pause_enabled": lambda v: str(v).lower() == "true",
     "size_scaling_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
     "position_stop_loss_pct": float,
@@ -112,7 +129,7 @@ def init_from_db() -> None:
 # порог 92, так и остались бы). Дальше можно спокойно менять из Telegram —
 # повторно не перезапишутся, пока не поднимем PRESET_VERSION. Кнопка
 # "⭐ Рекомендованные" в ⚙️ Настройках применяет их вручную ещё раз.
-PRESET_VERSION = 1
+PRESET_VERSION = 4
 
 
 def recommended() -> dict:
@@ -124,6 +141,18 @@ def recommended() -> dict:
         # Хедж вынесен в отдельный бот; здесь он тратил бы тот же кошелёк
         # и в LIVE покупал бы по $5 на каждом рынке, где цена прошла 0.70.
         "hedge_bot_enabled": False,
+        # v2 (02.10): классика на 15m в минусе вне выборки (01–02.10: 30 сделок,
+        # 83% выигрышей при цене 0.93 → −$34 на $10). Ранний импульс — в плюсе
+        # в обоих периодах (25–28.09 и 01–02.10). См. src/strategy.py.
+        "strategy_mode": "momentum",
+        "mom_min_price": settings.MOMENTUM_MIN_PRICE,
+        "mom_max_price": settings.MOMENTUM_MAX_PRICE,
+        "mom_min_minutes_left": settings.MOMENTUM_MIN_MINUTES_LEFT,
+        # v3 (02.10): по всем архивам 16.09–02.10 (1105 рынков 15m, BTC/ETH/SOL/XRP)
+        # перекос есть только в первые ~2.5 минуты окна и при узком спреде.
+        "mom_max_spread": settings.MOMENTUM_MAX_SPREAD,
+        # 02.10: проигрыш на рывке после отчёта по рынку труда США (12:30 UTC).
+        "news_pause_enabled": True,
     }
 
 
@@ -135,9 +164,17 @@ def apply_recommended() -> dict:
 
 
 def _apply_preset_if_new() -> None:
-    if int(_state.get("preset_version") or 0) >= PRESET_VERSION:
+    current = int(_state.get("preset_version") or 0)
+    if current >= PRESET_VERSION:
         return
     apply_recommended()
+    if current < 4:
+        # v4 (03.10): «ранний импульс» на реальных деньгах 02.10 — 12 побед из 17
+        # (71%) при безубыточности ~81.5%. Данные, которые НЕ участвовали в
+        # подборе правила (трекер 20–23.09 и живой день 02.10), дают 74% —
+        # минус. Переводим в DRY RUN: бот продолжает считать виртуальные сделки,
+        # LIVE включается кнопкой, если проверка на 100 сделках пройдёт.
+        set("dry_run", True)
     set("preset_version", PRESET_VERSION)
 
 
