@@ -15,7 +15,7 @@ from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKe
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, ContextTypes, filters
 
 from config import settings
-from src import news_calendar, storage, runtime_state
+from src import storage, runtime_state
 
 _app: Application | None = None
 _state_ref: dict = {}  # заполняется из main.py: последний сигнал/статус для меню
@@ -68,67 +68,6 @@ def _settings_text() -> str:
     )
 
 
-MOM_BANDS = [(0.75, 0.85), (0.78, 0.88), (0.80, 0.90)]
-MOM_MINUTES = [12.0, 12.5, 13.0]
-MOM_SPREADS = [0.015, 0.025, 1.0]
-
-
-def _strategy_summary() -> str:
-    if runtime_state.get("strategy_mode") == "momentum":
-        sp = runtime_state.get("mom_max_spread")
-        sp_txt = "без фильтра спреда" if sp is None or sp >= 1 else f"спред ≤ {sp:g}"
-        news_txt = ", пауза на новости США" if runtime_state.get("news_pause_enabled") else ""
-        return (f"ранний импульс: лидер {runtime_state.get('mom_min_price'):.2f}–"
-                f"{runtime_state.get('mom_max_price'):.2f}, до конца ≥ {runtime_state.get('mom_min_minutes_left'):g} мин, "
-                f"{sp_txt}{news_txt}")
-    return "классика (score + диапазон входа)"
-
-
-def _strategy_text() -> str:
-    return (
-        f"🧭 Стратегия: {_strategy_summary()}\n\n"
-        "Ранний импульс: в первые ~2.5 минуты окна покупаем сторону-лидера, как только её цена "
-        "впервые попала в диапазон при узком спреде, и держим до конца.\n"
-        "Классика: старая логика (score, вход 0.90–0.95 ближе к концу).\n\n"
-        f"📰 Пауза на новости: {'вкл' if runtime_state.get('news_pause_enabled') else 'выкл'} — пропускаем рынок, "
-        f"который начинается в момент выхода статистики США — по будням в {news_calendar.describe_times()} — "
-        "и в момент решений ФРС."
-    )
-
-
-def _strategy_menu_markup() -> InlineKeyboardMarkup:
-    mode = runtime_state.get("strategy_mode")
-    rows = [[
-        InlineKeyboardButton(("✅ " if mode == "momentum" else "") + "Ранний импульс", callback_data="strat_mode:momentum"),
-        InlineKeyboardButton(("✅ " if mode == "classic" else "") + "Классика", callback_data="strat_mode:classic"),
-    ]]
-    rows.append([InlineKeyboardButton("— Диапазон цены лидера —", callback_data="noop")])
-    lo, hi = runtime_state.get("mom_min_price"), runtime_state.get("mom_max_price")
-    rows.append([
-        InlineKeyboardButton(("✅ " if abs(a - lo) < 1e-6 and abs(b - hi) < 1e-6 else "") + f"{a:.2f}–{b:.2f}",
-                             callback_data=f"mom_band:{a}:{b}")
-        for a, b in MOM_BANDS
-    ])
-    rows.append([InlineKeyboardButton("— Минимум минут до конца —", callback_data="noop")])
-    ml = runtime_state.get("mom_min_minutes_left")
-    rows.append([
-        InlineKeyboardButton(("✅ " if abs(m - ml) < 1e-6 else "") + f"{m:g}", callback_data=f"mom_min:{m}")
-        for m in MOM_MINUTES
-    ])
-    rows.append([InlineKeyboardButton("— Макс. спред (ask UP + ask DOWN − 1) —", callback_data="noop")])
-    sp = runtime_state.get("mom_max_spread")
-    rows.append([
-        InlineKeyboardButton(("✅ " if abs(v - sp) < 1e-6 else "") + ("выкл" if v >= 1 else f"{v:g}"),
-                             callback_data=f"mom_spread:{v}")
-        for v in MOM_SPREADS
-    ])
-    news_on = runtime_state.get("news_pause_enabled")
-    rows.append([InlineKeyboardButton(("✅ " if news_on else "❌ ") + "📰 Пауза на новости США",
-                                      callback_data="news_pause:toggle")])
-    rows.append([InlineKeyboardButton("◀️ Назад", callback_data="menu:main")])
-    return InlineKeyboardMarkup(rows)
-
-
 def _main_menu_text() -> str:
     s = _state_ref  # dict: "asset:timeframe" -> instance state
     paused = runtime_state.get("paused")
@@ -136,14 +75,13 @@ def _main_menu_text() -> str:
     pos_sl_on = runtime_state.get("position_stop_loss_enabled")
     enabled_assets = runtime_state.get_enabled_assets()
     lines = [
-        "🤖 *Polymarket Multi-Asset Bot*",
+        "🤖 *Polymarket 5m Chainlink Bot*",
         "",
         f"Статус: {'⏸ на паузе' if paused else '▶️ активен'} | Режим: {'🧪 DRY RUN' if dry_run else '🔴 LIVE'}",
         f"Активы: {', '.join(a.upper() for a in sorted(enabled_assets)) or '(нет включённых)'}",
         f"Размер позиции: {_size_summary()}",
         f"Стоп-лосс/день: {runtime_state.get('daily_loss_limit_usdc'):.0f} USDC",
         f"Стоп-лосс позиции: {'вкл ' + str(round(runtime_state.get('position_stop_loss_pct'))) + '%' if pos_sl_on else 'выкл'}",
-        f"Стратегия: {_strategy_summary()}",
         f"Safety score порог: {runtime_state.get('safety_score_threshold'):.0f}",
         f"Диапазон входа: {runtime_state.get('min_entry_price'):.2f}–{runtime_state.get('max_entry_price'):.2f}",
         f"Мин. расстояние от страйка: {_distance_summary()}",
@@ -156,7 +94,7 @@ def _main_menu_text() -> str:
             inst = s[key]
             lines.append(
                 f"  {inst['asset'].upper()} {inst['timeframe']}: {inst.get('direction','—')} "
-                f"score {inst.get('safety_score','—')}"
+                f"score {inst.get('safety_score','—')} | цена: {inst.get('price_source','—')}"
             )
     return "\n".join(lines)
 
@@ -174,8 +112,6 @@ def _main_menu_markup() -> InlineKeyboardMarkup:
             InlineKeyboardButton("📉 Стоп-лосс позиции", callback_data="menu:possl"),
             InlineKeyboardButton("📈 Диапазон входа", callback_data="menu:range"),
         ],
-        [InlineKeyboardButton("🧭 Стратегия", callback_data="menu:strategy")],
-        [InlineKeyboardButton("🔬 Исследование «лестниц»", callback_data="ladder:menu")],
         [InlineKeyboardButton("🐋 Слежка за кошельком", callback_data="menu:wallet")],
         [InlineKeyboardButton("🔒 Хедж-бот", callback_data="menu:hedge")],
         [
@@ -495,28 +431,20 @@ async def _cmd_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _stats_text() -> str:
     today_start = int(time.time() // 86400) * 86400
 
-    def _line(title: str, s: dict) -> str:
-        rate = f" ({s['wins'] / s['trades'] * 100:.0f}%)" if s["trades"] else ""
-        return f"{title}: {s['trades']} сделок, PnL {s['pnl_usdc']:+.2f} USDC, побед {s['wins']}{rate}"
+    today = storage.get_pnl_summary(today_start)
+    total = storage.get_pnl_summary(0)
 
-    lines = ["📊 *Статистика*"]
-    # Реальные и виртуальные (DRY RUN) сделки — раздельно: когда стратегию
-    # проверяют в DRY RUN, её винрейт не должен смешиваться с реальными деньгами.
-    for title, live_only, dry_only in (("🔴 Реальные", True, False), ("🧪 Виртуальные (DRY RUN)", False, True)):
-        total = storage.get_pnl_summary(0, live_only=live_only, dry_only=dry_only)
-        if not total["trades"] and dry_only:
-            continue
-        today = storage.get_pnl_summary(today_start, live_only=live_only, dry_only=dry_only)
-        lines += ["", f"*{title}*", _line("Сегодня (UTC)", today), _line("Всего", total)]
-        if dry_only:
-            losses = total["trades"] - total["wins"]
-            lines.append(f"Проверка: {total['trades']}/100 сделок, проигрышей {losses} "
-                         "(вернуть деньги можно, если к 100 сделкам их не больше 12)")
+    lines = [
+        "📊 *Статистика*",
+        "",
+        f"Сегодня: {today['trades']} сделок, PnL {today['pnl_usdc']:+.2f} USDC, побед {today['wins']}",
+        f"Всего: {total['trades']} сделок, PnL {total['pnl_usdc']:+.2f} USDC, побед {total['wins']}",
+    ]
 
     by_asset_total = storage.get_pnl_by_asset(0)
     if by_asset_total:
         lines.append("")
-        lines.append("*По токенам (всего, реальные + виртуальные):*")
+        lines.append("*По токенам (всего):*")
         for asset in sorted(by_asset_total.keys()):
             b = by_asset_total[asset]
             lines.append(f"  {asset.upper()}: {b['trades']} сделок, PnL {b['pnl_usdc']:+.2f}, побед {b['wins']}")
@@ -524,7 +452,7 @@ def _stats_text() -> str:
     by_tf_total = storage.get_pnl_by_timeframe(0)
     if by_tf_total:
         lines.append("")
-        lines.append("*По таймфреймам (всего, реальные + виртуальные):*")
+        lines.append("*По таймфреймам (всего):*")
         for label in sorted(by_tf_total.keys()):
             b = by_tf_total[label]
             lines.append(f"  {label}: {b['trades']} сделок, PnL {b['pnl_usdc']:+.2f}, побед {b['wins']}")
@@ -830,55 +758,6 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ Отмена", callback_data="menu:range")]]),
         )
 
-    elif data == "menu:strategy":
-        await query.edit_message_text(_strategy_text(), reply_markup=_strategy_menu_markup())
-
-    elif data.startswith("strat_mode:"):
-        runtime_state.set("strategy_mode", data.split(":", 1)[1])
-        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
-
-    elif data.startswith("mom_band:"):
-        _, a, b = data.split(":")
-        runtime_state.set("mom_min_price", float(a))
-        runtime_state.set("mom_max_price", float(b))
-        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
-
-    elif data.startswith("mom_spread:"):
-        runtime_state.set("mom_max_spread", float(data.split(":", 1)[1]))
-        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
-
-    elif data.startswith("mom_min:"):
-        runtime_state.set("mom_min_minutes_left", float(data.split(":", 1)[1]))
-        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
-
-    elif data == "ladder:menu":
-        await query.edit_message_text(
-            "🔬 Исследование «лестниц» (ничего не покупает)\n\n"
-            "Выгружает историю рынков «Bitcoin/Ethereum above ___ on <дата>»: цены всех страйков за "
-            "3 суток до конца и исход по свече Binance. Займёт ~5–15 минут, бот при этом работает как обычно. "
-            "Готовый CSV придёт сюда — перешли его мне.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("Выгрузить 60 дней", callback_data="ladder:run:60"),
-                 InlineKeyboardButton("120 дней", callback_data="ladder:run:120")],
-                [InlineKeyboardButton("◀️ Назад", callback_data="menu:main")],
-            ]),
-        )
-
-    elif data.startswith("ladder:run:"):
-        from src import ladder_research  # локальный импорт: модуль сам импортирует telegram_notify
-        if ladder_research.is_running():
-            await query.edit_message_text("🔬 Выгрузка уже идёт — дождись файла.",
-                                          reply_markup=_main_menu_markup())
-        else:
-            days = int(data.rsplit(":", 1)[1])
-            context.application.create_task(ladder_research.run(days=days))
-            await query.edit_message_text(f"🔬 Запустил выгрузку за {days} дней. Пришлю CSV сюда.",
-                                          reply_markup=_main_menu_markup())
-
-    elif data == "news_pause:toggle":
-        runtime_state.set("news_pause_enabled", not runtime_state.get("news_pause_enabled"))
-        await query.edit_message_text("✅ " + _strategy_text(), reply_markup=_strategy_menu_markup())
-
     elif data == "menu:settings":
         await query.edit_message_text(_settings_text(), reply_markup=_settings_menu_markup())
 
@@ -897,7 +776,7 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "preset_apply":
         runtime_state.apply_recommended()
         await query.edit_message_text(
-            f"⭐ Применены рекомендованные настройки. Стратегия: {_strategy_summary()}. Классика: порог 88, диапазон "
+            "⭐ Применены рекомендованные настройки: порог 88, диапазон "
             f"{runtime_state.get('min_entry_price'):.2f}–{runtime_state.get('max_entry_price'):.2f}.\n\n"
             + _settings_text(),
             reply_markup=_settings_menu_markup(),

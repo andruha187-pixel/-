@@ -93,7 +93,7 @@ CREATE TABLE IF NOT EXISTS hedge_positions (
     hedge_cost REAL,
     hedge_token_id TEXT,
     hedge_ts INTEGER,
-    status TEXT,          -- 'open_unhedged' | 'hedged' | 'closed'
+    status TEXT,
     outcome TEXT,
     pnl_usdc REAL,
     dry_run INTEGER
@@ -188,6 +188,9 @@ _SIGNALS_MIGRATIONS = [
     ("timeframe", "TEXT"),
     ("macd_histogram", "REAL"),
     ("macd_bullish", "INTEGER"),
+    ("price_source", "TEXT"),      # "chainlink" | "binance" (запасной)
+    ("binance_price", "REAL"),
+    ("binance_strike", "REAL"),
 ]
 
 _TRADES_MIGRATIONS = [
@@ -221,7 +224,9 @@ def init_db():
 
 
 def log_signal(market_slug: str, current_price: float, strike_price: float, decision,
-               indicators: dict | None = None, up_book=None, down_book=None) -> None:
+               indicators: dict | None = None, up_book=None, down_book=None,
+               price_source: str | None = None, binance_price: float | None = None,
+               binance_strike: float | None = None) -> None:
     """
     indicators/up_book/down_book необязательны (обратная совместимость), но
     без них отчёт для анализа будет неполным — main.py всегда должен их
@@ -237,8 +242,8 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 atr, atr_ratio_to_avg, ema_fast, ema_slow, ema_fast_slope, trend_up,
                 time_score, distance_score, trend_score, vol_score, liq_score,
                 ask_liquidity_usdc, up_best_ask, down_best_ask, book_source, asset, timeframe,
-                macd_histogram, macd_bullish)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                macd_histogram, macd_bullish, price_source, binance_price, binance_strike)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 int(time.time()), market_slug, current_price, strike_price, decision.direction,
                 decision.entry_price, decision.safety_score, decision.minutes_left,
@@ -257,6 +262,7 @@ def log_signal(market_slug: str, current_price: float, strike_price: float, deci
                 asset, timeframe_label,
                 indicators.get("macd_histogram"),
                 int(indicators.get("macd_bullish")) if indicators.get("macd_bullish") is not None else None,
+                price_source, binance_price, binance_strike,
             ),
         )
 
@@ -326,7 +332,7 @@ def count_open_trades() -> int:
 
 
 def parse_market_slug(slug: str) -> tuple[str, str]:
-    """'sol-updown-1h-1789270200' -> ('sol', '1h'). Если формат неожиданный,
+    """'sol-updown-5m-1789270200' -> ('sol', '5m'). Если формат неожиданный,
     возвращает ('unknown', 'unknown') вместо падения — отчёты не должны
     рушиться из-за одного странного слага."""
     try:
@@ -346,14 +352,13 @@ def get_unsettled_trades():
         return cur.fetchall()
 
 
-def get_pnl_summary(since_ts: int = 0, live_only: bool = False, dry_only: bool = False):
+def get_pnl_summary(since_ts: int = 0, live_only: bool = False):
     with _conn() as conn:
-        if live_only or dry_only:
+        if live_only:
             cur = conn.execute(
                 "SELECT COUNT(*), COALESCE(SUM(pnl_usdc), 0), "
                 "SUM(CASE WHEN pnl_usdc > 0 THEN 1 ELSE 0 END) "
-                "FROM trades WHERE outcome IS NOT NULL AND ts >= ? AND dry_run = ?",
-                (since_ts, 1 if dry_only else 0),
+                "FROM trades WHERE outcome IS NOT NULL AND ts >= ? AND dry_run = 0", (since_ts,),
             )
         else:
             cur = conn.execute(
@@ -387,7 +392,7 @@ def get_pnl_by_asset(since_ts: int = 0) -> dict[str, dict]:
 
 
 def get_pnl_by_timeframe(since_ts: int = 0) -> dict[str, dict]:
-    """То же самое, но сгруппировано по таймфрейму (15m/1h) вместо актива."""
+    """То же самое, но сгруппировано по таймфрейму вместо актива (в этом боте таймфрейм всегда 5m, но колонка общая с основным ботом)."""
     with _conn() as conn:
         cur = conn.execute(
             "SELECT market_slug, pnl_usdc FROM trades WHERE outcome IS NOT NULL AND ts >= ?",
@@ -414,13 +419,14 @@ SIGNALS_COLUMNS = [
     "atr", "atr_ratio_to_avg", "ema_fast", "ema_slow", "ema_fast_slope", "trend_up",
     "time_score", "distance_score", "trend_score", "vol_score", "liq_score",
     "ask_liquidity_usdc", "up_best_ask", "down_best_ask", "book_source", "outcome",
-    "macd_histogram", "macd_bullish",
+    "macd_histogram", "macd_bullish", "price_source", "binance_price", "binance_strike",
 ]
 
 TRADES_COLUMNS = [
     "id", "ts", "market_slug", "condition_id", "direction", "entry_price", "size_usdc",
     "order_id", "status", "outcome", "pnl_usdc", "dry_run", "token_id", "source",
 ]
+
 
 MOMENTUM_COLUMNS = [
     "id", "ts", "market_slug", "asset", "timeframe", "side", "checkpoint_price", "minutes_left",
