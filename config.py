@@ -71,6 +71,12 @@ class Settings:
     # торговать по Binance, как основной бот (False).
     CHAINLINK_REQUIRED: bool = _get_bool("CHAINLINK_REQUIRED", True)
     CHAINLINK_MAX_AGE_SEC: float = _get_float("CHAINLINK_MAX_AGE_SEC", 5.0)
+    # Если поток Chainlink не застал старт окна (обрыв, перезапуск бота), страйк
+    # оцениваем как страйк Binance + текущая разница Chainlink−Binance (она почти
+    # постоянна: 04.10 медиана −$14, разброс ~$4). Для решения о входе такое
+    # расстояние до страйка уменьшаем на запас CHAINLINK_EST_MARGIN_USD.
+    CHAINLINK_ALLOW_STRIKE_ESTIMATE: bool = _get_bool("CHAINLINK_ALLOW_STRIKE_ESTIMATE", True)
+    CHAINLINK_EST_MARGIN_USD: float = _get_float("CHAINLINK_EST_MARGIN_USD", 10.0)
 
     MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.0)
 
