@@ -38,12 +38,18 @@ TOPIC = "crypto_prices_chainlink"
 PING_INTERVAL_SEC = 5
 RECONNECT_BACKOFF_SEC = 2
 HISTORY_SEC = 20 * 60
+# Если данных нет дольше этого — соединение «зависло»: сервер перестал слать
+# цены, но сокет не закрыл (PING при этом уходит без ошибок). Так 04.10 поток
+# молчал по 30–100 минут подряд, и бот пропустил половину окон без страйка.
+STALL_SEC = 15
 
 # asset -> отсортированные по времени списки (ts_sec, value)
 _hist_ts: dict[str, list[float]] = {}
 _hist_val: dict[str, list[float]] = {}
 _last_rx: dict[str, float] = {}      # asset -> локальное время последнего апдейта
 _connected = False
+_last_data = 0.0                      # локальное время последнего сообщения с ценами
+_reconnects = 0
 
 
 def _asset_from_symbol(symbol: str) -> str | None:
@@ -146,7 +152,7 @@ def latest(asset: str) -> tuple[float | None, float | None]:
     return _hist_val[asset.lower()][-1], max(0.0, time.time() - tss[-1])
 
 
-def price_at(asset: str, ts_sec: float, tolerance_sec: float = 3.0) -> float | None:
+def price_at(asset: str, ts_sec: float, tolerance_sec: float = 5.0) -> float | None:
     """Цена оракула на момент ts_sec: первая точка с временем >= ts_sec
     (не дальше tolerance_sec). Если точной точки нет, но есть точка чуть
     раньше (в пределах tolerance) — берём её. Иначе None: не гадаем."""
@@ -167,6 +173,20 @@ def is_connected() -> bool:
     return _connected
 
 
+def reconnects() -> int:
+    return _reconnects
+
+
+async def _watchdog(ws) -> None:
+    """Закрывает зависшее соединение, чтобы run_forever переподключился."""
+    while True:
+        await asyncio.sleep(5)
+        if time.time() - _last_data > STALL_SEC:
+            log.warning("Chainlink RTDS: нет цен %.0f с — переподключаюсь", time.time() - _last_data)
+            await ws.close()
+            return
+
+
 async def _pinger(ws) -> None:
     while True:
         await asyncio.sleep(PING_INTERVAL_SEC)
@@ -174,15 +194,17 @@ async def _pinger(ws) -> None:
 
 
 async def run_forever() -> None:
-    global _connected
+    global _connected, _last_data, _reconnects
     sub = {"action": "subscribe", "subscriptions": [{"topic": TOPIC, "type": "*"}]}
     while True:
         try:
             async with websockets.connect(WS_URL, ping_interval=None, max_size=2**22) as ws:
                 await ws.send(json.dumps(sub))
                 _connected = True
+                _last_data = time.time()  # даём серверу STALL_SEC на первые цены
                 log.info("Chainlink RTDS connected")
                 pinger = asyncio.create_task(_pinger(ws))
+                watchdog = asyncio.create_task(_watchdog(ws))
                 try:
                     async for raw in ws:
                         if not raw or raw in ("PONG", "pong"):
@@ -191,10 +213,13 @@ async def run_forever() -> None:
                             parsed = json.loads(raw)
                         except (json.JSONDecodeError, ValueError):
                             continue
+                        _last_data = time.time()
                         _handle_message(parsed)
                 finally:
                     pinger.cancel()
+                    watchdog.cancel()
         except Exception as exc:  # noqa: BLE001
             log.warning("Chainlink RTDS disconnected (%s), reconnecting in %ss", exc, RECONNECT_BACKOFF_SEC)
         _connected = False
+        _reconnects += 1
         await asyncio.sleep(RECONNECT_BACKOFF_SEC)

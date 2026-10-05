@@ -13,7 +13,10 @@
 from __future__ import annotations
 import asyncio
 import logging
+import math
+import statistics
 import time
+from collections import deque
 
 from config import settings
 from src import binance_feed, market_discovery, indicators, strategy
@@ -40,6 +43,56 @@ _active_markets: dict[str, ActiveMarket] = {}
 
 # Страйк по Chainlink для каждого рынка (slug -> цена оракула на старт окна).
 _cl_strikes: dict[str, float] = {}
+
+# Разница Chainlink − Binance по каждому активу за последние ~10 минут тиков:
+# по ней оцениваем страйк, если поток Chainlink не застал старт окна.
+_basis: dict[str, deque] = {}
+
+
+def resolve_prices(asset: str, market: ActiveMarket, binance_price: float) -> dict:
+    """Цена/страйк для решения о входе.
+
+    Возвращает dict: current_price/strike_price (для лога), eval_price (для
+    strategy.evaluate), price_source ("chainlink" | "chainlink_est" | "binance"),
+    cl_problem (None, если по Chainlink можно торговать)."""
+    if market.slug not in _cl_strikes:
+        cl_strike = chainlink_feed.price_at(asset, market.start_time)
+        if cl_strike is not None:
+            _cl_strikes[market.slug] = cl_strike
+            if len(_cl_strikes) > 200:
+                for old in list(_cl_strikes)[:100]:
+                    _cl_strikes.pop(old, None)
+    cl_strike = _cl_strikes.get(market.slug)
+    cl_price, cl_age = chainlink_feed.latest(asset)
+    fresh = cl_price is not None and cl_age is not None and cl_age <= settings.CHAINLINK_MAX_AGE_SEC
+    if fresh and binance_price:
+        _basis.setdefault(asset, deque(maxlen=120)).append(cl_price - binance_price)
+
+    estimated = False
+    if cl_strike is None and fresh and settings.CHAINLINK_ALLOW_STRIKE_ESTIMATE \
+            and len(_basis.get(asset, ())) >= 12 and market.strike_price:
+        cl_strike = market.strike_price + statistics.median(_basis[asset])
+        estimated = True
+
+    cl_problem = None
+    if cl_strike is None:
+        cl_problem = "нет цены Chainlink на старт окна (бот запущен посреди окна или поток не подключён)"
+    elif cl_price is None:
+        cl_problem = "нет текущей цены Chainlink"
+    elif not fresh:
+        cl_problem = f"цена Chainlink устарела ({cl_age:.0f} с)"
+
+    if cl_problem is not None:
+        return {"current_price": binance_price, "strike_price": market.strike_price, "eval_price": binance_price,
+                "price_source": "binance", "cl_problem": cl_problem}
+    eval_price = cl_price
+    if estimated:
+        # Страйк оценён с погрешностью ~$5 — для решения считаем, что до
+        # страйка на CHAINLINK_EST_MARGIN_USD ближе, чем видно.
+        d = cl_price - cl_strike
+        eval_price = cl_strike + math.copysign(max(0.0, abs(d) - settings.CHAINLINK_EST_MARGIN_USD), d)
+    return {"current_price": cl_price, "strike_price": cl_strike, "eval_price": eval_price,
+            "price_source": "chainlink_est" if estimated else "chainlink", "cl_problem": None}
 
 # Последнее состояние каждого потока — для команды /token и общего статуса.
 _instance_state: dict[str, dict] = {}
@@ -90,28 +143,10 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
     binance_price = ind["close"]
 
     # Цена и страйк по Chainlink — по ним Polymarket решает исход. Binance
-    # остаётся только для индикаторов (ATR/EMA/MACD) и как запасной вариант.
-    if market.slug not in _cl_strikes:
-        cl_strike = chainlink_feed.price_at(asset, market.start_time)
-        if cl_strike is not None:
-            _cl_strikes[market.slug] = cl_strike
-            if len(_cl_strikes) > 200:
-                for old in list(_cl_strikes)[:100]:
-                    _cl_strikes.pop(old, None)
-    cl_strike = _cl_strikes.get(market.slug)
-    cl_price, cl_age = chainlink_feed.latest(asset)
-    cl_problem = None
-    if cl_strike is None:
-        cl_problem = "нет цены Chainlink на старт окна (бот запущен посреди окна или поток не подключён)"
-    elif cl_price is None:
-        cl_problem = "нет текущей цены Chainlink"
-    elif cl_age > settings.CHAINLINK_MAX_AGE_SEC:
-        cl_problem = f"цена Chainlink устарела ({cl_age:.0f} с)"
-
-    if cl_problem is None:
-        current_price, strike_price, price_source = cl_price, cl_strike, "chainlink"
-    else:
-        current_price, strike_price, price_source = binance_price, market.strike_price, "binance"
+    # остаётся для индикаторов (ATR/EMA/MACD) и как запасной вариант.
+    px = resolve_prices(asset, market, binance_price)
+    current_price, strike_price, price_source = px["current_price"], px["strike_price"], px["price_source"]
+    cl_problem = px["cl_problem"]
 
     minutes_left = max(0.0, (market.end_time - time.time()) / 60)
 
@@ -120,7 +155,7 @@ async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
     down_book = await get_book(market.down_token_id)
 
     decision = strategy.evaluate(
-        current_price=current_price,
+        current_price=px["eval_price"],
         strike_price=strike_price,
         minutes_left=minutes_left,
         indicators=ind,
