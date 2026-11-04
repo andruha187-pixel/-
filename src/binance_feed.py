@@ -1,12 +1,8 @@
 """
-Источник данных о цене — публичный REST API Binance (ключ не нужен).
-Параметризован по символу — один и тот же код обслуживает все активы.
+Свечи Binance для ATR (публичный REST API, ключ не нужен).
 
-Фолбэк на фьючерсы (fapi.binance.com): часть монет может не иметь спотовой
-пары на обычном Binance (на момент написания это под вопросом для HYPE) —
-если спотовый запрос возвращает 400/404, пробуем тот же символ на
-фьючерсном хосте. Если и там нет — актив просто пропускается на этом тике
-(main.py логирует предупреждение и не падает).
+Фолбэк на фьючерсы (fapi.binance.com): если у монеты нет спотовой пары
+(запрос вернул 400/404), пробуем тот же символ на фьючерсном хосте.
 """
 from __future__ import annotations
 import httpx
@@ -26,6 +22,7 @@ SYMBOL_MAP = {
     "bnb": "BNBUSDT",
     "xrp": "XRPUSDT",
     "hype": "HYPEUSDT",
+    "doge": "DOGEUSDT",
 }
 
 
@@ -58,31 +55,3 @@ async def get_klines(symbol: str, limit: int = 100, interval: str = "1m",
         return await _get_klines_from(settings.BINANCE_BASE_URL, symbol, interval, limit, start_time_ms)
     except httpx.HTTPStatusError:
         return await _get_klines_from(settings.BINANCE_FUTURES_URL, symbol, interval, limit, start_time_ms)
-
-
-async def get_price_at(symbol: str, timestamp_sec: int) -> float:
-    """
-    Цена на начало минуты, в которую стартовал рынок на Polymarket. Это и
-    есть "страйк" — рынок резолвится как Up, если цена в конце окна >=
-    цены в начале окна. Всегда 1m-свеча, независимо от таймфрейма рынка —
-    точность момента открытия важнее, чем таймфрейм индикаторов.
-    """
-    minute_start_ms = (timestamp_sec // 60) * 60 * 1000
-    df = await get_klines(symbol, limit=1, interval="1m", start_time_ms=minute_start_ms)
-    if df.empty:
-        raise RuntimeError(f"Binance не вернул свечу для {symbol} timestamp={timestamp_sec}")
-    return float(df.iloc[0]["open"])
-
-
-async def get_last_price(symbol: str) -> float:
-    async def _try(base_url: str) -> float:
-        url = f"{base_url}/fapi/v1/ticker/price" if "fapi" in base_url else f"{base_url}/api/v3/ticker/price"
-        async with httpx.AsyncClient(timeout=10) as client:
-            resp = await client.get(url, params={"symbol": symbol})
-            resp.raise_for_status()
-            return float(resp.json()["price"])
-
-    try:
-        return await _try(settings.BINANCE_BASE_URL)
-    except httpx.HTTPStatusError:
-        return await _try(settings.BINANCE_FUTURES_URL)

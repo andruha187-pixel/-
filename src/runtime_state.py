@@ -1,94 +1,180 @@
 """
-Настройки, которые можно менять на лету из Telegram (без передеплоя):
-размер позиции, дневной стоп-лосс, порог safety score, диапазон входа,
-пауза, режим DRY_RUN/LIVE.
+Настройки, которые меняются на лету из Telegram: общий режим DRY RUN / LIVE,
+монеты (вкл/выкл, 🧪 тест / 🔴 реально) и правило входа ⏱ (окно, цена,
+расстояние до страйка, ATR, ставка, дневной стоп).
 
-Живут в памяти для быстрого доступа из strategy/executor на каждом тике,
-но каждое изменение сразу пишется в SQLite (`bot_settings`) — переживает
-рестарт процесса (важно на Render: контейнер может перезапуститься сам
-по себе, не только по твоей команде).
+Живут в памяти, каждое изменение сразу пишется в SQLite (`bot_settings`) и
+переживает рестарт — если база на постоянном томе (/app/data).
+
+У монеты может быть своя сумма входа (💵: $ или % банка) и свой банк (🏦): сумма,
+с которой монета стартовала, и момент, с которого считаем её реальные ставки.
+И сторона реальных ставок (🎯): обе, только UP или только DOWN — тестовые идут по обеим.
+
+➕ Докупка на откате: вкл/выкл, 🧪 тест / 🔴 реально (независимо от основной
+стратегии), уровни цены и сумма на уровень.
 """
 from __future__ import annotations
+import json
+import re
+import time
 
 from config import settings
 from src import storage
 
+
+def _coins_csv(raw: str) -> str:
+    return ",".join(sorted({a.strip().lower() for a in (raw or "").split(",") if a.strip()}))
+
+
+def _bool(v) -> bool:
+    return str(v).lower() == "true"
+
+
+# Пределы, чтобы кнопки и ввод вручную не сделали правило бессмысленным
+WINDOW_LIMITS = (5, 295)            # окно входа — секунд до конца 5-минутного окна
+PRICE_LIMITS = (0.50, 0.99)
+STAKE_LIMITS = (1.0, 1000.0)
+PCT_LIMITS = (0.1, 100.0)           # ставка монеты — % от банка
+BANK_LIMITS = (0.0, 1_000_000.0)    # банк вручную (0 — не задан)
+
+
+def _stakes_json(v) -> str:
+    """Ставки монет: {"btc": {"mode": "usd", "value": 20}, "eth": {"mode": "pct", "value": 5}} — проверенный JSON."""
+    raw = json.loads(v) if isinstance(v, str) else dict(v or {})
+    out = {}
+    for asset, cfg in (raw or {}).items():
+        mode, value = str(cfg.get("mode")), float(cfg.get("value"))
+        if mode == "usd":
+            value = min(STAKE_LIMITS[1], max(STAKE_LIMITS[0], value))
+        elif mode == "pct":
+            value = min(PCT_LIMITS[1], max(PCT_LIMITS[0], value))
+        else:
+            continue
+        out[str(asset).lower()] = {"mode": mode, "value": round(value, 2)}
+    return json.dumps(out, sort_keys=True)
+
+
+def _banks_json(v) -> str:
+    """Свои банки монет: {"btc": {"start": 100, "since": 1793600000}} — проверенный JSON (сумма > 0)."""
+    raw = json.loads(v) if isinstance(v, str) else dict(v or {})
+    out = {}
+    for asset, cfg in (raw or {}).items():
+        try:
+            start, since = float(cfg.get("start")), int(float(cfg.get("since") or 0))
+        except (TypeError, ValueError, AttributeError):
+            continue
+        if not start > 0:
+            continue
+        out[str(asset).lower()] = {"start": round(min(BANK_LIMITS[1], start), 2), "since": max(0, since)}
+    return json.dumps(out, sort_keys=True)
+
+
+SIDES = ("UP", "DOWN")
+
+
+def _sides_json(v) -> str:
+    """Сторона реальных ставок монет: {"btc": "UP"} — только эта сторона; нет записи — обе."""
+    raw = json.loads(v) if isinstance(v, str) else dict(v or {})
+    out = {str(a).lower(): str(s).upper() for a, s in (raw or {}).items() if str(s).upper() in SIDES}
+    return json.dumps(out, sort_keys=True)
+
+
+ADDON_USD_LIMITS = (0.1, 1000.0)    # ➕ докупка — $ на уровень
+ADDON_MAX_LEVELS = 20
+ADDON_DEFAULT_LEVELS = "0.95,0.94,0.93,0.92,0.91,0.90"
+
+
+def _levels_csv(v) -> str:
+    """Уровни докупки → «0.95,0.94,…»: от большего к меньшему, без повторов, в пределах цены (0.50–0.99),
+    не больше ADDON_MAX_LEVELS. Ни одного годного — ValueError (остаётся прежнее значение)."""
+    # (set() тут нельзя: ниже в модуле set — запись настройки)
+    raw = v if isinstance(v, (list, tuple, frozenset)) or type(v).__name__ == "set" \
+        else re.split(r"[,;\s]+", str(v or ""))
+    out: dict[float, None] = {}
+    for x in raw:
+        try:
+            f = float(str(x).strip())
+        except ValueError:
+            continue
+        f = round(f / 100 if f > 1 else f, 2)
+        if PRICE_LIMITS[0] - 1e-9 <= f <= PRICE_LIMITS[1] + 1e-9:
+            out[f] = None
+    if not out:
+        raise ValueError("нет ни одного уровня 0.50–0.99")
+    return ",".join(f"{x:.2f}" for x in sorted(out, reverse=True)[:ADDON_MAX_LEVELS])
+
+
+def _addon_usd(v) -> float:
+    return round(min(ADDON_USD_LIMITS[1], max(ADDON_USD_LIMITS[0], float(v))), 2)
+
+
+def _default_levels() -> str:
+    try:
+        return _levels_csv(settings.LATE_ADDON_LEVELS)
+    except ValueError:
+        return ADDON_DEFAULT_LEVELS
+
+
+def _sec(v) -> int:
+    return int(min(WINDOW_LIMITS[1], max(WINDOW_LIMITS[0], int(float(v)))))
+
+
+def _price(v) -> float:
+    return round(min(PRICE_LIMITS[1], max(PRICE_LIMITS[0], float(v))), 2)
+
+
 _DEFAULTS = {
-    "paused": False,
     "dry_run": settings.DRY_RUN,
-    "trade_size_usdc": settings.TRADE_SIZE_USDC,
-    "daily_loss_limit_usdc": settings.DAILY_LOSS_LIMIT_USDC,
-    "safety_score_threshold": settings.SAFETY_SCORE_THRESHOLD,
-    "min_entry_price": settings.MIN_ENTRY_PRICE,
-    "max_entry_price": settings.MAX_ENTRY_PRICE,
-    # Мин. расстояние цены от страйка, % от цены (0 = выкл) — см. config.py.
-    "min_distance_pct": settings.MIN_DISTANCE_PCT,
-    # Версия применённого набора рекомендованных настроек (см. RECOMMENDED ниже).
-    "preset_version": 0,
-    # По умолчанию выключено: каждая прошедшая порог сделка идёт полным
-    # TRADE_SIZE_USDC, без урезания по пограничности score.
-    "size_scaling_enabled": False,
-    # Стоп-лосс ОТДЕЛЬНОЙ позиции в процентах (не дневной!): если текущая
-    # стоимость позиции (по best bid в стакане) упала настолько от суммы
-    # входа — закрываем досрочно продажей, не дожидаясь резолюции рынка.
-    "position_stop_loss_enabled": False,
-    "position_stop_loss_pct": 50.0,
-    # Какие активы сейчас реально торгуются — можно включать/выключать
-    # по одному через Telegram, не трогая остальные и не передеплоя.
-    # Хранится как строка через запятую (см. get/set_enabled_assets ниже).
-    "enabled_assets": ",".join(settings.ASSETS),
-    # Режим размера ставки: "fixed" (константа в USDC, trade_size_usdc) или
-    # "percent" (доля от ТЕКУЩЕГО банка — starting_bankroll_usdc + вся
-    # реализованная прибыль/убыток с начала). Percent-режим сам сжимается
-    # при просадке и растёт при выигрышах — в отличие от fixed, который на
-    # похудевшем банке становится относительно только агрессивнее.
-    "sizing_mode": "fixed",
-    "bankroll_pct": 5.0,
-    "starting_bankroll_usdc": 60.0,
-    # Отслеживание чужого кошелька: уведомления всегда можно включить
-    # отдельно от реального копирования сделок (copytrade) — по умолчанию
-    # только уведомляем, ничего не покупаем автоматически.
-    "wallet_notify_enabled": True,
-    "wallet_copytrade_enabled": False,
-    "copytrade_size_usdc": 5.0,
-    # Хедж-бот: вход по ENTRY_PRICE, докупка противоположной стороны при
-    # достижении HEDGE_PRICE — см. src/hedge_bot.py. Пороги пришли из
-    # анализа реальных momentum-отчётов (2026-09-20): хедж на 0.90 дал
-    # положительный PnL на бэктесте, хедж на 0.70-0.85 — отрицательный,
-    # несмотря на то, что сам хедж всегда безубыточен по построению —
-    # разница в том, сколько сессий вообще НЕ доходит до точки хеджа и
-    # остаётся неприкрытой позицией (см. обсуждение в чате).
-    "hedge_bot_enabled": False,  # хедж живёт отдельным ботом (polymarket-hedge-bot)
-    "hedge_entry_price": 0.70,
-    "hedge_trigger_price": 0.90,
-    "hedge_stake_usdc": 5.0,
+    "late_coins_on": _coins_csv(settings.LATE_COINS),
+    "late_coins_live": _coins_csv(settings.LATE_LIVE_COINS),
+    "late_enabled": settings.LATE_ENABLED,
+    "late_from_sec": _sec(max(settings.LATE_FROM_SEC, settings.LATE_TO_SEC)),
+    "late_to_sec": _sec(min(settings.LATE_FROM_SEC, settings.LATE_TO_SEC)),
+    "late_min_price": _price(min(settings.LATE_MIN_PRICE, settings.LATE_MAX_PRICE)),
+    "late_max_price": _price(max(settings.LATE_MIN_PRICE, settings.LATE_MAX_PRICE)),
+    "late_min_dist": max(0.0, settings.LATE_MIN_DIST_PCT),
+    "late_min_atr": max(0.0, settings.LATE_MIN_ATR),
+    "late_stake": min(STAKE_LIMITS[1], max(STAKE_LIMITS[0], settings.LATE_STAKE_USDC)),
+    "late_stop": max(0.0, settings.LATE_STOP_USDC),
+    # с какого момента действует нынешнее правило (итоги «по нынешнему правилу» — с него)
+    "late_rule_since": 0,
+    # своя ставка у монеты: фиксированная $ или % от банка (нет записи — общая ставка late_stake)
+    "late_coin_stakes": "{}",
+    # банк для ставок в % — если баланс кошелька не читается (0 — не задан)
+    "late_bank_manual": max(0.0, settings.LATE_BANK_USDC),
+    # свой банк монеты: сумма и с какого момента считаем её реальные ставки (нет записи — общий банк)
+    "late_coin_banks": "{}",
+    # сторона реальных ставок монеты: "UP" / "DOWN" (нет записи — обе); тестовые — всегда обе
+    "late_coin_sides": "{}",
+    # ➕ докупка на откате: вкл/выкл, 🔴 реально (иначе только тест), уровни цены, $ на уровень
+    "late_addon_on": settings.LATE_ADDON_ON,
+    "late_addon_live": settings.LATE_ADDON_LIVE,
+    "late_addon_levels": _default_levels(),
+    "late_addon_usd": _addon_usd(settings.LATE_ADDON_USDC),
 }
 
-# Типы приведения при чтении из SQLite (там всё хранится как TEXT)
 _CASTERS = {
-    "paused": lambda v: str(v).lower() == "true",
-    "dry_run": lambda v: str(v).lower() == "true",
-    "trade_size_usdc": float,
-    "daily_loss_limit_usdc": float,
-    "safety_score_threshold": float,
-    "min_entry_price": float,
-    "max_entry_price": float,
-    "min_distance_pct": float,
-    "preset_version": int,
-    "size_scaling_enabled": lambda v: str(v).lower() == "true",
-    "position_stop_loss_enabled": lambda v: str(v).lower() == "true",
-    "position_stop_loss_pct": float,
-    "enabled_assets": str,
-    "sizing_mode": str,
-    "bankroll_pct": float,
-    "starting_bankroll_usdc": float,
-    "wallet_notify_enabled": lambda v: str(v).lower() == "true",
-    "wallet_copytrade_enabled": lambda v: str(v).lower() == "true",
-    "copytrade_size_usdc": float,
-    "hedge_bot_enabled": lambda v: str(v).lower() == "true",
-    "hedge_entry_price": float,
-    "hedge_trigger_price": float,
-    "hedge_stake_usdc": float,
+    "dry_run": _bool,
+    "late_coins_on": str,
+    "late_coins_live": str,
+    "late_enabled": _bool,
+    "late_from_sec": _sec,
+    "late_to_sec": _sec,
+    "late_min_price": _price,
+    "late_max_price": _price,
+    "late_min_dist": lambda v: max(0.0, float(v)),
+    "late_min_atr": lambda v: max(0.0, float(v)),
+    "late_stake": lambda v: min(STAKE_LIMITS[1], max(STAKE_LIMITS[0], float(v))),
+    "late_stop": lambda v: max(0.0, float(v)),
+    "late_rule_since": lambda v: int(float(v)),
+    "late_coin_stakes": _stakes_json,
+    "late_bank_manual": lambda v: min(BANK_LIMITS[1], max(BANK_LIMITS[0], float(v))),
+    "late_coin_banks": _banks_json,
+    "late_coin_sides": _sides_json,
+    "late_addon_on": _bool,
+    "late_addon_live": _bool,
+    "late_addon_levels": _levels_csv,
+    "late_addon_usd": _addon_usd,
 }
 
 _state: dict = dict(_DEFAULTS)
@@ -96,58 +182,16 @@ _state: dict = dict(_DEFAULTS)
 
 def init_from_db() -> None:
     """Вызывать один раз при старте, после storage.init_db()."""
-    saved = storage.get_all_settings()
-    for key, raw in saved.items():
+    for key, raw in storage.get_all_settings().items():
         if key in _CASTERS:
             try:
                 _state[key] = _CASTERS[key](raw)
             except (TypeError, ValueError):
                 pass
-    _apply_preset_if_new()
-
-
-# Рекомендованные настройки по итогам анализа отчётов 25-28.09 (5m и 15m BTC).
-# Применяются ОДИН РАЗ при первом старте новой версии поверх того, что было
-# сохранено в базе из Telegram (иначе старые значения из bot_settings, например
-# порог 92, так и остались бы). Дальше можно спокойно менять из Telegram —
-# повторно не перезапишутся, пока не поднимем PRESET_VERSION. Кнопка
-# "⭐ Рекомендованные" в ⚙️ Настройках применяет их вручную ещё раз.
-PRESET_VERSION = 2
-
-
-def recommended() -> dict:
-    return {
-        "safety_score_threshold": 88.0,
-        "min_entry_price": 0.90,
-        "max_entry_price": 0.95,
-        # v2 (05.10): на 5m мин. расстояние 0.07% ($60) почти полностью убивало входы
-        # (04.10 — 1 сделка за сутки) и не улучшало результат: на 1 184 рынках
-        # истории с ним 22 сделки и ≈$0, без него при пороге 88 — 132 сделки,
-        # 97% побед, +$40 на ставке $10. Поэтому на 5m фильтр выключен жёстко,
-        # независимо от переменной окружения.
-        "min_distance_pct": 0.0,
-        # Хедж вынесен в отдельный бот; здесь он тратил бы тот же кошелёк
-        # и в LIVE покупал бы по $5 на каждом рынке, где цена прошла 0.70.
-        "hedge_bot_enabled": False,
-    }
-
-
-def apply_recommended() -> dict:
-    rec = recommended()
-    for key, value in rec.items():
-        set(key, value)
-    return rec
-
-
-def _apply_preset_if_new() -> None:
-    if int(_state.get("preset_version") or 0) >= PRESET_VERSION:
-        return
-    apply_recommended()
-    set("preset_version", PRESET_VERSION)
 
 
 def get(key: str):
-    return _state[key]
+    return _state.get(key)
 
 
 def set(key: str, value) -> None:
@@ -155,56 +199,123 @@ def set(key: str, value) -> None:
     storage.set_setting(key, value)
 
 
-def snapshot() -> dict:
-    return dict(_state)
+# --- Монеты: включена ли и реальные ли ставки ---
 
+def _csv_set(key: str) -> set[str]:
+    return {a for a in str(_state.get(key) or "").split(",") if a}
 
-# --- Включение/выключение отдельных активов ---
 
 def get_enabled_assets() -> set[str]:
-    raw = _state.get("enabled_assets", "") or ""
-    return {a for a in raw.split(",") if a}
+    return _csv_set("late_coins_on")
 
 
 def is_asset_enabled(asset: str) -> bool:
     return asset.lower() in get_enabled_assets()
 
 
-def set_enabled_assets(assets: set[str]) -> None:
-    set("enabled_assets", ",".join(sorted(assets)))
-
-
 def toggle_asset(asset: str) -> bool:
-    """Переключает состояние актива и возвращает новое (True = включён)."""
+    """Включить/выключить монету; возвращает новое состояние (True — включена)."""
     asset = asset.lower()
-    enabled = get_enabled_assets()
-    if asset in enabled:
-        enabled.discard(asset)
+    on = get_enabled_assets()
+    on.symmetric_difference_update({asset})
+    set("late_coins_on", ",".join(sorted(on)))
+    return asset in on
+
+
+def get_live_assets() -> set[str]:
+    return _csv_set("late_coins_live")
+
+
+def is_asset_live(asset: str) -> bool:
+    return asset.lower() in get_live_assets()
+
+
+def set_asset_live(asset: str, live: bool) -> None:
+    coins = get_live_assets()
+    if live:
+        coins.add(asset.lower())
     else:
-        enabled.add(asset)
-    set_enabled_assets(enabled)
-    return asset in enabled
+        coins.discard(asset.lower())
+    set("late_coins_live", ",".join(sorted(coins)))
 
 
-# --- Размер ставки: fixed или % от текущего банка ---
+# --- Своя ставка монеты: ("usd", $) или ("pct", % банка); None — общая ставка ---
 
-def current_bankroll() -> float:
-    """starting_bankroll_usdc + реализованная прибыль/убыток с начала.
-    Считаем ТОЛЬКО реальные (не dry-run) сделки — иначе виртуальный PnL из
-    периодов тестового прогона исказил бы размер реальных ставок (баг,
-    найденный на реальных отчётах: банк считался завышенным на сумму
-    прошлого dry-run PnL). Если сейчас DRY_RUN, наоборот, честнее было бы
-    видеть, как рос бы виртуальный банк — но раз sizing реальных денег и
-    dry-run использует один и тот же расчёт, отдаём предпочтение
-    безопасности реальных ставок."""
-    pnl = storage.get_pnl_summary(0, live_only=True)["pnl_usdc"]
-    return get("starting_bankroll_usdc") + pnl
+def coin_stakes() -> dict:
+    try:
+        return json.loads(str(_state.get("late_coin_stakes") or "{}"))
+    except ValueError:
+        return {}
 
 
-def compute_trade_size() -> float:
-    """Базовый размер ставки ДО масштабирования по score (см.
-    executor._scale_trade_size) — либо константа, либо доля от банка."""
-    if get("sizing_mode") == "percent":
-        bankroll = max(0.0, current_bankroll())
-        return round(bankroll * get("bankroll_pct") / 100, 2)
-    return get("trade_size_usdc")
+def coin_stake(asset: str) -> tuple[str, float] | None:
+    cfg = coin_stakes().get(asset.lower())
+    return (cfg["mode"], float(cfg["value"])) if cfg else None
+
+
+def set_coin_stake(asset: str, mode: str | None, value: float | None = None) -> None:
+    """mode "usd" / "pct" — своя ставка; None — снова общая."""
+    stakes = coin_stakes()
+    if mode is None:
+        stakes.pop(asset.lower(), None)
+    else:
+        stakes[asset.lower()] = {"mode": mode, "value": float(value)}
+    set("late_coin_stakes", _stakes_json(stakes))
+
+
+# --- Свой банк монеты: (сумма, с какого момента считаем её ставки); None — общий банк ---
+
+def coin_banks() -> dict:
+    try:
+        return json.loads(str(_state.get("late_coin_banks") or "{}"))
+    except ValueError:
+        return {}
+
+
+def coin_bank(asset: str) -> tuple[float, int] | None:
+    cfg = coin_banks().get(asset.lower())
+    return (float(cfg["start"]), int(cfg["since"])) if cfg else None
+
+
+def set_coin_bank(asset: str, start: float | None, since: int | None = None) -> None:
+    """start > 0 — свой банк монеты с этой суммы, считаем с since (по умолчанию — сейчас); None/0 — убрать."""
+    banks = coin_banks()
+    if not start or start <= 0:
+        banks.pop(asset.lower(), None)
+    else:
+        banks[asset.lower()] = {"start": float(start), "since": int(time.time() if since is None else since)}
+    set("late_coin_banks", _banks_json(banks))
+
+
+# --- Сторона реальных ставок монеты: "UP" / "DOWN"; None — обе (тестовые — всегда обе) ---
+
+def coin_sides() -> dict:
+    try:
+        return json.loads(str(_state.get("late_coin_sides") or "{}"))
+    except ValueError:
+        return {}
+
+
+def coin_side(asset: str) -> str | None:
+    return coin_sides().get(asset.lower())
+
+
+def set_coin_side(asset: str, side: str | None) -> None:
+    """side "UP" / "DOWN" — реальные ставки по монете только на эту сторону; None — обе."""
+    sides = coin_sides()
+    if side is None or str(side).upper() not in SIDES:
+        sides.pop(asset.lower(), None)
+    else:
+        sides[asset.lower()] = str(side).upper()
+    set("late_coin_sides", _sides_json(sides))
+
+
+# --- ➕ Докупка на откате: уровни (от большего к меньшему) ---
+
+def addon_levels() -> list[float]:
+    return [float(x) for x in str(_state.get("late_addon_levels") or "").split(",") if x]
+
+
+def set_addon_levels(levels) -> None:
+    """Список цен (или строка «0.95,0.94»); ValueError — ни одного годного уровня."""
+    set("late_addon_levels", _levels_csv(levels))

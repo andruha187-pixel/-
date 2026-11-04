@@ -1,331 +1,55 @@
 """
-Точка входа. Архитектура: один независимый асинхронный поток на каждую
-пару (актив, таймфрейм) — например, "btc/5m", "sol/5m" и т.д. Все потоки
-делят общий book_stream (WS-стакан), общий Telegram-бот и общую БД.
+Точка входа ⏱ бота позднего входа на 5m-рынках.
 
-Плюс две общие фоновые задачи, которые не привязаны к конкретному потоку:
-- settlement_loop: резолюция сделок и разметка исходов сигналов по ВСЕМ
-  активам/таймфреймам разом (если делать это в каждом из 12 потоков
-  отдельно — 12-кратное дублирование запросов к Gamma API впустую).
-- reporting.report_loop: периодический CSV-отчёт в Telegram (общий по
-  всем активам — разбивка по колонкам asset/timeframe уже в самих данных).
+Фоновые задачи:
+  - book_stream    — живой стакан Polymarket (WebSocket);
+  - chainlink_feed — цена Chainlink (страйк, текущая цена, исход окна);
+  - atr_feed       — ATR по 1-минутным свечам Binance;
+  - late_bot       — 🔁 запись окон всех монет и ⏱ ставки (тест и реальные);
+  - reporting      — файлы в Telegram раз в REPORT_INTERVAL_HOURS;
+  - Telegram       — меню и уведомления.
 """
 from __future__ import annotations
 import asyncio
 import logging
-import math
-import statistics
-import time
-from collections import deque
 
 from config import settings
-from src import binance_feed, market_discovery, indicators, strategy
-from src.market_discovery import ActiveMarket
-from src import polymarket_client, storage, telegram_notify, executor, book_stream, runtime_state, reporting, wallet_tracker, momentum_tracker, hedge_bot, chainlink_feed
-from src.timeframes import TIMEFRAMES, TimeframeProfile
+from src import atr_feed, book_stream, chainlink_feed, late_bot, reporting, runtime_state, storage, telegram_notify
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-)
-log = logging.getLogger("polymarket-bot")
-
-# Слаг сейчас активного рынка по каждому потоку ("btc:15m" -> "btc-updown-15m-...")
-# — общий словарь, читает settlement_loop, чтобы не спрашивать Gamma API про
-# рынки, которые заведомо ещё не могли зарезолвиться.
-_active_slugs: dict[str, str] = {}
-
-# Рынок на протяжении всего своего окна не меняется — кэшируем и спрашиваем
-# Gamma API заново только когда окно истекло, а не на каждом тике (было:
-# один и тот же рынок запрашивался каждые 3-5 секунд, до ~100 лишних
-# запросов за один 5-минутный рынок).
-_active_markets: dict[str, ActiveMarket] = {}
-
-# Страйк по Chainlink для каждого рынка (slug -> цена оракула на старт окна).
-_cl_strikes: dict[str, float] = {}
-
-# Разница Chainlink − Binance по каждому активу за последние ~10 минут тиков:
-# по ней оцениваем страйк, если поток Chainlink не застал старт окна.
-_basis: dict[str, deque] = {}
-
-
-def resolve_prices(asset: str, market: ActiveMarket, binance_price: float) -> dict:
-    """Цена/страйк для решения о входе.
-
-    Возвращает dict: current_price/strike_price (для лога), eval_price (для
-    strategy.evaluate), price_source ("chainlink" | "chainlink_est" | "binance"),
-    cl_problem (None, если по Chainlink можно торговать)."""
-    if market.slug not in _cl_strikes:
-        cl_strike = chainlink_feed.price_at(asset, market.start_time)
-        if cl_strike is not None:
-            _cl_strikes[market.slug] = cl_strike
-            if len(_cl_strikes) > 200:
-                for old in list(_cl_strikes)[:100]:
-                    _cl_strikes.pop(old, None)
-    cl_strike = _cl_strikes.get(market.slug)
-    cl_price, cl_age = chainlink_feed.latest(asset)
-    fresh = cl_price is not None and cl_age is not None and cl_age <= settings.CHAINLINK_MAX_AGE_SEC
-    if fresh and binance_price:
-        _basis.setdefault(asset, deque(maxlen=120)).append(cl_price - binance_price)
-
-    estimated = False
-    if cl_strike is None and fresh and settings.CHAINLINK_ALLOW_STRIKE_ESTIMATE \
-            and len(_basis.get(asset, ())) >= 12 and market.strike_price:
-        cl_strike = market.strike_price + statistics.median(_basis[asset])
-        estimated = True
-
-    cl_problem = None
-    if cl_strike is None:
-        cl_problem = "нет цены Chainlink на старт окна (бот запущен посреди окна или поток не подключён)"
-    elif cl_price is None:
-        cl_problem = "нет текущей цены Chainlink"
-    elif not fresh:
-        cl_problem = f"цена Chainlink устарела ({cl_age:.0f} с)"
-
-    if cl_problem is not None:
-        return {"current_price": binance_price, "strike_price": market.strike_price, "eval_price": binance_price,
-                "price_source": "binance", "cl_problem": cl_problem}
-    eval_price = cl_price
-    if estimated:
-        # Страйк оценён с погрешностью ~$5 — для решения считаем, что до
-        # страйка на CHAINLINK_EST_MARGIN_USD ближе, чем видно.
-        d = cl_price - cl_strike
-        eval_price = cl_strike + math.copysign(max(0.0, abs(d) - settings.CHAINLINK_EST_MARGIN_USD), d)
-    return {"current_price": cl_price, "strike_price": cl_strike, "eval_price": eval_price,
-            "price_source": "chainlink_est" if estimated else "chainlink", "cl_problem": None}
-
-# Последнее состояние каждого потока — для команды /token и общего статуса.
-_instance_state: dict[str, dict] = {}
-
-
-async def _instance_tick(asset: str, timeframe: TimeframeProfile) -> None:
-    key = f"{asset}:{timeframe.label}"
-
-    if not runtime_state.is_asset_enabled(asset):
-        # Актив выключен кнопкой в Telegram — не тратим запросы к API,
-        # просто помечаем в статусе, что поток на паузе, и выходим.
-        _instance_state[key] = {
-            "market_slug": "—", "asset": asset, "timeframe": timeframe.label,
-            "direction": "выкл", "current_price": "—", "strike_price": "—",
-            "minutes_left": "—", "safety_score": "—",
-            "up_token_id": None, "down_token_id": None,
-        }
-        telegram_notify.set_state_ref(_instance_state)
-        return
-
-    cached = _active_markets.get(key)
-    if cached is not None and time.time() < cached.end_time:
-        market = cached
-    else:
-        # Окно истекло (или это первый тик) — отписываемся от токенов
-        # СТАРОГО рынка для этого же потока прежде, чем подписаться на новый.
-        # Без этого _subscribed растёт неограниченно с каждым новым окном.
-        if cached is not None and settings.USE_LIVE_BOOK_STREAM:
-            book_stream.unsubscribe([cached.up_token_id, cached.down_token_id])
-        market = await market_discovery.get_active_market(asset, timeframe)
-        _active_slugs[key] = market.slug
-        _active_markets[key] = market
-        if settings.USE_LIVE_BOOK_STREAM:
-            book_stream.subscribe([market.up_token_id, market.down_token_id])
-
-    if not runtime_state.get("dry_run"):
-        asyncio.create_task(polymarket_client.prewarm_transport())
-
-    symbol = binance_feed.symbol_for(asset)
-    klines = await binance_feed.get_klines(
-        symbol,
-        limit=max(100, timeframe.atr_lookback_for_regime + timeframe.atr_period + 5),
-        interval=timeframe.kline_interval,
-    )
-    ind = indicators.compute_indicator_snapshot(
-        klines, timeframe.atr_period, timeframe.ema_fast, timeframe.ema_slow, timeframe.atr_lookback_for_regime,
-    )
-    binance_price = ind["close"]
-
-    # Цена и страйк по Chainlink — по ним Polymarket решает исход. Binance
-    # остаётся для индикаторов (ATR/EMA/MACD) и как запасной вариант.
-    px = resolve_prices(asset, market, binance_price)
-    current_price, strike_price, price_source = px["current_price"], px["strike_price"], px["price_source"]
-    cl_problem = px["cl_problem"]
-
-    minutes_left = max(0.0, (market.end_time - time.time()) / 60)
-
-    get_book = polymarket_client.get_orderbook_cached if settings.USE_LIVE_BOOK_STREAM else polymarket_client.get_orderbook
-    up_book = await get_book(market.up_token_id)
-    down_book = await get_book(market.down_token_id)
-
-    decision = strategy.evaluate(
-        current_price=px["eval_price"],
-        strike_price=strike_price,
-        minutes_left=minutes_left,
-        indicators=ind,
-        up_book=up_book,
-        down_book=down_book,
-        min_minutes_left=timeframe.min_minutes_left,
-        max_minutes_left=timeframe.max_minutes_left,
-        atr_distance_mult=timeframe.atr_distance_mult,
-        atr_spike_mult=timeframe.atr_spike_mult,
-    )
-
-    if cl_problem is not None and settings.CHAINLINK_REQUIRED:
-        decision.should_enter = False
-        decision.reasons.append(cl_problem)
-
-    storage.log_signal(market.slug, current_price, strike_price, decision,
-                        indicators=ind, up_book=up_book, down_book=down_book,
-                        price_source=price_source, binance_price=binance_price,
-                        binance_strike=market.strike_price)
-
-    _instance_state[key] = {
-        "market_slug": market.slug,
-        "asset": asset,
-        "timeframe": timeframe.label,
-        "direction": decision.direction,
-        "current_price": round(current_price, 2),
-        "strike_price": round(strike_price, 2),
-        "price_source": price_source,
-        "minutes_left": round(minutes_left, 2),
-        "safety_score": decision.safety_score,
-        "up_token_id": market.up_token_id,
-        "down_token_id": market.down_token_id,
-    }
-    telegram_notify.set_state_ref(_instance_state)
-
-    active_book = up_book if decision.direction == "UP" else down_book
-    log.info(
-        "%s | %s price=%.2f strike=%.2f (binance %.2f/%.2f) dir=%s left=%.1fm score=%.1f enter=%s book=%s reasons=%s",
-        market.slug, price_source, current_price, strike_price, binance_price, market.strike_price, decision.direction,
-        minutes_left, decision.safety_score, decision.should_enter, active_book.source, decision.reasons,
-    )
-
-    await executor.maybe_enter(market, decision)
-
-    if settings.MOMENTUM_TRACKER_ENABLED:
-        try:
-            await momentum_tracker.check_market(market, timeframe)
-        except Exception as exc:  # noqa: BLE001 — исследовательский модуль не должен ронять торговлю
-            log.warning("Ошибка momentum_tracker для %s: %s", market.slug, exc)
-
-    try:
-        await hedge_bot.check_market(market, timeframe)
-    except Exception as exc:  # noqa: BLE001 — хедж-бот не должен ронять основную торговлю
-        log.warning("Ошибка hedge_bot для %s: %s", market.slug, exc)
-
-
-ERROR_RETRY_SECONDS = 30
-
-
-async def _instance_loop(asset: str, timeframe: TimeframeProfile) -> None:
-    key = f"{asset}:{timeframe.label}"
-    consecutive_failures = 0
-    notified_dead = False
-    while True:
-        try:
-            await _instance_tick(asset, timeframe)
-            if notified_dead:
-                await telegram_notify.notify(
-                    f"✅ Поток {key} снова работает после {consecutive_failures} ошибок подряд."
-                )
-            consecutive_failures = 0
-            notified_dead = False
-        except Exception as exc:  # noqa: BLE001 — один сломанный поток не должен ронять остальные
-            consecutive_failures += 1
-            err = f"{type(exc).__name__}: {exc}" if str(exc) else type(exc).__name__
-            log.exception("Ошибка в потоке %s (%d подряд): %s", key, consecutive_failures, err)
-            if consecutive_failures == 10 and not notified_dead:
-                notified_dead = True
-                await telegram_notify.notify(
-                    f"⚠️ Поток {key}: {consecutive_failures} ошибок подряд ({err}). "
-                    f"Продолжаю пробовать раз в {ERROR_RETRY_SECONDS} с, сообщу, когда восстановится."
-                )
-
-        # Раньше после 10 ошибок подряд поток переходил на опрос раз в 10 минут
-        # — для BTC 5m это значит пропустить 2 рынка из каждых 2-х (ошибка
-        # обычно временная: таймаут Binance/Gamma). Теперь максимум 30 с.
-        sleep_for = timeframe.poll_interval_seconds if consecutive_failures < 10 else ERROR_RETRY_SECONDS
-        await asyncio.sleep(sleep_for)
-
-
-async def settlement_loop() -> None:
-    """Общая (не привязанная к конкретному активу) фоновая задача: резолюция
-    сделок, стоп-лосс открытых позиций и разметка исходов сигналов по всем
-    потокам разом."""
-    while True:
-        try:
-            await executor.settle_resolved_trades()
-            await executor.check_position_stop_losses()
-            active = set(_active_slugs.values())
-            await executor.label_resolved_markets(exclude_slugs=active)
-            if settings.MOMENTUM_TRACKER_ENABLED:
-                await momentum_tracker.label_resolved(exclude_slugs=active)
-                momentum_tracker.cleanup_old_sessions(active)
-            await hedge_bot.settle_resolved()
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Ошибка в settlement_loop: %s", exc)
-        await asyncio.sleep(10)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("polymarket-5m-late-bot")
 
 
 async def main():
-    # Инициализация БД и настроек — до старта любых фоновых задач.
     storage.init_db()
     runtime_state.init_from_db()
+    if not late_bot.rule_since():
+        late_bot.mark_rule_change()      # первый запуск: итоги «по нынешнему правилу» — с него
 
-    # Защита от "тихого" LIVE без ключа: если в БД с прошлого раза сохранён
-    # LIVE-режим, а сейчас POLY_PRIVATE_KEY не задан (новый хостинг, забыли
-    # перенести переменную и т.п.) — принудительно откатываемся в DRY RUN,
-    # а не пытаемся торговать клиентом без прав на ордера.
-    forced_back_to_dry_run = False
+    # Защита от «тихого» LIVE без ключа: в базе сохранён LIVE, а ключа сейчас нет
+    forced_dry = False
     if not runtime_state.get("dry_run") and not settings.POLY_PRIVATE_KEY:
         runtime_state.set("dry_run", True)
-        forced_back_to_dry_run = True
+        forced_dry = True
 
     app = telegram_notify.build_app()
     async with app:
         await app.start()
         await app.updater.start_polling()
-
-        await telegram_notify.clear_legacy_keyboard()
-        dry_run = runtime_state.get("dry_run")
-        assets_line = ", ".join(a.upper() for a in settings.ASSETS)
-        timeframes_line = ", ".join(tf.label for tf in TIMEFRAMES)
-        forced_note = (
-            "\n⚠️ Был сохранён LIVE-режим с прошлого раза, но POLY_PRIVATE_KEY сейчас не задан — "
-            "принудительно откатил в DRY RUN, чтобы не пытаться торговать без ключа."
-            if forced_back_to_dry_run else ""
-        )
-        await telegram_notify.notify(
-            f"🤖 Бот запущен. Режим: {'DRY RUN (без реальных сделок)' if dry_run else 'LIVE — реальные сделки!'}\n"
-            f"Активы: {assets_line}\nТаймфреймы: {timeframes_line}\n"
-            f"Цена и страйк: Chainlink (как у Polymarket), Binance — только индикаторы\n"
-            f"Открой /menu для управления (старт/стоп, размер позиции, стоп-лосс, настройки)."
-            f"{forced_note}"
-        )
-
-        chainlink_task = asyncio.create_task(chainlink_feed.run_forever())
-
-        book_stream_task = None
-        if settings.USE_LIVE_BOOK_STREAM:
-            book_stream_task = asyncio.create_task(book_stream.run_forever())
-
-        report_task = asyncio.create_task(reporting.report_loop())
-        settlement_task = asyncio.create_task(settlement_loop())
-        wallet_tracker_task = asyncio.create_task(wallet_tracker.wallet_tracker_loop())
-
-        instance_tasks = [
-            asyncio.create_task(_instance_loop(asset, timeframe))
-            for asset in settings.ASSETS
-            for timeframe in TIMEFRAMES
-        ]
-
         try:
-            await asyncio.gather(*instance_tasks)
+            await telegram_notify.notify(telegram_notify.startup_text(forced_dry))
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Стартовое сообщение не ушло: %s", exc)
+
+        jobs = [chainlink_feed.run_forever(), atr_feed.run_forever(), late_bot.run_forever(), reporting.report_loop()]
+        if settings.USE_LIVE_BOOK_STREAM:
+            jobs.append(book_stream.run_forever())
+        tasks = [asyncio.create_task(j) for j in jobs]
+        try:
+            await asyncio.gather(*tasks)
         finally:
-            if book_stream_task:
-                book_stream_task.cancel()
-            chainlink_task.cancel()
-            report_task.cancel()
-            settlement_task.cancel()
-            wallet_tracker_task.cancel()
+            for t in tasks:
+                t.cancel()
             await app.updater.stop()
             await app.stop()
 
