@@ -1,6 +1,11 @@
 """
-Централизованная конфигурация бота. Все настройки берутся из переменных
-окружения (.env), см. .env.example. Ничего не хардкодим — особенно ключи.
+Конфигурация бота. Все настройки — из переменных окружения (.env), см.
+.env.example. Ключи не хардкодим.
+
+Бот один: ⏱ поздний вход на 5-минутных рынках Up/Down Polymarket — за ~3 минуты
+до конца окна покупаем сторону, которая уже далеко ушла от страйка (src/late_bot.py).
+Почти всё ниже — только стартовые значения: дальше настройки меняются кнопками в
+Telegram и хранятся в базе.
 """
 import os
 from dataclasses import dataclass, field
@@ -26,21 +31,72 @@ def _get_int(name: str, default: int) -> int:
     return int(val) if val else default
 
 
+def _coins(raw: str) -> list:
+    return [a.strip().lower() for a in (raw or "").split(",") if a.strip()]
+
+
 @dataclass
 class Settings:
-    # --- Активы ---
-    # Список торгуемых монет через запятую — на каждую заводится независимый
-    # поток по каждому таймфрейму (см. src/timeframes.py).
-    ASSETS: list = field(default_factory=lambda: [
-        a.strip().lower() for a in os.getenv("ASSETS", "btc").split(",") if a.strip()
-    ])
+    # --- Монеты ---
+    # ASSETS — какие 5m-рынки бот пишет (все, даже выключенные — для подбора по архивам).
+    # LATE_COINS — по каким ставит стратегия при старте (✅); LATE_LIVE_COINS — какие
+    # сразу 🔴 (реальные ставки, когда бот в 🔴 LIVE; по умолчанию ни одной).
+    # По умолчанию ✅ — монеты, у которых правило «3:00–3:10» было лучшим на
+    # данных 25.09–20.10: BTC, ETH, XRP, DOGE, BNB. SOL — нет (на последних днях
+    # 38 из 41), HYPE — давно нет данных.
+    ASSETS: list = field(default_factory=lambda: _coins(os.getenv("ASSETS", "btc,eth,sol,xrp,bnb,doge,hype")))
+    LATE_COINS: str = os.getenv("LATE_COINS", "btc,eth,xrp,doge,bnb")
+    LATE_LIVE_COINS: str = os.getenv("LATE_LIVE_COINS", "")
 
-    # --- Binance (источник цены/индикаторов) ---
+    # --- Режим ---
+    # true — ни одного реального ордера (общий выключатель, 🔴 Включить LIVE в меню)
+    DRY_RUN: bool = _get_bool("DRY_RUN", True)
+
+    # --- ⏱ Правило входа (всё — кнопками в ⚙️ Настройках) ---
+    LATE_ENABLED: bool = _get_bool("LATE_ENABLED", True)
+    # Окно входа — секунд до конца окна: с LATE_FROM_SEC до LATE_TO_SEC (3:10 → 3:00)
+    LATE_FROM_SEC: int = _get_int("LATE_FROM_SEC", 190)
+    LATE_TO_SEC: int = _get_int("LATE_TO_SEC", 180)
+    # Цена стороны-лидера (ask)
+    LATE_MIN_PRICE: float = _get_float("LATE_MIN_PRICE", 0.92)
+    LATE_MAX_PRICE: float = _get_float("LATE_MAX_PRICE", 0.95)
+    # Цена Chainlink ушла от страйка не меньше чем на столько процентов…
+    LATE_MIN_DIST_PCT: float = _get_float("LATE_MIN_DIST_PCT", 0.10)
+    # …и не меньше чем на столько ATR (0 — без условия по ATR)
+    LATE_MIN_ATR: float = _get_float("LATE_MIN_ATR", 2.0)
+    # Сумма входа, USDC (но не меньше 5 акций — меньший ордер биржа не берёт)
+    LATE_STAKE_USDC: float = _get_float("LATE_STAKE_USDC", 5.0)
+    # Дневной стоп реальных ставок, USDC (UTC-сутки; 0 — без стопа)
+    LATE_STOP_USDC: float = _get_float("LATE_STOP_USDC", 30.0)
+    # Банк для ставок «% от банка» (у монеты в 🪙), если баланс кошелька прочитать нельзя
+    # (нет ключа или SDK не отдаёт баланс). 0 — не задан: тогда такие монеты ставят общую сумму.
+    LATE_BANK_USDC: float = _get_float("LATE_BANK_USDC", 0.0)
+
+    # --- ➕ Докупка на откате (всё — кнопками в ➕ Докупке) ---
+    # После основной ставки цена нашей стороны опустилась до уровня — докупка по нему (каждый уровень —
+    # раз за окно). Тестовая (по стакану) — всегда, пока докупка включена.
+    LATE_ADDON_ON: bool = _get_bool("LATE_ADDON_ON", True)
+    # true — ещё и реальные ордера (если по окну есть реальная основная ставка); false — только тест
+    LATE_ADDON_LIVE: bool = _get_bool("LATE_ADDON_LIVE", False)
+    LATE_ADDON_LEVELS: str = os.getenv("LATE_ADDON_LEVELS", "0.95,0.94,0.93,0.92,0.91,0.90")
+    # Сумма на уровень, USDC (реальная — не меньше 5 акций: меньший ордер биржа не берёт)
+    LATE_ADDON_USDC: float = _get_float("LATE_ADDON_USDC", 1.0)
+
+    # --- ATR: Wilder по 1-минутным свечам Binance (как в прежних 5m-ботах) ---
+    ATR_PERIOD: int = _get_int("ATR_PERIOD", 7)
+    ATR_REFRESH_SEC: float = _get_float("ATR_REFRESH_SEC", 10.0)
     BINANCE_BASE_URL: str = os.getenv("BINANCE_BASE_URL", "https://api.binance.com")
-    # Фьючерсный хост — фолбэк для монет без спотовой пары на Binance (HYPE
-    # на споте под вопросом на момент написания; на фьючерсах есть точно).
     BINANCE_FUTURES_URL: str = os.getenv("BINANCE_FUTURES_URL", "https://fapi.binance.com")
-    ATR_LOOKBACK_FOR_REGIME: int = _get_int("ATR_LOOKBACK_FOR_REGIME", 60)
+
+    # --- Цена Chainlink (по ней Polymarket решает исход): страйк и текущая цена ---
+    CHAINLINK_MAX_AGE_SEC: float = _get_float("CHAINLINK_MAX_AGE_SEC", 5.0)
+    CHAINLINK_USE_POLYBOLT: bool = _get_bool("CHAINLINK_USE_POLYBOLT", True)
+    CHAINLINK_POLYBOLT_URL: str = os.getenv("CHAINLINK_POLYBOLT_URL", "wss://ws-live-v2.polymarket.com/ws")
+    CHAINLINK_USE_RTDS: bool = _get_bool("CHAINLINK_USE_RTDS", True)
+    CHAINLINK_RTDS_URL: str = os.getenv("CHAINLINK_RTDS_URL", "wss://ws-live-data.polymarket.com")
+    POLY_API_KEY: str = os.getenv("POLY_API_KEY", "")
+    POLY_API_SECRET: str = os.getenv("POLY_API_SECRET", "")
+    POLY_API_PASSPHRASE: str = os.getenv("POLY_API_PASSPHRASE", "")
 
     # --- Polymarket / CLOB ---
     POLY_HOST: str = os.getenv("POLY_HOST", "https://clob.polymarket.com")
@@ -48,91 +104,24 @@ class Settings:
     POLY_CHAIN_ID: int = _get_int("POLY_CHAIN_ID", 137)
     POLY_PRIVATE_KEY: str = os.getenv("POLY_PRIVATE_KEY", "")
     POLY_FUNDER_ADDRESS: str = os.getenv("POLY_FUNDER_ADDRESS", "")
-    # ПРИМЕЧАНИЕ: с переходом на polymarket-client (актуальный официальный SDK)
-    # этот параметр больше не используется — SDK сам определяет тип кошелька
-    # (EOA/proxy/deposit wallet) через AsyncSecureClient.create(). Оставлен
-    # в конфиге на случай отката на другой клиент, полем можно не заниматься.
-    POLY_SIGNATURE_TYPE: int = _get_int("POLY_SIGNATURE_TYPE", 0)
-
-    # --- Стратегия входа (общее для всех активов/таймфреймов) ---
-    MIN_ENTRY_PRICE: float = _get_float("MIN_ENTRY_PRICE", 0.90)
-    MAX_ENTRY_PRICE: float = _get_float("MAX_ENTRY_PRICE", 0.95)
-    SAFETY_SCORE_THRESHOLD: float = _get_float("SAFETY_SCORE_THRESHOLD", 88.0)
-    MIN_BOOK_LIQUIDITY_USDC: float = _get_float("MIN_BOOK_LIQUIDITY_USDC", 25.0)
-    # Минимальное расстояние цены от страйка в % от цены (0 = фильтр выключен).
-    # Зачем: расхождение в ATR обманчиво в тихом рынке — при маленьком ATR
-    # "3-4 ATR" это всего $40-70 для BTC, и за 5-7 минут до конца 15m-рынка
-    # такое расстояние легко съедается. Бэктест 15m BTC (25-28.09, 139 рынков):
-    # без фильтра −$17, с минимумом ~$60 (0.07% при BTC ~84k) — +$38, из 4
-    # проигрышей остался 1. На 5m фильтр ничего не дал (там вход за 1.5-3 мин),
-    # поэтому для 5m по умолчанию выключен. Меняется из Telegram (⚙️ Настройки).
-    # --- Chainlink (цена, по которой Polymarket решает исход) ---
-    # Если цена Chainlink недоступна/устарела — входить нельзя (True) или
-    # торговать по Binance, как основной бот (False).
-    CHAINLINK_REQUIRED: bool = _get_bool("CHAINLINK_REQUIRED", True)
-    CHAINLINK_MAX_AGE_SEC: float = _get_float("CHAINLINK_MAX_AGE_SEC", 5.0)
-    # Если поток Chainlink не застал старт окна (обрыв, перезапуск бота), страйк
-    # оцениваем как страйк Binance + текущая разница Chainlink−Binance (она почти
-    # постоянна: 04.10 медиана −$14, разброс ~$4). Для решения о входе такое
-    # расстояние до страйка уменьшаем на запас CHAINLINK_EST_MARGIN_USD.
-    CHAINLINK_ALLOW_STRIKE_ESTIMATE: bool = _get_bool("CHAINLINK_ALLOW_STRIKE_ESTIMATE", True)
-    CHAINLINK_EST_MARGIN_USD: float = _get_float("CHAINLINK_EST_MARGIN_USD", 10.0)
-
-    MIN_DISTANCE_PCT: float = _get_float("MIN_DISTANCE_PCT", 0.0)
-
-    # --- Латентность / исполнение (прогрев стакана и транспорта) ---
     USE_LIVE_BOOK_STREAM: bool = _get_bool("USE_LIVE_BOOK_STREAM", True)
-    LIVE_ENTRY_MAX_SLIPPAGE: float = _get_float("LIVE_ENTRY_MAX_SLIPPAGE", 0.01)
-    MAX_ENTRY_EXECUTION_PRICE: float = _get_float("MAX_ENTRY_EXECUTION_PRICE", 0.97)
+    FEE_RATE: float = _get_float("FEE_RATE", 0.07)
 
-    # --- Управление капиталом ---
-    # Дефолты откалиброваны под небольшой депозит (~$60) — см. обсуждение
-    # в README: фиксированный (не растущий в % от банка) размер ставки,
-    # чтобы не разгонять риск компаундингом на непроверенной вживую
-    # стратегии. Меняй TRADE_SIZE_USDC пропорционально своему реальному
-    # депозиту — это НЕ универсальная константа.
-    TRADE_SIZE_USDC: float = _get_float("TRADE_SIZE_USDC", 2.0)
-    # Общий потолок ОДНОВРЕМЕННО открытых позиций по ВСЕМ активам/таймфреймам
-    # разом — без этого при 12 параллельных потоках (6 монет x 2 таймфрейма)
-    # можно случайно открыть 12 позиций разом, если все совпадут по времени.
-    MAX_OPEN_POSITIONS: int = _get_int("MAX_OPEN_POSITIONS", 2)
-    # Ниже этой суммы даже пробовать не стоит — комиссии и слиппедж съедят
-    # выгоду. Если в стакане меньше этого объёма по нужной цене — тик тихо
-    # пропускается (не считается ошибкой, просто рынок сейчас неликвиден).
-    MIN_VIABLE_TRADE_USDC: float = _get_float("MIN_VIABLE_TRADE_USDC", 2.0)
-    DAILY_LOSS_LIMIT_USDC: float = _get_float("DAILY_LOSS_LIMIT_USDC", 6.0)
-
-    # --- Исследовательский модуль (momentum_tracker) ---
-    # Не торгует — просто пишет, при каких условиях (RSI/MACD/дисбаланс
-    # стакана/и т.д.) цена стороны контракта проходит контрольные точки
-    # 0.70/0.75/.../0.95. См. src/momentum_tracker.py.
-    MOMENTUM_TRACKER_ENABLED: bool = _get_bool("MOMENTUM_TRACKER_ENABLED", True)
-
-    # --- Масштабирование ставки по уверенности сигнала ---
-    # Ставка = TRADE_SIZE_USDC только при score >= SIZE_SCALING_MAX_SCORE.
-    # На самом пороге (score == threshold) ставка = TRADE_SIZE_USDC * MIN_FRACTION.
-    # Между ними — линейная интерполяция. Так пограничные сигналы (score чуть
-    # выше порога) автоматически получают меньшую ставку, а не полный размер.
-    SIZE_SCALING_MIN_FRACTION: float = _get_float("SIZE_SCALING_MIN_FRACTION", 0.3)
-    SIZE_SCALING_MAX_SCORE: float = _get_float("SIZE_SCALING_MAX_SCORE", 95.0)
-
-    # --- Режим работы ---
-    DRY_RUN: bool = _get_bool("DRY_RUN", True)          # True = только сигналы, ордера не шлём
+    # --- 🔁 Запись окон (все монеты): путь цены для подбора времени и монет по архивам ---
+    # с REC_FROM_SEC до REC_TO_SEC секунд до конца, каждые REC_STEP_SEC секунд
+    REC_FROM_SEC: int = _get_int("REC_FROM_SEC", 270)
+    REC_TO_SEC: int = _get_int("REC_TO_SEC", 5)
+    REC_STEP_SEC: float = _get_float("REC_STEP_SEC", 2.0)
+    REC_KEEP_DAYS: int = _get_int("REC_KEEP_DAYS", 14)
 
     # --- Telegram ---
     TELEGRAM_BOT_TOKEN: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     TELEGRAM_CHAT_ID: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # --- Storage ---
+    # --- База и отчёты ---
     DB_PATH: str = os.getenv("DB_PATH", "data/bot.db")
-
-    # --- Отчёты для анализа стратегии ---
     REPORT_INTERVAL_HOURS: float = _get_float("REPORT_INTERVAL_HOURS", 4.0)
     REPORTS_DIR: str = os.getenv("REPORTS_DIR", "data/reports")
-
-    # --- Отслеживание чужого кошелька (уведомления + опциональный копитрейдинг) ---
-    WALLET_TRACK_ADDRESS: str = os.getenv("WALLET_TRACK_ADDRESS", "0x4707b735acce66b2ccb5600086de2329685cd1ce")
-    WALLET_TRACK_POLL_SECONDS: int = _get_int("WALLET_TRACK_POLL_SECONDS", 3)
 
 
 settings = Settings()
