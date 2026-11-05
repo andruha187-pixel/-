@@ -81,6 +81,9 @@ class Settings:
     LATE_ADDON_LEVELS: str = os.getenv("LATE_ADDON_LEVELS", "0.95,0.94,0.93,0.92,0.91,0.90")
     # Сумма на уровень, USDC (реальная — не меньше 5 акций: меньший ордер биржа не берёт)
     LATE_ADDON_USDC: float = _get_float("LATE_ADDON_USDC", 1.0)
+    # > 0 — на уровень не $, а столько % от банка (свой банк монеты 🏦, а нет его — общий; банк
+    # неизвестен — LATE_ADDON_USDC). 0 — фиксированная сумма.
+    LATE_ADDON_PCT: float = _get_float("LATE_ADDON_PCT", 0.0)
 
     # --- ATR: Wilder по 1-минутным свечам Binance (как в прежних 5m-ботах) ---
     ATR_PERIOD: int = _get_int("ATR_PERIOD", 7)
