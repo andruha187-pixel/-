@@ -35,7 +35,8 @@ Telegram — только итог («✅ ставка …»); окно без �
 ➕ Докупка на откате (вкл/выкл кнопкой): после основной ставки бот следит за
 ask нашей стороны до ADDON_MIN_LEFT_SEC до конца; опустился до уровня (по
 умолчанию 0.95, 0.94 … 0.90; уровни не ниже цены входа пропускаются) — покупка
-не дороже уровня, каждый уровень — раз за окно, сумма — $ на уровень. Режим свой:
+не дороже уровня, каждый уровень — раз за окно, сумма на уровень — фиксированная $
+или % от банка (как у ставки монеты: свой банк 🏦, а нет его — общий). Режим свой:
 🧪 тест — по стакану, как тестовые ставки (идёт всегда, пока докупка включена);
 🔴 реально — ещё и FAK-ордер, если по окну есть реальная основная ставка, монета
 🔴 и бот в LIVE (не меньше 5 акций). В итоге реальной ставки в Telegram — и
@@ -106,6 +107,7 @@ STAKE_PRESETS = (5.0, 10.0, 20.0, 50.0)
 PCT_PRESETS = (1.0, 2.0, 5.0, 10.0)
 STOP_PRESETS = (0.0, 30.0, 60.0, 150.0)
 ADDON_USD_PRESETS = (0.5, 1.0, 2.0, 5.0)
+ADDON_PCT_PRESETS = (0.5, 1.0, 2.0, 5.0)
 ADDON_LEVEL_PRESETS = ((0.95, 0.94, 0.93, 0.92, 0.91, 0.90), (0.95, 0.93, 0.91), (0.93, 0.90))
 
 
@@ -318,12 +320,65 @@ def addon_levels() -> list[float]:
 
 
 def addon_usd() -> float:
+    """Фиксированная сумма на уровень (и запасная для % банка, если банк неизвестен)."""
     return float(_rs("late_addon_usd"))
 
 
-def addon_live_usd(level: float) -> float:
-    """Реальная докупка на уровне: $ на уровень, но не меньше 5 акций по цене уровня (меньше биржа не берёт)."""
-    return max(addon_usd(), round(MIN_ORDER_SHARES * level + 0.01, 2))
+def addon_amount_mode() -> str:
+    """Сумма на уровень: "usd" — фиксированная $, "pct" — % от банка."""
+    return "pct" if _rs("late_addon_mode") == "pct" else "usd"
+
+
+def addon_pct() -> float:
+    return float(_rs("late_addon_pct"))
+
+
+def addon_usd_for(asset: str) -> float:
+    """$ на уровень у монеты: фиксированная или % банка — своего банка монеты (🏦: заданная сумма + итог её
+    реальных ставок), а нет его — общего (баланс кошелька, не читается — заданный вручную); банк неизвестен —
+    фиксированная $. Так же, как % у ставки монеты."""
+    if addon_amount_mode() != "pct":
+        return addon_usd()
+    own = coin_bank(asset)
+    if own is not None:
+        b = max(0.0, own["now"])
+    else:
+        b, _src = bank()
+        if b is None:
+            return addon_usd()
+    return round(min(runtime_state.ADDON_USD_LIMITS[1], b * addon_pct() / 100.0), 2)
+
+
+def addon_live_usd(level: float, asset: str | None = None) -> float:
+    """Реальная докупка на уровне: сумма на уровень (у монеты — с учётом % банка), но не меньше 5 акций по цене
+    уровня (меньше биржа не берёт)."""
+    base = addon_usd() if asset is None else addon_usd_for(asset)
+    return max(base, round(MIN_ORDER_SHARES * level + 0.01, 2))
+
+
+def addon_amount_text() -> str:
+    """«$1» или «1% банка» — для экранов."""
+    return f"{addon_pct():g}% банка" if addon_amount_mode() == "pct" else f"${addon_usd():g}"
+
+
+def addon_amount_note(asset: str) -> str:
+    """Сколько сейчас на уровень у монеты: «$1», «~$1.00 (банк BTC $100.00)», «~$2.10 (общий банк $210.00)»
+    или «$1 (банк неизвестен)»."""
+    if addon_amount_mode() != "pct":
+        return f"${addon_usd():g}"
+    own = coin_bank(asset)
+    if own is not None:
+        return f"~${addon_usd_for(asset):.2f} (банк {asset.upper()} ${own['now']:.2f})"
+    b, _src = bank()
+    if b is None:
+        return f"${addon_usd():g} (банк неизвестен)"
+    return f"~${addon_usd_for(asset):.2f} (общий банк ${b:.2f})"
+
+
+def addon_amounts_text() -> str:
+    """По включённым монетам: «BTC ~$1.00 (банк BTC $100.00), ETH ~$2.10 (общий банк $210.00)»."""
+    coins = trade_assets()
+    return ", ".join(f"{a.upper()} {addon_amount_note(a)}" for a in coins) if coins else "включённых монет нет"
 
 
 def levels_text(levels: list[float] | None = None) -> str:
@@ -344,7 +399,7 @@ def addon_short() -> str:
     """«✅ 🧪 тест · 0.95–0.90 через 1¢ · по $1 на уровень» или «⏸ выключена»."""
     if not addon_on():
         return "⏸ выключена"
-    return f"✅ {addon_mode_text()} · {levels_text()} · по ${addon_usd():g} на уровень"
+    return f"✅ {addon_mode_text()} · {levels_text()} · по {addon_amount_text()} на уровень"
 
 
 # ------------------------------------------------- сумма ставки и банк ----
@@ -1081,10 +1136,13 @@ def maybe_addons(now: float | None = None) -> int:
         hit = [lv for lv in ad["left"] if ask <= lv + 1e-9]
         if not hit:
             continue
+        amt = addon_usd_for(w.asset)                       # $ или % банка монеты
+        if amt < MIN_DRY_ADDON_USDC:
+            continue                                       # банк пуст — нечего докупать
         used: dict = {}
         live_levels = []
         for lv in hit:
-            price, spent = dry_fill(token, lv, addon_usd(), used)
+            price, spent = dry_fill(token, lv, amt, used)
             if price is None or spent < MIN_DRY_ADDON_USDC:
                 continue                                   # объём съели уровни выше — на следующем тике
             ad["left"].remove(lv)
@@ -1131,7 +1189,7 @@ async def _addon_live_run(w: Win, base: dict, lv: float, now: float, t_spawn: fl
         return
     token, side, a = base["token_id"], base["side"], w.asset.upper()
     min_amt = max(MIN_TRADE_USDC, round(MIN_ORDER_SHARES * lv + 0.01, 2))
-    target, limited = live_target(w.asset, addon_live_usd(lv))
+    target, limited = live_target(w.asset, addon_live_usd(lv, w.asset))
     if target < min_amt:
         reason = (f"в банке {a} свободно меньше минимального ордера ${min_amt:.2f}" if limited == "coin"
                   else f"на балансе меньше минимального ордера ${min_amt:.2f}")
@@ -1382,7 +1440,10 @@ def with_addon_line(name: str, c: dict) -> str:
 def addon_lines(since_ts: int = 0) -> list[str]:
     """➕ Для 📊 и экрана докупки: настройки, тест докупки (и по уровням), «было бы» для тестовых и реальных
     ставок, реальная докупка."""
-    lines = [f"➕ Докупка: {addon_short()}", "  " + addon_line("Тест докупки", addon_stats(since_ts, live=False))]
+    lines = [f"➕ Докупка: {addon_short()}"]
+    if addon_on() and addon_amount_mode() == "pct":
+        lines.append(f"  На уровень сейчас: {addon_amounts_text()}")
+    lines.append("  " + addon_line("Тест докупки", addon_stats(since_ts, live=False)))
     lvl = addon_level_line(since_ts, live=False)
     if lvl:
         lines.append("  " + lvl)

@@ -8,7 +8,8 @@
                  (общая, фиксированная $ или % от банка), 🏦 свой банк монеты и
                  🎯 сторона реальных ставок (обе / только UP / только DOWN)
   ➕ Докупка    — докупка на откате после ставки: ✅ вкл / ⏸ выкл, 🧪 тест / 🔴 реально
-                 (своё, независимо от основной стратегии), уровни цены и $ на уровень
+                 (своё, независимо от основной стратегии), уровни цены, сумма на уровень —
+                 фиксированная $ или % от банка
   📊 Статистика · 📤 Файлы
   🔴 Включить LIVE (с подтверждением) / 🧪 Выключить LIVE
 
@@ -329,22 +330,31 @@ def _addon_button() -> str:
     lb = late_bot
     if not lb.addon_on():
         return "⏸ выкл"
-    return f"{'🔴' if lb.addon_live() else '🧪'} ${lb.addon_usd():g} · {_levels_label(lb.addon_levels())}"
+    amt = f"{lb.addon_pct():g}%" if lb.addon_amount_mode() == "pct" else f"${lb.addon_usd():g}"
+    return f"{'🔴' if lb.addon_live() else '🧪'} {amt} · {_levels_label(lb.addon_levels())}"
 
 
 def _live_addon_range() -> tuple[float, float, float]:
-    """(меньше всего, больше всего на уровень, на все уровни) — реальная докупка с учётом 5 акций."""
-    per = [late_bot.addon_live_usd(x) for x in late_bot.addon_levels()] or [late_bot.addon_usd()]
-    return min(per), max(per), sum(per)
+    """(меньше всего, больше всего на уровень, больше всего на все уровни за окно) — реальная докупка с учётом
+    5 акций; при % банка — по включённым монетам (банк у каждой свой)."""
+    lb = late_bot
+    levels = lb.addon_levels() or [0.95]
+    rows = [[lb.addon_live_usd(x, a) for x in levels] for a in (lb.trade_assets() or [None])]
+    flat = [v for r in rows for v in r]
+    return min(flat), max(flat), max(sum(r) for r in rows)
 
 
 def _live_each() -> str:
-    """Сколько реально на уровень: «$10» или «~$4.51–$4.76 (меньше 5 акций биржа не берёт)»."""
+    """Сколько реально на уровень: «$10», «~$4.51–$4.76 (меньше 5 акций биржа не берёт…)» или «1% банка (…)»."""
+    lb = late_bot
     lo, hi, _total = _live_addon_range()
-    usd = late_bot.addon_usd()
+    rng = f"~${lo:.2f}" if hi - lo < 0.005 else f"~${lo:.2f}–${hi:.2f}"
+    if lb.addon_amount_mode() == "pct":
+        return f"{lb.addon_pct():g}% банка (сейчас {rng}: не меньше 5 акций — меньше биржа не берёт)"
+    usd = lb.addon_usd()
     if hi <= usd + 0.005:
         return f"${usd:g}"
-    return f"~${lo:.2f}–${hi:.2f} (меньше 5 акций биржа не берёт, поэтому не ${usd:g})"
+    return f"{rng} (меньше 5 акций биржа не берёт, поэтому не ${usd:g})"
 
 
 def addon_text(head: str = "") -> str:
@@ -358,6 +368,8 @@ def addon_text(head: str = "") -> str:
         "стороны (ask). Опустилась до уровня — докупка не дороже этого уровня; каждый уровень — один раз за окно "
         "(провалилась сразу через несколько — докупка на каждом). Уровни не ниже цены входа пропускаются — это "
         "не откат.",
+        "• Сумма на уровень — фиксированная $ или % от банка, как у ставки монеты: своего банка монеты (🏦), а "
+        "нет его — общего (баланс кошелька; не читается — заданный вручную); банк неизвестен — фиксированная $.",
         "• 🧪 тест — на бумаге, по живому стакану, с комиссией тейкера; реальных ордеров нет. В итоге каждой "
         "реальной ставки — «с тестовой докупкой было бы …».",
         "• 🔴 реально — ещё и реальные ордера, когда по окну есть реальная основная ставка (монета 🔴, бот в "
@@ -374,12 +386,14 @@ def addon_text(head: str = "") -> str:
 
 def addon_markup() -> InlineKeyboardMarkup:
     lb = late_bot
-    usd, levels = lb.addon_usd(), lb.addon_levels()
+    mode, usd, pct, levels = lb.addon_amount_mode(), lb.addon_usd(), lb.addon_pct(), lb.addon_levels()
     return _menu(
         (Btn("✅ включена" if lb.addon_on() else "⏸ выключена", callback_data="adt"),
          Btn("🔴 реально" if lb.addon_live() else "🧪 тест", callback_data="adl")),
-        tuple(Btn(_mark(_same(usd, v)) + f"${v:g}", callback_data=f"adu:{v:g}") for v in lb.ADDON_USD_PRESETS)
-        + (Btn("✏️ $", callback_data="in:adu"),),
+        tuple(Btn(_mark(mode == "usd" and _same(usd, v)) + f"${v:g}", callback_data=f"adu:{v:g}")
+              for v in lb.ADDON_USD_PRESETS) + (Btn("✏️ $", callback_data="in:adu"),),
+        tuple(Btn(_mark(mode == "pct" and _same(pct, v)) + f"{v:g}%", callback_data=f"adp:{v:g}")
+              for v in lb.ADDON_PCT_PRESETS) + (Btn("✏️ %", callback_data="in:adp"),),
         tuple(Btn(_mark(_same_levels(levels, p)) + _levels_label(p), callback_data=f"adv:{i}")
               for i, p in enumerate(lb.ADDON_LEVEL_PRESETS)) + (Btn("✏️ уровни", callback_data="in:adlv"),),
         (Btn("🔄 Обновить", callback_data="ad"), Btn("◀️ Настройки", callback_data="se"), BACK),
@@ -402,8 +416,11 @@ def confirm_addon_live_text() -> str:
 
 
 ADDON_PROMPTS = {
-    "adu": "✏️ Докупка: сумма на один уровень в $ — например «1» или «2.5» (от 0.1 до 1000). Реальная докупка "
-           "всё равно не меньше 5 акций (~$4.6 при цене 0.92).",
+    "adu": "✏️ Докупка: фиксированная сумма на один уровень в $ — например «1» или «2.5» (от 0.1 до 1000). "
+           "Реальная докупка всё равно не меньше 5 акций (~$4.6 при цене 0.92).",
+    "adp": "✏️ Докупка: % от банка на один уровень — например «1» или «0.5» (от 0.1 до 100). Банк — как у ставки "
+           "монеты: свой банк монеты (🏦), а нет его — общий (баланс кошелька; не читается — заданный вручную); "
+           "неизвестен — фиксированная $ на уровень. Реальная докупка всё равно не меньше 5 акций.",
     "adlv": "✏️ Уровни докупки — цены через запятую или пробел: «0.95, 0.94, 0.93» или в центах «95 93 91»; "
             "диапазон «0.95-0.90» — каждый цент. От 0.50 до 0.99, не больше 20 уровней. Уровни не ниже цены "
             "входа бот пропускает.",
@@ -411,7 +428,7 @@ ADDON_PROMPTS = {
 
 
 def addon_prompt_text(kind: str, head: str = "") -> str:
-    cur = f"${late_bot.addon_usd():g}" if kind == "adu" else late_bot.levels_text()
+    cur = f"{late_bot.addon_amount_text()} на уровень" if kind in ("adu", "adp") else late_bot.levels_text()
     return ((head + "\n\n") if head else "") + ADDON_PROMPTS[kind] + f"\nСейчас: {cur}."
 
 
@@ -444,10 +461,18 @@ def parse_levels(text: str) -> list[float]:
 
 def apply_addon_usd(v: float) -> str:
     runtime_state.set("late_addon_usd", round(v, 2))
+    runtime_state.set("late_addon_mode", "usd")
     lo, hi, _total = _live_addon_range()
     usd = late_bot.addon_usd()
     return (f"✅ Докупка: ${usd:g} на уровень" + (f" (реальная — не меньше 5 акций, ~${lo:.2f}–${hi:.2f})"
                                                 if hi > usd + 0.005 else "") + ".")
+
+
+def apply_addon_pct(v: float) -> str:
+    runtime_state.set("late_addon_pct", round(v, 2))
+    runtime_state.set("late_addon_mode", "pct")
+    return (f"✅ Докупка: {late_bot.addon_pct():g}% банка на уровень — сейчас {late_bot.addon_amounts_text()} "
+            "(реальная — не меньше 5 акций).")
 
 
 def apply_addon_levels(levels) -> str:
@@ -458,6 +483,8 @@ def apply_addon_levels(levels) -> str:
 def apply_addon_input(kind: str, text: str) -> str:
     if kind == "adu":
         return apply_addon_usd(parse_number(text.replace("$", ""), *runtime_state.ADDON_USD_LIMITS, allow_off=False))
+    if kind == "adp":
+        return apply_addon_pct(parse_number(text.replace("%", ""), *runtime_state.PCT_LIMITS, allow_off=False))
     if kind == "adlv":
         return apply_addon_levels(parse_levels(text))
     raise ValueError("неизвестная настройка")
@@ -489,8 +516,14 @@ def _handle_addon(cmd: str, parts: list[str]) -> tuple[str, InlineKeyboardMarkup
             head += " Докупка ⏸ выключена — включи кнопкой ниже."
     elif cmd == "adu" and len(parts) == 2:
         v = _float(parts[1])
-        if v is not None and any(_same(v, x) for x in lb.ADDON_USD_PRESETS) and not _same(v, lb.addon_usd()):
+        if (v is not None and any(_same(v, x) for x in lb.ADDON_USD_PRESETS)
+                and not (lb.addon_amount_mode() == "usd" and _same(v, lb.addon_usd()))):
             head = apply_addon_usd(v)
+    elif cmd == "adp" and len(parts) == 2:
+        v = _float(parts[1])
+        if (v is not None and any(_same(v, x) for x in lb.ADDON_PCT_PRESETS)
+                and not (lb.addon_amount_mode() == "pct" and _same(v, lb.addon_pct()))):
+            head = apply_addon_pct(v)
     elif cmd == "adv" and len(parts) == 2:
         i = int(parts[1]) if parts[1].isdigit() else -1
         if 0 <= i < len(lb.ADDON_LEVEL_PRESETS) and not _same_levels(lb.addon_levels(), lb.ADDON_LEVEL_PRESETS[i]):
@@ -763,7 +796,7 @@ async def handle(data: str) -> tuple[str, InlineKeyboardMarkup]:
         return settings_text("Ввод отменён."), settings_markup()
     if cmd == "se":
         return settings_text(), settings_markup()
-    if cmd in ("ad", "adt", "adl", "adly", "adu", "adv"):
+    if cmd in ("ad", "adt", "adl", "adly", "adu", "adp", "adv"):
         return _handle_addon(cmd, parts)
     res = _handle_settings(cmd, parts)
     if res is not None:

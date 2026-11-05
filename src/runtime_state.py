@@ -11,7 +11,7 @@
 И сторона реальных ставок (🎯): обе, только UP или только DOWN — тестовые идут по обеим.
 
 ➕ Докупка на откате: вкл/выкл, 🧪 тест / 🔴 реально (независимо от основной
-стратегии), уровни цены и сумма на уровень.
+стратегии), уровни цены и сумма на уровень — фиксированная $ или % от банка.
 """
 from __future__ import annotations
 import json
@@ -108,6 +108,20 @@ def _addon_usd(v) -> float:
     return round(min(ADDON_USD_LIMITS[1], max(ADDON_USD_LIMITS[0], float(v))), 2)
 
 
+ADDON_MODES = ("usd", "pct")       # на уровень: фиксированная $ / % от банка
+
+
+def _addon_mode(v) -> str:
+    v = str(v).strip().lower()
+    if v not in ADDON_MODES:
+        raise ValueError(f"режим суммы докупки: {v}")
+    return v
+
+
+def _pct(v) -> float:
+    return round(min(PCT_LIMITS[1], max(PCT_LIMITS[0], float(v))), 2)
+
+
 def _default_levels() -> str:
     try:
         return _levels_csv(settings.LATE_ADDON_LEVELS)
@@ -151,6 +165,9 @@ _DEFAULTS = {
     "late_addon_live": settings.LATE_ADDON_LIVE,
     "late_addon_levels": _default_levels(),
     "late_addon_usd": _addon_usd(settings.LATE_ADDON_USDC),
+    # сумма на уровень: "usd" — late_addon_usd, "pct" — late_addon_pct % от банка (как у ставки монеты)
+    "late_addon_mode": "pct" if settings.LATE_ADDON_PCT > 0 else "usd",
+    "late_addon_pct": _pct(settings.LATE_ADDON_PCT if settings.LATE_ADDON_PCT > 0 else 1.0),
 }
 
 _CASTERS = {
@@ -175,6 +192,8 @@ _CASTERS = {
     "late_addon_live": _bool,
     "late_addon_levels": _levels_csv,
     "late_addon_usd": _addon_usd,
+    "late_addon_mode": _addon_mode,
+    "late_addon_pct": _pct,
 }
 
 _state: dict = dict(_DEFAULTS)
