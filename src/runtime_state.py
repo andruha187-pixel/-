@@ -12,6 +12,9 @@
 
 ➕ Докупка на откате: вкл/выкл, 🧪 тест / 🔴 реально (независимо от основной
 стратегии), уровни цены и сумма на уровень — фиксированная $ или % от банка.
+
+У монеты может быть своё правило входа (📏: до страйка в % и в ATR) и своя
+докупка (вкл/выкл, 🧪/🔴, уровни, сумма) — чего не задано, берётся общее.
 """
 from __future__ import annotations
 import json
@@ -122,6 +125,75 @@ def _pct(v) -> float:
     return round(min(PCT_LIMITS[1], max(PCT_LIMITS[0], float(v))), 2)
 
 
+DIST_LIMITS = (0.0, 5.0)           # до страйка, % (0 — без условия)
+ATR_LIMITS = (0.0, 20.0)           # до страйка, ATR (0 — без условия)
+
+
+RULE_KEYS = ("dist", "atr", "dist_UP", "atr_UP", "dist_DOWN", "atr_DOWN")
+
+
+def _rules_json(v) -> str:
+    """Своё правило монеты: {"btc": {"dist": 0.12, "dist_DOWN": 0.15}, "sol": {"atr": 2.5}} — до страйка в % и в
+    ATR: для обеих сторон (dist, atr) и отдельно для UP / DOWN (dist_UP, atr_DOWN, …); поля нет — дальше по цепочке:
+    сторона → монета → общее из ⚙️."""
+    raw = json.loads(v) if isinstance(v, str) else dict(v or {})
+    out = {}
+    for asset, cfg in (raw or {}).items():
+        if not isinstance(cfg, dict):
+            continue
+        c = {}
+        for key, (lo, hi) in ((k, DIST_LIMITS if k.startswith("dist") else ATR_LIMITS) for k in RULE_KEYS):
+            if cfg.get(key) is None:
+                continue
+            try:
+                c[key] = round(min(hi, max(lo, float(cfg[key]))), 4)
+            except (TypeError, ValueError):
+                continue
+        if c:
+            out[str(asset).lower()] = c
+    return json.dumps(out, sort_keys=True)
+
+
+def _coin_addons_json(v) -> str:
+    """Своя докупка монеты: {"btc": {"on": false}, "sol": {"levels": "0.95,0.93", "mode": "pct", "pct": 1.0}} —
+    вкл/выкл (on), 🔴 реально (live), уровни, сумма на уровень ($ — usd или % банка — pct, mode — что из них);
+    поля нет — как в общей докупке."""
+    raw = json.loads(v) if isinstance(v, str) else dict(v or {})
+    out = {}
+    for asset, cfg in (raw or {}).items():
+        if not isinstance(cfg, dict):
+            continue
+        c = {}
+        for key in ("on", "live"):
+            if cfg.get(key) is not None:
+                c[key] = cfg[key] if isinstance(cfg[key], bool) else _bool(cfg[key])
+        if cfg.get("levels") is not None:
+            try:
+                c["levels"] = _levels_csv(cfg["levels"])
+            except ValueError:
+                pass
+        if str(cfg.get("mode")) in ADDON_MODES:
+            c["mode"] = str(cfg["mode"])
+        for key, fn in (("usd", _addon_usd), ("pct", _pct)):
+            if cfg.get(key) is not None:
+                try:
+                    c[key] = fn(cfg[key])
+                except (TypeError, ValueError):
+                    pass
+        if c:
+            out[str(asset).lower()] = c
+    return json.dumps(out, sort_keys=True)
+
+
+# 🎛 Пресет монет — по архиву 21.10–13.11 (вход 3:30–3:20 по 0.96–0.97): что у монет своё по умолчанию.
+# Ставится один раз на версию пресета (late_preset_v): в новой базе — сразу, в работающей — только тем монетам
+# и полям, где своё ещё не задано. Потом всё меняется кнопками и больше не трогается.
+PRESET_VERSION = 1
+PRESET_COIN_RULES = {"btc": {"dist_DOWN": 0.15}, "sol": {"atr": 2.5}, "xrp": {"dist": 0.12}}
+PRESET_COIN_SIDES = {"doge": "UP", "bnb": "UP"}
+PRESET_NOTE = {"text": ""}          # что поставили при этом старте — для сообщения о запуске
+
+
 def _default_levels() -> str:
     try:
         return _levels_csv(settings.LATE_ADDON_LEVELS)
@@ -159,7 +231,7 @@ _DEFAULTS = {
     # свой банк монеты: сумма и с какого момента считаем её реальные ставки (нет записи — общий банк)
     "late_coin_banks": "{}",
     # сторона реальных ставок монеты: "UP" / "DOWN" (нет записи — обе); тестовые — всегда обе
-    "late_coin_sides": "{}",
+    "late_coin_sides": _sides_json(PRESET_COIN_SIDES) if settings.LATE_COIN_PRESET else "{}",
     # ➕ докупка на откате: вкл/выкл, 🔴 реально (иначе только тест), уровни цены, $ на уровень
     "late_addon_on": settings.LATE_ADDON_ON,
     "late_addon_live": settings.LATE_ADDON_LIVE,
@@ -168,6 +240,12 @@ _DEFAULTS = {
     # сумма на уровень: "usd" — late_addon_usd, "pct" — late_addon_pct % от банка (как у ставки монеты)
     "late_addon_mode": "pct" if settings.LATE_ADDON_PCT > 0 else "usd",
     "late_addon_pct": _pct(settings.LATE_ADDON_PCT if settings.LATE_ADDON_PCT > 0 else 1.0),
+    # своё правило монеты (до страйка % и ATR; можно отдельно для UP / DOWN) и своя докупка монеты — поля нет —
+    # общее; по умолчанию — пресет монет (LATE_COIN_PRESET)
+    "late_coin_rules": _rules_json(PRESET_COIN_RULES) if settings.LATE_COIN_PRESET else "{}",
+    "late_coin_addons": "{}",
+    # какая версия пресета монет уже поставлена (0 — никакая)
+    "late_preset_v": 0,
 }
 
 _CASTERS = {
@@ -194,19 +272,51 @@ _CASTERS = {
     "late_addon_usd": _addon_usd,
     "late_addon_mode": _addon_mode,
     "late_addon_pct": _pct,
+    "late_coin_rules": _rules_json,
+    "late_coin_addons": _coin_addons_json,
+    "late_preset_v": lambda v: int(float(v)),
 }
 
 _state: dict = dict(_DEFAULTS)
 
 
 def init_from_db() -> None:
-    """Вызывать один раз при старте, после storage.init_db()."""
+    """Вызывать один раз при старте, после storage.init_db(). Заодно — пресет монет, если он ещё не стоял."""
     for key, raw in storage.get_all_settings().items():
         if key in _CASTERS:
             try:
                 _state[key] = _CASTERS[key](raw)
             except (TypeError, ValueError):
                 pass
+    PRESET_NOTE["text"] = apply_coin_preset()
+
+
+def apply_coin_preset() -> str:
+    """🎛 Пресет монет (один раз на версию): своё правило и сторона — только там, где у монеты своё ещё не задано.
+    Возвращает, что поставили («BTC ⬇️ DOWN ≥0.15%; …»), или "" — ничего (уже стоял / выключен)."""
+    if not settings.LATE_COIN_PRESET or int(_state.get("late_preset_v") or 0) >= PRESET_VERSION:
+        return ""
+    rules = coin_rules()
+    for asset, cfg in PRESET_COIN_RULES.items():
+        cur = dict(rules.get(asset) or {})
+        rules[asset] = {**cfg, **cur}                      # своё монеты важнее пресета
+    set("late_coin_rules", _rules_json(rules))
+    sides = coin_sides()
+    for asset, side in PRESET_COIN_SIDES.items():
+        sides.setdefault(asset, side)
+    set("late_coin_sides", _sides_json(sides))
+    set("late_preset_v", PRESET_VERSION)
+    # что из пресета теперь действует (там, где у монеты было своё другое, — не пишем)
+    done = []
+    rules = coin_rules()
+    for asset, cfg in PRESET_COIN_RULES.items():
+        for k, v in cfg.items():
+            if abs(float((rules.get(asset) or {}).get(k, -1)) - v) < 1e-9:
+                side = {"_UP": "⬆️ UP ", "_DOWN": "⬇️ DOWN "}.get(k[k.find("_"):] if "_" in k else "", "")
+                done.append(f"{asset.upper()} {side}" + (f"≥{v:g}%" if k.startswith("dist") else f"≥{v:g} ATR"))
+    sides = coin_sides()
+    done += [f"{a.upper()} реальные только {s}" for a, s in PRESET_COIN_SIDES.items() if sides.get(a) == s]
+    return "; ".join(done)
 
 
 def get(key: str):
@@ -338,3 +448,70 @@ def addon_levels() -> list[float]:
 def set_addon_levels(levels) -> None:
     """Список цен (или строка «0.95,0.94»); ValueError — ни одного годного уровня."""
     set("late_addon_levels", _levels_csv(levels))
+
+
+# --- 📏 Своё правило монеты: до страйка в % (dist) и в ATR (atr); поля нет — общее ---
+
+def coin_rules() -> dict:
+    try:
+        return json.loads(str(_state.get("late_coin_rules") or "{}"))
+    except ValueError:
+        return {}
+
+
+def coin_rule(asset: str) -> dict:
+    return dict(coin_rules().get(asset.lower()) or {})
+
+
+def set_coin_rule(asset: str, key: str, value: float | None) -> None:
+    """key "dist" / "atr" (обе стороны) или "dist_UP" / "atr_DOWN" … (одна сторона); value None — снова по цепочке
+    (сторона → монета → общее)."""
+    rules = coin_rules()
+    cfg = dict(rules.get(asset.lower()) or {})
+    if value is None:
+        cfg.pop(key, None)
+    else:
+        cfg[key] = float(value)
+    if cfg:
+        rules[asset.lower()] = cfg
+    else:
+        rules.pop(asset.lower(), None)
+    set("late_coin_rules", _rules_json(rules))
+
+
+# --- ➕ Своя докупка монеты: on / live / levels / mode / usd / pct; поля нет — как в общей ---
+
+def coin_addons() -> dict:
+    try:
+        return json.loads(str(_state.get("late_coin_addons") or "{}"))
+    except ValueError:
+        return {}
+
+
+def coin_addon(asset: str) -> dict:
+    return dict(coin_addons().get(asset.lower()) or {})
+
+
+def set_coin_addon(asset: str, **fields) -> None:
+    """Поля своей докупки монеты: on=, live=, levels= (список или «0.95,0.94»), mode= ("usd"/"pct"), usd=, pct=.
+    Значение None — поле снова общее. Уровни без единого годного — ValueError."""
+    addons = coin_addons()
+    cfg = dict(addons.get(asset.lower()) or {})
+    for key, value in fields.items():
+        if value is None:
+            cfg.pop(key, None)
+        elif key == "levels":
+            cfg[key] = _levels_csv(value)
+        else:
+            cfg[key] = value
+    if cfg:
+        addons[asset.lower()] = cfg
+    else:
+        addons.pop(asset.lower(), None)
+    set("late_coin_addons", _coin_addons_json(addons))
+
+
+def clear_coin_addon(asset: str) -> None:
+    addons = coin_addons()
+    addons.pop(asset.lower(), None)
+    set("late_coin_addons", _coin_addons_json(addons))

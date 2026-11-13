@@ -99,10 +99,13 @@ ADDON_LIVE_TRIES = 3           # …и не больше 3 ордеров на �
 MIN_DRY_ADDON_USDC = 0.05      # тестовая докупка меньше — не в счёт (объём на уровне съели уровни выше)
 
 # Кнопки ⚙️ Настроек (окно — секунд до конца: (от, до)); любое другое значение — ✏️ сообщением
-WINDOW_PRESETS = ((190, 180), (200, 180), (190, 170))
-PRICE_PRESETS = ((0.90, 0.95), (0.92, 0.95), (0.92, 0.96))
+WINDOW_PRESETS = ((210, 200), (220, 200), (190, 180))
+PRICE_PRESETS = ((0.96, 0.97), (0.95, 0.97), (0.92, 0.95))
 DIST_PRESETS = (0.05, 0.08, 0.10, 0.15)
 ATR_PRESETS = (1.5, 2.0, 2.5, 0.0)
+COIN_DIST_PRESETS = (0.12, 0.15, 0.20)        # 📏 своё у монеты (и для стороны)
+COIN_ATR_PRESETS = (2.5, 3.0)
+SIDE_ATR_PRESETS = (2.5, 3.0, 4.0)            # 📏 своё для стороны UP / DOWN
 STAKE_PRESETS = (5.0, 10.0, 20.0, 50.0)
 PCT_PRESETS = (1.0, 2.0, 5.0, 10.0)
 STOP_PRESETS = (0.0, 30.0, 60.0, 150.0)
@@ -191,12 +194,62 @@ def price_range() -> tuple[float, float]:
     return min(a, b), max(a, b)
 
 
-def min_dist() -> float:
-    return float(_rs("late_min_dist"))
+def _rule_value(key: str, asset: str | None, side: str | None) -> float:
+    """Порог по цепочке: своё для стороны монеты (dist_DOWN) → своё у монеты (dist) → общее из ⚙️."""
+    own = runtime_state.coin_rule(asset) if asset else {}
+    for k in ((f"{key}_{side}",) if side else ()) + (key,):
+        if own.get(k) is not None:
+            return float(own[k])
+    return float(_rs("late_min_dist" if key == "dist" else "late_min_atr"))
 
 
-def min_atr() -> float:
-    return float(_rs("late_min_atr"))
+def min_dist(asset: str | None = None, side: str | None = None) -> float:
+    """До страйка, %: своё для стороны монеты → своё у монеты (📏) → общее из ⚙️."""
+    return _rule_value("dist", asset, side)
+
+
+def min_atr(asset: str | None = None, side: str | None = None) -> float:
+    """До страйка, ATR: своё для стороны монеты → своё у монеты (📏) → общее из ⚙️."""
+    return _rule_value("atr", asset, side)
+
+
+def coin_rule_own(asset: str) -> dict:
+    """Что у монеты своё в правиле: {"dist": 0.12, "dist_DOWN": 0.15} / {}."""
+    return runtime_state.coin_rule(asset)
+
+
+def _thr(d: float, k: float) -> str:
+    return (f"≥{d:g}%" if d > 0 else "без %") + " и " + (f"≥{k:g} ATR" if k > 0 else "без ATR")
+
+
+def coin_rule_text(asset: str) -> str:
+    """«до страйка ≥0.12% (своё) и ≥2 ATR (общее); ⬇️ DOWN: ≥0.15% и ≥2 ATR»."""
+    own = coin_rule_own(asset)
+    d, k = min_dist(asset), min_atr(asset)
+    dist = (f"≥{d:g}%" if d > 0 else "без условия по %") + (" (своё)" if "dist" in own else " (общее)")
+    atr = (f"≥{k:g} ATR" if k > 0 else "без ATR") + (" (своё)" if "atr" in own else " (общее)")
+    s = f"до страйка {dist} и {atr}"
+    for side, mark in (("UP", "⬆️"), ("DOWN", "⬇️")):
+        if f"dist_{side}" in own or f"atr_{side}" in own:
+            s += f"; {mark} {side}: {_thr(min_dist(asset, side), min_atr(asset, side))}"
+    return s
+
+
+def coin_rule_short(asset: str) -> str:
+    """Своё у монеты коротко: «≥0.12%», «⬇️≥0.15%», «≥2.5 ATR · ⬆️≥0.2%» ("" — всё общее)."""
+    own = coin_rule_own(asset)
+    bits = []
+    for suffix, mark in (("", ""), ("_UP", "⬆️"), ("_DOWN", "⬇️")):
+        part = ([f"≥{own['dist' + suffix]:g}%"] if f"dist{suffix}" in own else []) + \
+               ([f"≥{own['atr' + suffix]:g} ATR"] if f"atr{suffix}" in own else [])
+        if part:
+            bits.append(mark + " и ".join(part))
+    return " · ".join(bits)
+
+
+def coin_rules_text() -> str:
+    """У каких монет своё правило: «BTC ⬇️≥0.15%; SOL ≥2.5 ATR» ("" — ни у каких)."""
+    return "; ".join(f"{a.upper()} {coin_rule_short(a)}" for a in settings.ASSETS if coin_rule_own(a))
 
 
 def stake() -> float:
@@ -248,11 +301,11 @@ def window_text() -> str:
     return f"{mmss(lo)}–{mmss(hi)}"
 
 
-def rule_tag() -> str:
-    """Правило коротко — пишется в каждую ставку (колонка rule)."""
+def rule_tag(asset: str | None = None, side: str | None = None) -> str:
+    """Правило коротко — пишется в каждую ставку (колонка rule); у монеты и стороны — с их порогами."""
     hi, lo = window()
     pl, ph = price_range()
-    return f"{hi}-{lo}s|{pl:.2f}-{ph:.2f}|d{min_dist():g}%|atr{min_atr():g}"
+    return f"{hi}-{lo}s|{pl:.2f}-{ph:.2f}|d{min_dist(asset, side):g}%|atr{min_atr(asset, side):g}"
 
 
 def atr_text() -> str:
@@ -263,14 +316,18 @@ def rule_short() -> str:
     """Правило в одну строку: «за 3:00–3:10 до конца, цена 0.92–0.95, до страйка ≥0.1% и ≥2 ATR»."""
     pl, ph = price_range()
     atr = f" и {atr_text()}" if min_atr() > 0 else " (без ATR)"
-    return f"{window_phrase()}, цена {pl:.2f}–{ph:.2f}, до страйка ≥{min_dist():g}%{atr}"
+    own = coin_rules_text()
+    return (f"{window_phrase()}, цена {pl:.2f}–{ph:.2f}, до страйка ≥{min_dist():g}%{atr}"
+            + (f" (своё у {own})" if own else ""))
 
 
 def rule_text() -> str:
     pl, ph = price_range()
     atr = f", не меньше {min_atr():g} ATR" if min_atr() > 0 else ", без условия по ATR"
+    own = coin_rules_text()
     return (f"{window_phrase()} окна сторона по цене {pl:.2f}–{ph:.2f}, "
-            f"цена Chainlink ушла от страйка не меньше чем на {min_dist():g}%{atr}")
+            f"цена Chainlink ушла от страйка не меньше чем на {min_dist():g}%{atr}"
+            + (f"; своё у монет: {own}" if own else ""))
 
 
 def trade_assets() -> list[str]:
@@ -306,47 +363,63 @@ def coin_name(asset: str) -> str:
 
 # ---------------------------------------------------- ➕ докупка: настройки ----
 
-def addon_on() -> bool:
-    return bool(_rs("late_addon_on"))
+def _coin_ad(asset: str | None) -> dict:
+    """Своя докупка монеты (что задано у неё самой); {} — всё как в общей."""
+    return runtime_state.coin_addon(asset) if asset else {}
 
 
-def addon_live() -> bool:
+def addon_custom(asset: str) -> bool:
+    return bool(_coin_ad(asset))
+
+
+def addon_on(asset: str | None = None) -> bool:
+    """Докупка включена: у монеты — своя настройка, если задана, иначе общая."""
+    v = _coin_ad(asset).get("on")
+    return bool(_rs("late_addon_on")) if v is None else bool(v)
+
+
+def addon_live(asset: str | None = None) -> bool:
     """🔴 реальная докупка (иначе только тест). Реальный ордер — ещё и при монете 🔴 и боте в LIVE."""
-    return bool(_rs("late_addon_live"))
+    v = _coin_ad(asset).get("live")
+    return bool(_rs("late_addon_live")) if v is None else bool(v)
 
 
-def addon_levels() -> list[float]:
-    return runtime_state.addon_levels()
+def addon_levels(asset: str | None = None) -> list[float]:
+    v = _coin_ad(asset).get("levels")
+    return [float(x) for x in str(v).split(",") if x] if v else runtime_state.addon_levels()
 
 
-def addon_usd() -> float:
+def addon_usd(asset: str | None = None) -> float:
     """Фиксированная сумма на уровень (и запасная для % банка, если банк неизвестен)."""
-    return float(_rs("late_addon_usd"))
+    v = _coin_ad(asset).get("usd")
+    return float(_rs("late_addon_usd") if v is None else v)
 
 
-def addon_amount_mode() -> str:
+def addon_amount_mode(asset: str | None = None) -> str:
     """Сумма на уровень: "usd" — фиксированная $, "pct" — % от банка."""
-    return "pct" if _rs("late_addon_mode") == "pct" else "usd"
+    v = _coin_ad(asset).get("mode") or _rs("late_addon_mode")
+    return "pct" if v == "pct" else "usd"
 
 
-def addon_pct() -> float:
-    return float(_rs("late_addon_pct"))
+def addon_pct(asset: str | None = None) -> float:
+    v = _coin_ad(asset).get("pct")
+    return float(_rs("late_addon_pct") if v is None else v)
 
 
 def addon_usd_for(asset: str) -> float:
-    """$ на уровень у монеты: фиксированная или % банка — своего банка монеты (🏦: заданная сумма + итог её
-    реальных ставок), а нет его — общего (баланс кошелька, не читается — заданный вручную); банк неизвестен —
-    фиксированная $. Так же, как % у ставки монеты."""
-    if addon_amount_mode() != "pct":
-        return addon_usd()
+    """$ на уровень у монеты (по её докупке): фиксированная или % банка — своего банка монеты (🏦: заданная сумма
+    + итог её реальных ставок), а нет его — общего (баланс кошелька, не читается — заданный вручную); банк
+    неизвестен — фиксированная $. Так же, как % у ставки монеты."""
+    if addon_amount_mode(asset) != "pct":
+        return addon_usd(asset)
     own = coin_bank(asset)
     if own is not None:
         b = max(0.0, own["now"])
     else:
         b, _src = bank()
         if b is None:
-            return addon_usd()
-    return round(min(runtime_state.ADDON_USD_LIMITS[1], b * addon_pct() / 100.0), 2)
+            return addon_usd(asset)
+    return round(min(runtime_state.ADDON_USD_LIMITS[1], b * addon_pct(asset) / 100.0), 2)
 
 
 def addon_live_usd(level: float, asset: str | None = None) -> float:
@@ -356,34 +429,34 @@ def addon_live_usd(level: float, asset: str | None = None) -> float:
     return max(base, round(MIN_ORDER_SHARES * level + 0.01, 2))
 
 
-def addon_amount_text() -> str:
+def addon_amount_text(asset: str | None = None) -> str:
     """«$1» или «1% банка» — для экранов."""
-    return f"{addon_pct():g}% банка" if addon_amount_mode() == "pct" else f"${addon_usd():g}"
+    return f"{addon_pct(asset):g}% банка" if addon_amount_mode(asset) == "pct" else f"${addon_usd(asset):g}"
 
 
 def addon_amount_note(asset: str) -> str:
     """Сколько сейчас на уровень у монеты: «$1», «~$1.00 (банк BTC $100.00)», «~$2.10 (общий банк $210.00)»
     или «$1 (банк неизвестен)»."""
-    if addon_amount_mode() != "pct":
-        return f"${addon_usd():g}"
+    if addon_amount_mode(asset) != "pct":
+        return f"${addon_usd(asset):g}"
     own = coin_bank(asset)
     if own is not None:
         return f"~${addon_usd_for(asset):.2f} (банк {asset.upper()} ${own['now']:.2f})"
     b, _src = bank()
     if b is None:
-        return f"${addon_usd():g} (банк неизвестен)"
+        return f"${addon_usd(asset):g} (банк неизвестен)"
     return f"~${addon_usd_for(asset):.2f} (общий банк ${b:.2f})"
 
 
 def addon_amounts_text() -> str:
     """По включённым монетам: «BTC ~$1.00 (банк BTC $100.00), ETH ~$2.10 (общий банк $210.00)»."""
-    coins = trade_assets()
-    return ", ".join(f"{a.upper()} {addon_amount_note(a)}" for a in coins) if coins else "включённых монет нет"
+    coins = [a for a in trade_assets() if addon_on(a)]
+    return ", ".join(f"{a.upper()} {addon_amount_note(a)}" for a in coins) if coins else "монет с докупкой нет"
 
 
-def levels_text(levels: list[float] | None = None) -> str:
+def levels_text(levels: list[float] | None = None, asset: str | None = None) -> str:
     """«0.95–0.90 через 1¢» (подряд по центу, от 3 уровней) или «0.95, 0.93, 0.91»."""
-    lv = sorted(addon_levels() if levels is None else levels, reverse=True)
+    lv = sorted(addon_levels(asset) if levels is None else levels, reverse=True)
     if not lv:
         return "нет уровней"
     if len(lv) >= 3 and all(abs(a - b - 0.01) < 1e-6 for a, b in zip(lv, lv[1:])):
@@ -391,15 +464,26 @@ def levels_text(levels: list[float] | None = None) -> str:
     return ", ".join(f"{x:.2f}" for x in lv)
 
 
-def addon_mode_text() -> str:
-    return "🔴 реально" if addon_live() else "🧪 тест"
+def addon_mode_text(asset: str | None = None) -> str:
+    return "🔴 реально" if addon_live(asset) else "🧪 тест"
 
 
-def addon_short() -> str:
-    """«✅ 🧪 тест · 0.95–0.90 через 1¢ · по $1 на уровень» или «⏸ выключена»."""
-    if not addon_on():
+def addon_short(asset: str | None = None) -> str:
+    """«✅ 🧪 тест · 0.95–0.90 через 1¢ · по $1 на уровень» или «⏸ выключена» (у монеты — с её настройкой)."""
+    if not addon_on(asset):
         return "⏸ выключена"
-    return f"✅ {addon_mode_text()} · {levels_text()} · по {addon_amount_text()} на уровень"
+    return (f"✅ {addon_mode_text(asset)} · {levels_text(asset=asset)} · по {addon_amount_text(asset)} "
+            "на уровень")
+
+
+def coin_addons_text() -> str:
+    """У каких монет своя докупка: «BTC ⏸ выключена; SOL ✅ 🧪 тест · 0.95, 0.93 · по $2 на уровень»."""
+    return "; ".join(f"{a.upper()} {addon_short(a)}" for a in settings.ASSETS if addon_custom(a))
+
+
+def any_addon_on() -> bool:
+    """Докупка включена хоть у одной монеты (общая или своя)."""
+    return addon_on() or any(addon_on(a) for a in settings.ASSETS)
 
 
 # ------------------------------------------------- сумма ставки и банк ----
@@ -835,15 +919,20 @@ def evaluate(w: Win, now: float) -> tuple[bool, dict]:
         info["why"] = "стакан не обновлялся 30 с"
     elif not lo - 1e-9 <= ask <= hi + 1e-9:
         info["why"] = f"цена вне {lo:.2f}–{hi:.2f}"
-    elif dist < min_dist() - 1e-12:
-        info["why"] = f"до страйка меньше {min_dist():g}%"
-    elif min_atr() > 0 and atr is None:
+    elif dist < min_dist(w.asset, side) - 1e-12:
+        info["why"] = f"до страйка меньше {min_dist(w.asset, side):g}%" + _side_note(w.asset, side, "dist")
+    elif min_atr(w.asset, side) > 0 and atr is None:
         info["why"] = "нет ATR (Binance)"
-    elif min_atr() > 0 and datr < min_atr() - 1e-9:
-        info["why"] = f"меньше {min_atr():g} ATR от страйка"
+    elif min_atr(w.asset, side) > 0 and datr < min_atr(w.asset, side) - 1e-9:
+        info["why"] = f"меньше {min_atr(w.asset, side):g} ATR от страйка" + _side_note(w.asset, side, "atr")
     else:
         return True, info
     return False, info
+
+
+def _side_note(asset: str, side: str, key: str) -> str:
+    """« (порог DOWN)» — если для этой стороны у монеты свой порог."""
+    return f" (порог {side})" if f"{key}_{side}" in coin_rule_own(asset) else ""
 
 
 def dry_fill(token: str, cap: float, usdc: float, used: dict | None = None) -> tuple[float | None, float]:
@@ -936,10 +1025,10 @@ def _enter(w: Win, info: dict, now: float) -> int:
     base = dict(ts=int(now), asset=w.asset, start_ts=w.start, slug=w.slug, side=info["side"], token_id=info["token"],
                 t_left=round(w.end - now, 1), price_now=_num(info["price_now"]), strike=_num(w.strike),
                 dist_pct=round(info["dist"], 4), dist_atr=round(info["datr"], 3) if info["datr"] else None,
-                atr=_num(info["atr"], 6), ask=ask, rule=rule_tag())
+                atr=_num(info["atr"], 6), ask=ask, rule=rule_tag(w.asset, info["side"]))
     tid = storage.trade_log(**base, price=price, size_usdc=spent, shares=round(spent / price, 4),
                             fee_usdc=fee_for(spent, price), dry_run=1, status="DRY")
-    if tid and addon_on():
+    if tid and addon_on(w.asset):
         _arm_addon(w, info, now)
     if (coin_live(w.asset) and side_allowed(w.asset, info["side"])
             and not storage.trade_exists(w.asset, w.start, dry_run=False)):
@@ -1091,17 +1180,20 @@ def _arm_addon(w: Win, info: dict, now: float) -> None:
     """После основной ставки: какие уровни ждут отката — только ниже цены входа (ask по сигналу). В базу —
     строка ARMED (уровень 0): окно, где докупка была включена, — итоги «с докупкой» считаются по таким окнам."""
     entry = float(info["ask"])
-    levels = [lv for lv in addon_levels() if round(lv, 2) < round(entry, 2)]
+    levels = [lv for lv in addon_levels(w.asset) if round(lv, 2) < round(entry, 2)]
     w.addon = {"side": info["side"], "token": info["token"], "entry": entry, "left": levels, "lock": None}
     storage.addon_log(ts=int(now), asset=w.asset, start_ts=w.start, slug=w.slug, side=info["side"],
                       token_id=info["token"], level=0.0, entry_ask=entry, t_left=round(w.end - now, 1), ask=entry,
-                      size_usdc=0.0, shares=0.0, fee_usdc=0.0, dry_run=1, status="ARMED", rule=rule_tag(),
+                      size_usdc=0.0, shares=0.0, fee_usdc=0.0, dry_run=1, status="ARMED",
+                      rule=rule_tag(w.asset, info["side"]),
                       note=f"уровни {levels_text(levels)}" if levels else "все уровни не ниже цены входа")
 
 
 def addon_live_why(w: Win, now: float | None = None) -> str | None:
     """Почему реальная докупка по окну не идёт (None — можно): монета 🧪, бот в DRY / стоп / нет ключа,
     по окну нет реальной основной ставки."""
+    if not addon_on(w.asset) or not addon_live(w.asset):
+        return f"докупка {w.asset.upper()} не 🔴"
     if not coin_live(w.asset):
         return f"{w.asset.upper()} 🧪 — реальных ставок по монете нет"
     why = live_blocked(now)
@@ -1127,7 +1219,7 @@ def maybe_addons(now: float | None = None) -> int:
         if w.end - now < ADDON_MIN_LEFT_SEC:
             ad["left"] = []                                # последние секунды — без докупки
             continue
-        if not addon_on():
+        if not addon_on(w.asset):
             continue
         token = ad["token"]
         ask = book_stream.best_ask(token)
@@ -1147,11 +1239,12 @@ def maybe_addons(now: float | None = None) -> int:
                 continue                                   # объём съели уровни выше — на следующем тике
             ad["left"].remove(lv)
             base = dict(ts=int(now), asset=w.asset, start_ts=w.start, slug=w.slug, side=ad["side"], token_id=token,
-                        level=lv, entry_ask=ad["entry"], t_left=round(w.end - now, 1), ask=ask, rule=rule_tag())
+                        level=lv, entry_ask=ad["entry"], t_left=round(w.end - now, 1), ask=ask,
+                        rule=rule_tag(w.asset, ad["side"]))
             if storage.addon_log(**base, price=price, size_usdc=spent, shares=round(spent / price, 4),
                                  fee_usdc=fee_for(spent, price), dry_run=1, status="DRY"):
                 done += 1
-            if addon_live() and coin_live(w.asset):          # монета 🧪 — реальной докупки и не ждём
+            if addon_live(w.asset) and coin_live(w.asset):   # монета 🧪 — реальной докупки и не ждём
                 live_levels.append((lv, base))
         if live_levels:
             why = addon_live_why(w, now)
@@ -1400,9 +1493,10 @@ def addon_line(name: str, st: dict) -> str:
     return s
 
 
-def addon_level_line(since_ts: int = 0, live: bool = False) -> str | None:
-    """«по уровням: 0.95 — 5 (проигр. 0, +0.21 $) · 0.93 — 2 (проигр. 1, −0.85 $)»."""
-    rows = [r for r in storage.addons_since(since_ts) if bool(r["dry_run"]) != live and _is_buy(r)]
+def addon_level_line(since_ts: int = 0, live: bool = False, asset: str | None = None) -> str | None:
+    """«по уровням: 0.95 — 5 (проигр. 0, +0.21 $) · 0.93 — 2 (проигр. 1, −0.85 $)» (asset — по одной монете)."""
+    rows = [r for r in storage.addons_since(since_ts) if bool(r["dry_run"]) != live and _is_buy(r)
+            and (asset is None or r["asset"] == asset)]
     parts = []
     for lv in sorted({round(r["level"] or 0, 2) for r in rows}, reverse=True):
         st = _addon_stats([r for r in rows if abs((r["level"] or 0) - lv) < 1e-6])
@@ -1440,8 +1534,11 @@ def with_addon_line(name: str, c: dict) -> str:
 def addon_lines(since_ts: int = 0) -> list[str]:
     """➕ Для 📊 и экрана докупки: настройки, тест докупки (и по уровням), «было бы» для тестовых и реальных
     ставок, реальная докупка."""
-    lines = [f"➕ Докупка: {addon_short()}"]
-    if addon_on() and addon_amount_mode() == "pct":
+    lines = [f"➕ Докупка: {addon_short()}" + (" (общая)" if coin_addons_text() else "")]
+    own = coin_addons_text()
+    if own:
+        lines.append(f"  Своя у монет: {own}")
+    if any(addon_on(a) and addon_amount_mode(a) == "pct" for a in trade_assets()):
         lines.append(f"  На уровень сейчас: {addon_amounts_text()}")
     lines.append("  " + addon_line("Тест докупки", addon_stats(since_ts, live=False)))
     lvl = addon_level_line(since_ts, live=False)
@@ -1452,12 +1549,12 @@ def addon_lines(since_ts: int = 0) -> list[str]:
         if c:
             lines.append("  " + with_addon_line(name, c))
     real = addon_stats(since_ts, live=True)
-    if real["bets"] or real["skipped"] or addon_live():
+    if real["bets"] or real["skipped"] or addon_live() or any(addon_live(a) for a in settings.ASSETS):
         s = "  " + addon_line("Реальная докупка", real)
         if real["skipped"]:
             s += f" (не купилось: {real['skipped']} — причины в колонке note)"
         lines.append(s)
-    if addon_on() and addon_live() and _addon_note["why"]:
+    if any(addon_on(a) and addon_live(a) for a in settings.ASSETS) and _addon_note["why"]:
         lines.append(f"  ⚠️ Последняя реальная докупка не пошла: {_addon_note['why']} "
                      f"({time.strftime('%d.%m %H:%M', time.gmtime(_addon_note['ts']))} UTC)")
     return lines
@@ -1466,7 +1563,7 @@ def addon_lines(since_ts: int = 0) -> list[str]:
 def addon_report_line(since_ts: int) -> str | None:
     """Одна строка для 4-часового отчёта (None — докупка выключена и покупок за период нет)."""
     test, real = addon_stats(since_ts, live=False), addon_stats(since_ts, live=True)
-    if not (test["bets"] or real["bets"] or addon_on()):
+    if not (test["bets"] or real["bets"] or any_addon_on()):
         return None
     s = "➕ " + addon_line("Докупка (тест) за период", test)
     c = with_addon(since_ts, live=True)
@@ -1521,8 +1618,10 @@ def strategy_lines() -> list[str]:
         if why and why != "бот в DRY RUN":
             lines.append(f"  ⚠️ Реальные ставки сейчас не уходят: {why}")
     test_add = addon_stats(0, live=False)
-    if addon_on() or test_add["bets"]:
-        lines.append(f"  ➕ Докупка: {addon_short()}. " + addon_line("Тест докупки всего", test_add))
+    if any_addon_on() or test_add["bets"]:
+        own = coin_addons_text()
+        lines.append(f"  ➕ Докупка: {addon_short()}" + (f" (своя у монет: {own})" if own else "") + ". "
+                     + addon_line("Тест докупки всего", test_add))
     return lines
 
 
@@ -1611,7 +1710,9 @@ def coin_lines() -> list[str]:
         bank_s = ""
         if own is not None:
             bank_s = f" · 🏦 ${own['now']:.2f}" + (" ⚠️ исчерпан" if own["free"] < min_order_usdc() else "")
-        s = f"{a.upper()} {mark} · 💵 {stake_label(a)}{bank_s} — " + stats_line("тест", test)
+        rule_s = f" · 📏 {coin_rule_short(a)}" if coin_rule_own(a) else ""
+        add_s = f" · ➕ {addon_short(a)}" if addon_custom(a) else ""
+        s = f"{a.upper()} {mark} · 💵 {stake_label(a)}{bank_s}{rule_s}{add_s} — " + stats_line("тест", test)
         if real["bets"] or coin_live(a):
             s += "; " + stats_line("реальные", real)
             miss = sum(1 for t in storage.trades_since(0) if t["asset"] == a and not t["dry_run"]
@@ -1654,7 +1755,8 @@ def feed_warnings(now: float | None = None) -> list[str]:
     if not any((lambda p: p[0] is not None and p[1] is not None and p[1] <= settings.CHAINLINK_MAX_AGE_SEC)(
             chainlink_feed.latest(a, now)) for a in coins):
         out.append("⚠️ Нет свежей цены Chainlink — ставок не будет (📊 — что с потоком цен).")
-    if min_atr() > 0 and not any(atr_feed.get(a, now) is not None for a in coins):
+    if any(min_atr(a, s) > 0 for a in coins for s in ("UP", "DOWN")) \
+            and not any(atr_feed.get(a, now) is not None for a in coins):
         out.append("⚠️ Нет ATR с Binance — при условии по ATR ставок не будет (📊 — ошибка Binance).")
     return out
 
@@ -1683,7 +1785,7 @@ def chainlink_line(now: float | None = None) -> str:
 
 def stats_text() -> str:
     lines = ["📊 Статистика", ""] + [x for x in strategy_lines() if not x.startswith("  ➕")]
-    if addon_on() or storage.addons_since(0):
+    if any_addon_on() or storage.addons_since(0):
         lines += ["", "За всё время в базе:"] + addon_lines()
     lines += ["", "По монетам (за всё время в базе):"]
     lines += ["  " + x for x in coin_lines()]
